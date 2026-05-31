@@ -8,7 +8,7 @@ from config import (
     HELPER_KEYWORDS, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS,
     EXCLUDE_CATEGORIES, STOP_PHRASES
 )
-from db import is_message_sent, mark_message_sent
+from db import is_message_processed, mark_message_processed, save_vacancy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -27,6 +27,7 @@ LAST_DEBUG_STATS = {
     "errors": 0,
     "reasons": {},
     "errors_by_chat": {},
+    "categories": {},  # НОВОЕ: статистика по категориям
 }
 
 
@@ -49,6 +50,7 @@ def _new_stats() -> dict:
         "errors": 0,
         "reasons": {},
         "errors_by_chat": {},
+        "categories": {},
     }
 
 
@@ -63,22 +65,65 @@ def get_last_debug_report() -> str:
         f"Чатов: {s.get('chats_ok', 0)}/{s.get('chats_total', 0)} успешно, ошибок: {s.get('chats_failed', 0)}",
         f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
         f"Совпадений найдено: {s.get('matched', 0)}",
-        f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | уже отправлено: {s.get('already_sent', 0)}",
+        f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | уже обработано: {s.get('already_sent', 0)}",
         f"Локальных ошибок: {s.get('errors', 0)}",
     ]
+    
+    # НОВОЕ: статистика по категориям
+    categories = s.get("categories") or {}
+    if categories:
+        lines.append("\n📊 *Распределение по категориям:*")
+        for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"  • {cat}: {count}")
+    
     reasons = s.get("reasons") or {}
     if reasons:
         top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
-        lines.append("Топ причин фильтра:")
+        lines.append("\n📋 Топ причин фильтра:")
         for reason, count in top:
-            lines.append(f"- {reason}: {count}")
+            lines.append(f"  • {reason}: {count}")
+    
     chat_errors = s.get("errors_by_chat") or {}
     if chat_errors:
-        lines.append("Ошибки по чатам:")
+        lines.append("\n⚠️ Ошибки по чатам:")
         for chat, count in sorted(chat_errors.items(), key=lambda x: x[1], reverse=True)[:5]:
-            lines.append(f"- {chat}: {count}")
+            lines.append(f"  • {chat}: {count}")
+    
     return "\n".join(lines)
 
+
+# ========== НОВАЯ ФУНКЦИЯ ОПРЕДЕЛЕНИЯ КАТЕГОРИИ ==========
+
+def detect_category(text: str) -> str:
+    """Определяет категорию вакансии по тексту"""
+    if not text:
+        return "helper"
+    
+    text_lower = text.lower()
+    
+    category_map = {
+        "promoter": ["промоутер", "промо", "раздача листовок", "промоутеры", "промоутерша"],
+        "hostess": ["хостес", "встреча гостей", "приветствие", "встреча guests"],
+        "wardrobe": ["гардеробщик", "гардероб", "гардеробщица", "раздевалка"],
+        "animator": ["аниматор", "анимация", "детский праздник", "аниматоры", "аниматорша"],
+        "helper": ["хелпер", "хэлпер", "помощник на мероприятие", "хелперы", "хэлперы", "helper", "helpers"],
+        "loader": ["грузчик", "погрузка", "разгрузка", "грузчики", "такелаж"],
+        "waiter": ["официант", "официантка", "сервис", "официанты", "бармен"],
+        "driver": ["водитель", "доставка", "водители", "курьер", "экспедитор"],
+        "security": ["охранник", "безопасность", "контролёр", "охрана", "секьюрити"],
+        "parking": ["парковщик", "парковка", "паркинг", "автомобиль"],
+        "supervisor": ["супервайзер", "координатор", "менеджер", "супервизор", "тимлид"]
+    }
+    
+    for category, keywords in category_map.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return category
+    
+    return "helper"  # по умолчанию
+
+
+# ========== СУЩЕСТВУЮЩАЯ ФУНКЦИЯ ПРОВЕРКИ (МОДИФИЦИРОВАНА) ==========
 
 def is_helper_message(text: str) -> tuple[bool, str, list]:
     """
@@ -99,7 +144,6 @@ def is_helper_message(text: str) -> tuple[bool, str, list]:
     # ШАГ 2: Проверяем, что это НЕ творческая профессия
     for category in EXCLUDE_CATEGORIES:
         if category.lower() in text_lower:
-            # Дополнительная проверка: если есть "хелпер" или "промоутер" — оставляем
             if not any(hw in text_lower for hw in ["хелпер", "хэлпер", "промоутер", "аниматор", "грузчик"]):
                 return False, f"excluded_category: {category}", []
     
@@ -116,34 +160,30 @@ def is_helper_message(text: str) -> tuple[bool, str, list]:
     found_payment = [pi for pi in PAYMENT_INDICATORS if pi.lower() in text_lower]
     
     # ЛОГИКА ПРИНЯТИЯ РЕШЕНИЯ:
-    # Вариант А: Прямое указание на хелпера/промоутера + глагол найма
     if found_helpers and found_hiring:
         return True, "helper_plus_hiring", found_helpers + found_hiring[:2]
     
-    # Вариант Б: Прямое указание на хелпера + признак разовой работы
     if found_helpers and found_one_time:
         return True, "helper_plus_one_time", found_helpers + found_one_time[:2]
     
-    # Вариант В: Прямое указание на хелпера + оплата
     if found_helpers and found_payment:
         return True, "helper_plus_payment", found_helpers + found_payment[:2]
     
-    # Вариант Г: Глагол найма + "хелпер" в тексте (даже если не в HELPER_KEYWORDS)
     if found_hiring and "хелпер" in text_lower:
         return True, "hiring_plus_helper_text", found_hiring + ["хелпер"]
     
-    # Вариант Д: Глагол найма + "промоутер" в тексте
     if found_hiring and "промоутер" in text_lower:
         return True, "hiring_plus_promoter_text", found_hiring + ["промоутер"]
     
-    # Если ничего не подошло — не релевантно
     return False, "no_match", []
+
 
 def clean_message_text(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
 
 def get_message_link(chat_id: int, message_id: int) -> str:
     str_id = str(chat_id)
@@ -155,6 +195,7 @@ def get_message_link(chat_id: int, message_id: int) -> str:
         return f"https://t.me/c/{clean_id}/{message_id}"
     return f"https://t.me/c/{chat_id}/{message_id}"
 
+
 async def safe_get_entity(client: TelegramClient, chat_link: str):
     try:
         entity = await client.get_entity(chat_link)
@@ -164,7 +205,14 @@ async def safe_get_entity(client: TelegramClient, chat_link: str):
         logger.error(f"❌ {chat_link}: {type(e).__name__}")
         return None
 
+
+# ========== ОСНОВНАЯ ФУНКЦИЯ ПАРСИНГА (МОДИФИЦИРОВАНА) ==========
+
 async def get_new_messages(limit_per_chat: int = 30) -> list:
+    """
+    Парсит сообщения из чатов и возвращает список новых вакансий
+    Каждая вакансия содержит: chat_title, message_text, message_link, category
+    """
     global LAST_DEBUG_STATS
     LAST_DEBUG_STATS = _new_stats()
     client = TelegramClient('user_session', API_ID, API_HASH)
@@ -191,6 +239,7 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
             async for message in client.iter_messages(entity, limit=limit_per_chat):
                 try:
                     LAST_DEBUG_STATS["messages_scanned"] += 1
+                    
                     if not message.text:
                         LAST_DEBUG_STATS["no_text"] += 1
                         continue
@@ -198,7 +247,7 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                     message_id = str(message.id)
 
                     # Проверяем, не обработано ли уже
-                    if is_message_sent(message_id, chat_id):
+                    if is_message_processed(message_id, chat_id):
                         LAST_DEBUG_STATS["already_sent"] += 1
                         continue
 
@@ -210,23 +259,44 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                         LAST_DEBUG_STATS["non_relevant"] += 1
                         continue
 
+                    # ОПРЕДЕЛЯЕМ КАТЕГОРИЮ ВАКАНСИИ
+                    category = detect_category(message.text)
+                    LAST_DEBUG_STATS["categories"][category] = LAST_DEBUG_STATS["categories"].get(category, 0) + 1
+
                     cleaned_text = clean_message_text(message.text)
                     message_link = get_message_link(entity.id, message.id)
+                    vacancy_id = f"{chat_id}_{message_id}"
+
+                    # Сохраняем вакансию в БД
+                    save_vacancy(
+                        vacancy_id=vacancy_id,
+                        source_chat=chat_id,
+                        source_chat_title=chat_title,
+                        category_code=category,
+                        message_text=cleaned_text[:1000],
+                        message_link=message_link
+                    )
 
                     result = {
                         "chat_title": chat_title,
                         "message_text": cleaned_text,
                         "message_link": message_link,
+                        "category": category,  # НОВОЕ: категория вакансии
+                        "chat_id": chat_id,
+                        "message_id": message_id,
                         "keywords": keywords[:5],
                         "reason": reason,
                     }
                     all_results.append(result)
                     LAST_DEBUG_STATS["matched"] += 1
 
-                    mark_message_sent(message_id, chat_id)
-                    logger.info(f"✅ {chat_title}: {cleaned_text[:60]}... (причина: {reason})")
+                    # Отмечаем сообщение как обработанное
+                    mark_message_processed(message_id, chat_id)
+                    
+                    logger.info(f"✅ {chat_title} [{category}]: {cleaned_text[:60]}... (причина: {reason})")
 
                     await asyncio.sleep(0.3)
+                    
                 except Exception as e:
                     LAST_DEBUG_STATS["errors"] += 1
                     LAST_DEBUG_STATS["errors_by_chat"][chat_title] = LAST_DEBUG_STATS["errors_by_chat"].get(chat_title, 0) + 1
@@ -240,7 +310,9 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
             
             await asyncio.sleep(2)
         
-        logger.info(f"🏁 Найдено хелперов: {len(all_results)}")
+        logger.info(f"🏁 Найдено вакансий: {len(all_results)}")
+        if LAST_DEBUG_STATS["categories"]:
+            logger.info(f"📊 Распределение по категориям: {LAST_DEBUG_STATS['categories']}")
         
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
@@ -251,7 +323,18 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
     
     return all_results
 
-# Тестовая функция
+
+async def run_parser() -> str:
+    """Запускает парсер и возвращает строку с результатом"""
+    orders = await get_new_messages()
+    if orders:
+        return f"✅ Найдено {len(orders)} новых вакансий.\n📊 Категории: {LAST_DEBUG_STATS.get('categories', {})}"
+    else:
+        return "✅ Новых вакансий не найдено."
+
+
+# ========== ТЕСТОВАЯ ФУНКЦИЯ ==========
+
 async def test_filter(chat_link: str, limit: int = 30):
     client = TelegramClient('user_session', API_ID, API_HASH)
     
@@ -267,6 +350,7 @@ async def test_filter(chat_link: str, limit: int = 30):
         
         passed = 0
         blocked = 0
+        category_stats = {}
         
         async for message in client.iter_messages(entity, limit=limit):
             if not message.text:
@@ -275,15 +359,16 @@ async def test_filter(chat_link: str, limit: int = 30):
             is_rel, reason, keywords = is_helper_message(message.text)
             
             if is_rel:
+                category = detect_category(message.text)
+                category_stats[category] = category_stats.get(category, 0) + 1
                 passed += 1
-                logger.info(f"✅ [{reason}] {message.text[:80]}...")
-                logger.info(f"   Ключевые слова: {keywords}")
+                logger.info(f"✅ [{category}] [{reason}] {message.text[:80]}...")
             else:
                 blocked += 1
-                logger.debug(f"❌ [{reason}] {message.text[:80]}...")
         
         logger.info(f"\n{'='*60}")
         logger.info(f"📊 ПРОПУЩЕНО: {passed} | ОТСЕЯНО: {blocked}")
+        logger.info(f"📊 Категории: {category_stats}")
         logger.info(f"{'='*60}")
         
     except Exception as e:
@@ -291,6 +376,7 @@ async def test_filter(chat_link: str, limit: int = 30):
     finally:
         if client.is_connected():
             await client.disconnect()
+
 
 if __name__ == "__main__":
     async def main():
