@@ -8,7 +8,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     
-    # 1. Таблица подписчиков (расширенная)
+    # 1. Таблица подписчиков (расширенная с анкетой)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS subscribers (
             user_id INTEGER PRIMARY KEY,
@@ -18,6 +18,7 @@ def init_db():
             full_name TEXT,
             age INTEGER,
             phone TEXT,
+            questionnaire TEXT DEFAULT NULL,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_active BOOLEAN DEFAULT 1
         )
@@ -78,6 +79,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             vacancy_id TEXT,
+            vacancy_text TEXT,
+            vacancy_link TEXT,
             status TEXT DEFAULT 'pending',
             responded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES subscribers(user_id),
@@ -147,12 +150,25 @@ def update_subscriber_profile(user_id: int, full_name: str, age: int, phone: str
     conn.close()
 
 
+def update_candidate_questionnaire(user_id: int, questionnaire_text: str):
+    """Сохраняет готовую анкету кандидата"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE subscribers 
+        SET questionnaire = ?
+        WHERE user_id = ?
+    """, (questionnaire_text, user_id))
+    conn.commit()
+    conn.close()
+
+
 def get_subscriber_profile(user_id: int) -> dict:
     """Получает профиль подписчика"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
-        SELECT user_id, username, first_name, last_name, full_name, age, phone, is_active
+        SELECT user_id, username, first_name, last_name, full_name, age, phone, questionnaire, is_active
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     row = cur.fetchone()
@@ -166,7 +182,8 @@ def get_subscriber_profile(user_id: int) -> dict:
             "full_name": row[4],
             "age": row[5],
             "phone": row[6],
-            "is_active": row[7]
+            "questionnaire": row[7],
+            "is_active": row[8]
         }
     return None
 
@@ -310,14 +327,14 @@ def has_user_received_vacancy(user_id: int, vacancy_id: str) -> bool:
 
 # ========== ФУНКЦИИ ДЛЯ ОТКЛИКОВ ==========
 
-def add_response(user_id: int, vacancy_id: str):
-    """Добавляет отклик на вакансию"""
+def add_response(user_id: int, vacancy_id: str, vacancy_text: str = None, vacancy_link: str = None):
+    """Добавляет отклик на вакансию с сохранением текста и ссылки"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO responses (user_id, vacancy_id, status)
-        VALUES (?, ?, 'pending')
-    """, (user_id, vacancy_id))
+        INSERT INTO responses (user_id, vacancy_id, vacancy_text, vacancy_link, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    """, (user_id, vacancy_id, vacancy_text, vacancy_link))
     conn.commit()
     conn.close()
 
@@ -361,6 +378,55 @@ def mark_message_processed(message_id: str, chat_id: str):
 
 
 # ========== АДМИНСКАЯ СТАТИСТИКА ==========
+
+def get_all_subscribers() -> list:
+    """Возвращает список всех подписчиков (user_id)"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM subscribers WHERE is_active = 1")
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_recent_responses(limit: int = 10) -> list:
+    """Возвращает последние отклики"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT responded_at, vacancy_text, username, first_name 
+        FROM responses 
+        ORDER BY responded_at DESC 
+        LIMIT ?
+    """, (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_subscriber_by_id(user_id: int) -> dict:
+    """Получает подписчика по ID"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id, username, first_name, last_name, full_name, age, phone, is_active
+        FROM subscribers WHERE user_id = ?
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "first_name": row[2],
+            "last_name": row[3],
+            "full_name": row[4],
+            "age": row[5],
+            "phone": row[6],
+            "is_active": row[7]
+        }
+    return None
+
 
 def get_admin_stats() -> dict:
     """Собирает статистику для администратора"""

@@ -2,14 +2,16 @@ import asyncio
 import re
 import logging
 import hashlib
+import sqlite3
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.fsm import State, StatesGroup
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
-from parser import get_new_messages, get_last_debug_report
+from parser import get_new_messages, get_last_debug_report, detect_category
 from config import BOT_TOKEN, YOUR_USER_ID
 
 # Настройка логирования
@@ -27,7 +29,7 @@ periodic_task = None  # Глобальная переменная для пер�
 # Состояния для FSM
 class RegistrationState(StatesGroup):
     waiting_for_name = State()
-    waiting_for_age = State()
+    waiting_for_birthdate = State()
     waiting_for_phone = State()
 
 
@@ -47,36 +49,43 @@ def generate_vacancy_id(chat_id: str, message_id: str) -> str:
     return hashlib.md5(unique_str.encode()).hexdigest()[:16]
 
 
-def detect_vacancy_category(text: str) -> str:
-    """Определяет категорию вакансии по тексту"""
-    text_lower = text.lower()
-    
-    category_map = {
-        "promoter": ["промоутер", "промо", "раздача листовок", "промоутеры"],
-        "hostess": ["хостес", "встреча гостей", "приветствие"],
-        "wardrobe": ["гардеробщик", "гардероб"],
-        "animator": ["аниматор", "анимация", "детский праздник", "аниматоры"],
-        "helper": ["хелпер", "хэлпер", "помощник на мероприятие", "хелперы"],
-        "loader": ["грузчик", "погрузка", "разгрузка", "грузчики"],
-        "waiter": ["официант", "официантка", "сервис"],
-        "driver": ["водитель", "доставка"],
-        "security": ["охранник", "безопасность", "контролёр"],
-        "parking": ["парковщик", "парковка", "паркинг"],
-        "supervisor": ["супервайзер", "координатор", "менеджер"]
+def get_category_emoji(category_code: str) -> str:
+    """Возвращает эмодзи для категории"""
+    emojis = {
+        "promoter": "📢",
+        "hostess": "👩‍💼",
+        "wardrobe": "🧥",
+        "animator": "🎭",
+        "helper": "👷",
+        "loader": "📦",
+        "waiter": "🍽️",
+        "driver": "🚐",
+        "security": "🛡️",
+        "parking": "🚗",
+        "supervisor": "👨‍💼"
     }
-    
-    for category, keywords in category_map.items():
-        for kw in keywords:
-            if kw in text_lower:
-                return category
-    return "helper"  # по умолчанию
+    return emojis.get(category_code, "📌")
+
+
+def calculate_age(birth_date_str: str) -> int:
+    """Вычисляет возраст по дате рождения (формат ДД.ММ.ГГГГ)"""
+    try:
+        birth_date = datetime.strptime(birth_date_str, "%d.%m.%Y")
+        today = datetime.now()
+        age = today.year - birth_date.year
+        # Если день рождения ещё не наступил в этом году
+        if (today.month, today.day) < (birth_date.month, birth_date.day):
+            age -= 1
+        return age
+    except ValueError:
+        return None
 
 
 # ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ ==========
 
 async def send_vacancy_to_subscribers(order: dict):
     """Отправляет вакансию всем подписчикам, которые выбрали соответствующую категорию"""
-    category_code = detect_vacancy_category(order['message_text'])
+    category_code = order.get('category', detect_category(order['message_text']))
     vacancy_id = generate_vacancy_id(order.get('chat_id', ''), order.get('message_id', ''))
     
     # Получаем подписчиков на эту категорию
@@ -133,25 +142,7 @@ async def send_vacancy_to_subscribers(order: dict):
                 logger.error(f"Ошибка отправки {subscriber['user_id']}: {e}")
     
     logger.info(f"Вакансия {vacancy_id} (категория {category_code}) отправлена {sent_count} подписчикам")
-    mark_vacancy_sent(vacancy_id)  # Отмечаем как отправленную
-
-
-def get_category_emoji(category_code: str) -> str:
-    """Возвращает эмодзи для категории"""
-    emojis = {
-        "promoter": "📢",
-        "hostess": "👩‍💼",
-        "wardrobe": "🧥",
-        "animator": "🎭",
-        "helper": "👷",
-        "loader": "📦",
-        "waiter": "🍽️",
-        "driver": "🚐",
-        "security": "🛡️",
-        "parking": "🚗",
-        "supervisor": "👨‍💼"
-    }
-    return emojis.get(category_code, "📌")
+    mark_vacancy_sent(vacancy_id)
 
 
 # ========== КЛАВИАТУРЫ ==========
@@ -192,6 +183,18 @@ def get_main_keyboard(user_id: int):
         resize_keyboard=True
     )
     return keyboard, status_text
+def get_admin_keyboard():
+    """Создаёт Reply-клавиатуру для администратора"""
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔍 Ручная проверка")],
+            [KeyboardButton(text="📋 Список откликов"), KeyboardButton(text="📝 Отчёт парсера")],
+            [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="❌ Закрыть меню")]
+        ],
+        resize_keyboard=True
+    )
+    return keyboard
 
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
@@ -203,11 +206,24 @@ async def start_cmd(message: types.Message, state: FSMContext):
     first_name = message.from_user.first_name
     last_name = message.from_user.last_name
     
+    # ========== ДЛЯ АДМИНИСТРАТОРА ==========
+    if user_id == YOUR_USER_ID:
+        admin_keyboard = get_admin_keyboard()
+        await message.answer(
+            f"👋 Здравствуйте, Администратор {first_name}!\n\n"
+            f"📊 *Бот работает в штатном режиме.*\n\n"
+            f"Используйте кнопки для управления ботом:",
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard
+        )
+        return
+    
+    # ========== ДЛЯ ОБЫЧНЫХ ПОЛЬЗОВАТЕЛЕЙ ==========
     # Добавляем пользователя в БД
     add_subscriber(user_id, username, first_name, last_name)
     profile = get_subscriber_profile(user_id)
     
-    # Если профиль уже заполнен и есть категории
+    # Если профиль уже заполнен
     if profile and profile.get("full_name") and profile.get("phone"):
         categories = get_user_categories(user_id)
         if categories:
@@ -218,13 +234,24 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 reply_markup=keyboard
             )
             return
+        else:
+            # Профиль есть, но категории не выбраны
+            await message.answer(
+                f"👋 С возвращением, {first_name}!\n\n"
+                f"Ваш профиль уже заполнен, но вы ещё не выбрали категории вакансий.\n\n"
+                f"📋 *Выберите категории вакансий:*",
+                parse_mode="Markdown",
+                reply_markup=get_categories_keyboard()
+            )
+            return
     
     # Если данные не заполнены — начинаем регистрацию
     await message.answer(
         "👋 *Добро пожаловать в бот поиска работы!*\n\n"
         "Я помогу вам найти подходящие вакансии.\n\n"
         "📝 *Давайте заполним ваш профиль*\n\n"
-        "Как вас зовут? (ФИО полностью)",
+        "Как вас зовут? (ФИО полностью)\n\n"
+        "Пример: *Иван Петров*",
         parse_mode="Markdown"
     )
     await state.set_state(RegistrationState.waiting_for_name)
@@ -233,54 +260,155 @@ async def start_cmd(message: types.Message, state: FSMContext):
 @dp.message(RegistrationState.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
     full_name = message.text.strip()
-    if len(full_name.split()) < 2:
-        await message.answer("Пожалуйста, введите полное имя и фамилию (минимум 2 слова):")
+    
+    # Валидация ФИО: минимум 2 слова, только буквы, дефисы и пробелы
+    name_parts = full_name.split()
+    if len(name_parts) < 2:
+        await message.answer(
+            "❌ Пожалуйста, введите полное имя и фамилию (минимум 2 слова).\n\n"
+            "Пример: *Иван Петров*",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Проверяем, что только буквы, пробелы, дефисы и точки
+    if not re.match(r'^[a-zA-Zа-яА-ЯёЁ\s\-\.]+$', full_name):
+        await message.answer(
+            "❌ Имя может содержать только буквы, пробелы, дефисы и точки.\n\n"
+            "Пример: *Иван Петров* или *Иван-Петр Сидоров*",
+            parse_mode="Markdown"
+        )
         return
     
     await state.update_data(full_name=full_name)
     await message.answer(
-        f"Приятно познакомиться, {full_name}!\n\n"
-        "🎂 Сколько вам лет?"
+        "🎂 *Дата рождения*\n\n"
+        "Введите вашу дату рождения в формате: **ДД.ММ.ГГГГ**\n\n"
+        "Пример: `25.12.1990`\n\n"
+        "Я автоматически рассчитаю ваш возраст.",
+        parse_mode="Markdown"
     )
-    await state.set_state(RegistrationState.waiting_for_age)
+    await state.set_state(RegistrationState.waiting_for_birthdate)
 
 
-@dp.message(RegistrationState.waiting_for_age)
-async def process_age(message: types.Message, state: FSMContext):
-    try:
-        age = int(message.text.strip())
-        if age < 16 or age > 100:
-            await message.answer("Пожалуйста, введите корректный возраст (от 16 до 100):")
-            return
-    except ValueError:
-        await message.answer("Пожалуйста, введите число (ваш возраст):")
+@dp.message(RegistrationState.waiting_for_birthdate)
+async def process_birthdate(message: types.Message, state: FSMContext):
+    birth_date_str = message.text.strip()
+    
+    # Проверяем формат ДД.ММ.ГГГГ
+    if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', birth_date_str):
+        await message.answer(
+            "❌ Неверный формат!\n\n"
+            "Пожалуйста, введите дату в формате: **ДД.ММ.ГГГГ**\n\n"
+            "Пример: `25.12.1990`",
+            parse_mode="Markdown"
+        )
         return
     
-    await state.update_data(age=age)
+    # Вычисляем возраст
+    age = calculate_age(birth_date_str)
+    
+    if age is None:
+        await message.answer(
+            "❌ Неверная дата! Проверьте, что:\n"
+            "- День от 1 до 31\n"
+            "- Месяц от 1 до 12\n"
+            "- Год реальный\n\n"
+            "Пример: `25.12.1990`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if age < 16:
+        await message.answer(
+            "❌ К сожалению, мы принимаем заявки только от кандидатов старше 16 лет.\n\n"
+            f"Ваш возраст: {age} лет.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    if age > 100:
+        await message.answer(
+            "❌ Пожалуйста, проверьте правильность введённой даты.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    await state.update_data(birth_date=birth_date_str, age=age)
+    
+    # Клавиатура с кнопкой отправки контакта
+    phone_keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    
     await message.answer(
-        "📞 Отлично! Теперь укажите ваш контактный телефон.\n\n"
-        "Он будет передан работодателю при отклике на вакансию.\n\n"
-        "Пример: +7 999 123-45-67"
+        f"✅ Возраст: {age} лет\n\n"
+        f"📞 *Контактный телефон*\n\n"
+        f"Нажмите на кнопку ниже, чтобы отправить ваш номер телефона.\n"
+        f"Он будет передан работодателю при отклике на вакансию.",
+        parse_mode="Markdown",
+        reply_markup=phone_keyboard
     )
     await state.set_state(RegistrationState.waiting_for_phone)
 
 
 @dp.message(RegistrationState.waiting_for_phone)
 async def process_phone(message: types.Message, state: FSMContext):
-    phone = message.text.strip()
-    if not any(c.isdigit() for c in phone):
-        await message.answer("Пожалуйста, введите корректный номер телефона:")
-        return
-    
     user_id = message.from_user.id
+    
+    # Получаем номер телефона (из контакта или из текста)
+    if message.contact:
+        phone = message.contact.phone_number
+    else:
+        phone = message.text.strip()
+        # Валидация номера телефона
+        digits_only = re.sub(r'\D', '', phone)
+        if len(digits_only) < 10 or len(digits_only) > 15:
+            await message.answer(
+                "❌ Пожалуйста, введите корректный номер телефона.\n\n"
+                "Примеры:\n"
+                "+7 999 123-45-67\n"
+                "89991234567\n\n"
+                "Или нажмите кнопку «Отправить мой номер телефона»",
+                parse_mode="Markdown",
+                reply_markup=ReplyKeyboardMarkup(
+                    keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+            )
+            return
+    
     data = await state.get_data()
     
-    update_subscriber_profile(user_id, data['full_name'], data['age'], phone)
+    # Сохраняем профиль
+    update_subscriber_profile(
+        user_id, 
+        data['full_name'], 
+        data['age'], 
+        phone
+    )
     
+    # Убираем клавиатуру
     await message.answer(
         "✅ *Профиль успешно создан!*\n\n"
+        f"📝 ФИО: {data['full_name']}\n"
+        f"🎂 Дата рождения: {data['birth_date']}\n"
+        f"📊 Возраст: {data['age']} лет\n"
+        f"📞 Телефон: {phone}\n\n"
         "Теперь выберите категории вакансий, которые вас интересуют.\n\n"
         "Вы можете выбрать несколько:",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    # Показываем выбор категорий
+    await message.answer(
+        "📋 *Выберите категории вакансий:*",
         parse_mode="Markdown",
         reply_markup=get_categories_keyboard()
     )
@@ -306,14 +434,41 @@ async def select_category(callback: types.CallbackQuery):
     
     set_user_categories(user_id, current_codes)
     
-    await callback.message.edit_text(
-        "📋 *Выберите категории вакансий:*\n\n"
-        "✅ *Зелёные кнопки* — уже выбраны\n"
-        "⬜ *Обычные кнопки* — можно добавить\n\n"
-        "Когда закончите, нажмите «Завершить выбор»",
-        parse_mode="Markdown",
-        reply_markup=get_categories_keyboard()
-    )
+    # Получаем обновлённый список категорий
+    updated_categories = get_user_categories(user_id)
+    updated_codes = [c['code'] for c in updated_categories]
+    
+    # Создаём новую клавиатуру с отметками
+    all_categories = get_all_categories()
+    buttons = []
+    row = []
+    for i, cat in enumerate(all_categories):
+        # Добавляем галочку к выбранным категориям
+        prefix = "✅" if cat['code'] in updated_codes else "⬜"
+        row.append(InlineKeyboardButton(
+            text=f"{prefix} {cat['emoji']} {cat['name']}", 
+            callback_data=f"cat_{cat['code']}"
+        ))
+        if len(row) == 2 or i == len(all_categories) - 1:
+            buttons.append(row)
+            row = []
+    
+    buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
+    new_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    # Обновляем сообщение с обработкой ошибки
+    try:
+        await callback.message.edit_text(
+            "📋 *Выберите категории вакансий:*\n\n"
+            "✅ — уже выбраны\n"
+            "⬜ — можно добавить\n\n"
+            "Когда закончите, нажмите «Завершить выбор»",
+            parse_mode="Markdown",
+            reply_markup=new_markup
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            logger.error(f"Ошибка при редактировании: {e}")
 
 
 @dp.callback_query(lambda c: c.data == "finish_categories")
@@ -369,10 +524,13 @@ async def show_new_vacancies(message: types.Message):
     await message.answer(f"📬 Найдено {len(all_vacancies)} новых вакансий.")
     
     for vac in all_vacancies[:10]:
+        # Экранируем текст вакансии!
+        escaped_text = escape_markdown(vac['text'][:400])
+        
         text = (
             f"{vac['category']['emoji']} *{vac['category']['name']}*\n"
-            f"📢 Из чата: {vac['source']}\n\n"
-            f"{escape_markdown(vac['text'][:400])}\n\n"
+            f"📢 Из чата: {escape_markdown(vac['source'])}\n\n"
+            f"{escaped_text}\n\n"
             f"🔗 [Ссылка на сообщение]({vac['link']})"
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -384,6 +542,12 @@ async def show_new_vacancies(message: types.Message):
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"Ошибка отправки вакансии: {e}")
+            # Пробуем отправить без Markdown форматирования
+            try:
+                plain_text = f"{vac['category']['emoji']} {vac['category']['name']}\n\n{vac['text'][:400]}\n\n{vac['link']}"
+                await message.answer(plain_text, reply_markup=keyboard)
+            except Exception as e2:
+                logger.error(f"Не удалось отправить даже plain текст: {e2}")
 
 
 @dp.message(lambda m: m.text == "📋 Мои категории")
@@ -413,7 +577,7 @@ async def show_my_contacts(message: types.Message):
         await message.answer(
             f"📞 *Ваши контактные данные:*\n\n"
             f"👤 ФИО: {profile['full_name']}\n"
-            f"🎂 Возраст: {profile['age']}\n"
+            f"🎂 Возраст: {profile['age']} лет\n"
             f"📱 Телефон: {profile['phone']}\n\n"
             f"Эти данные будут переданы работодателю при отклике на вакансию.",
             parse_mode="Markdown"
@@ -473,7 +637,7 @@ async def handle_response(callback: types.CallbackQuery):
         f"🔗 Ссылка: {vacancy[1]}\n\n"
         f"👤 *Кандидат:*\n"
         f"• ФИО: {profile['full_name']}\n"
-        f"• Возраст: {profile['age']}\n"
+        f"• Возраст: {profile['age']} лет\n"
         f"• Телефон: {profile['phone']}\n"
         f"• Username: @{profile['username'] if profile['username'] else 'нет'}\n\n"
         f"📞 Свяжитесь с кандидатом: {user_link}"
@@ -577,9 +741,183 @@ async def debug_last_cmd(message: types.Message):
         await message.answer("⛔ У вас нет прав.")
         return
     await message.answer(get_last_debug_report())
+@dp.message(Command("myid"))
+async def show_my_id(message: types.Message):
+    await message.answer(
+        f"📌 Ваш Telegram ID: `{message.from_user.id}`\n\n"
+        f"ID в .env: `{YOUR_USER_ID}`\n\n"
+        f"{'✅ Совпадает' if message.from_user.id == YOUR_USER_ID else '❌ НЕ СОВПАДАЕТ! Обновите .env'}"
+    )
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    # Ожидаем текст рассылки после команды
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "📢 *Отправить рассылку подписчикам*\n\n"
+            "Использование: `/broadcast Текст сообщения`\n\n"
+            "Пример: `/broadcast Внимание! Новые вакансии скоро появятся!`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    broadcast_text = parts[1]
+    subscribers = get_all_subscribers()
+    
+    if not subscribers:
+        await message.answer("Нет подписчиков для рассылки.")
+        return
+    
+    status_msg = await message.answer(f"📢 Начинаю рассылку {len(subscribers)} подписчикам...")
+    
+    sent = 0
+    for user_id in subscribers:
+        try:
+            await bot.send_message(
+                user_id, 
+                f"📢 *Рассылка от администратора:*\n\n{broadcast_text}", 
+                parse_mode="Markdown"
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            if "bot was blocked by the user" in str(e):
+                logger.info(f"Пользователь {user_id} заблокировал бота")
+    
+    await status_msg.edit_text(f"✅ Рассылка отправлена {sent} из {len(subscribers)} подписчиков.")
+@dp.message(lambda m: m.text == "📊 Статистика")
+async def admin_stats_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    stats = get_admin_stats()
+    text = (
+        "📊 *Статистика бота*\n\n"
+        f"👥 Подписчиков: {stats['subscribers']}\n"
+        f"📝 Полных профилей: {stats['full_profiles']}\n"
+        f"💬 Откликов: {stats['responses']}\n"
+        f"📦 Вакансий в очереди: {stats['pending_vacancies']}\n"
+        f"🏁 Всего вакансий: {stats['total_vacancies']}"
+    )
+    await message.answer(text, parse_mode="Markdown")
 
 
-# ========== ПЕРИОДИЧЕСКАЯ ПРОВЕРКА (КЛЮЧЕВАЯ ФУНКЦИЯ) ==========
+@dp.message(lambda m: m.text == "🔍 Ручная проверка")
+async def admin_check_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    status_msg = await message.answer("🔍 Начинаю проверку...")
+    
+    try:
+        orders = await get_new_messages()
+        
+        if not orders:
+            await status_msg.edit_text("✅ Новых вакансий не найдено.")
+            return
+        
+        for order in orders:
+            await send_vacancy_to_subscribers(order)
+        
+        await status_msg.edit_text(
+            f"✅ Проверка завершена.\n"
+            f"📬 Найдено вакансий: {len(orders)}\n"
+            f"👥 Отправлено подписчикам"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при проверке: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+
+
+@dp.message(lambda m: m.text == "📋 Список откликов")
+async def admin_responses_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    recent = get_recent_responses(10)
+    if not recent:
+        await message.answer("📭 Пока нет ни одного отклика.")
+        return
+    
+    text = "📋 *Последние отклики:*\n\n"
+    for resp in recent:
+        time = resp[0][:16] if resp[0] else "—"
+        first_name = resp[3] or "Пользователь"
+        vacancy_preview = (resp[1][:50] + "...") if resp[1] and len(resp[1]) > 50 else (resp[1] or "—")
+        text += f"• {time} — {first_name}: {vacancy_preview}\n"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(lambda m: m.text == "📝 Отчёт парсера")
+async def admin_debug_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    await message.answer(get_last_debug_report())
+
+
+@dp.message(lambda m: m.text == "👥 Список подписчиков")
+async def admin_subscribers_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    subscribers = get_all_subscribers()
+    if not subscribers:
+        await message.answer("📭 Нет активных подписчиков.")
+        return
+    
+    text = "👥 *Список подписчиков:*\n\n"
+    for i, user_id in enumerate(subscribers[:20], 1):
+        profile = get_subscriber_profile(user_id)
+        if profile:
+            name = profile.get('full_name') or profile.get('first_name') or f"ID:{user_id}"
+            text += f"{i}. {name}\n"
+    
+    if len(subscribers) > 20:
+        text += f"\n... и ещё {len(subscribers) - 20} подписчиков"
+    
+    await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message(lambda m: m.text == "📢 Рассылка")
+async def admin_broadcast_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    await message.answer(
+        "📢 *Отправить рассылку*\n\n"
+        "Используйте команду:\n"
+        "`/broadcast Текст сообщения`\n\n"
+        "Пример: `/broadcast Внимание! Новые вакансии скоро появятся!`",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(lambda m: m.text == "❌ Закрыть меню")
+async def admin_close_menu(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        await message.answer("⛔ У вас нет прав.")
+        return
+    
+    await message.answer(
+        "Меню закрыто. Чтобы открыть снова, напишите /start",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+
+# ========== ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ==========
 
 async def periodic_check():
     """Автоматическая проверка каждые 5 минут"""
@@ -603,7 +941,7 @@ async def periodic_check():
         await asyncio.sleep(300)  # 5 минут
 
 
-# ========== ЗАПУСК И ОСТАНОВКА (КЛЮЧЕВЫЕ ФУНКЦИИ) ==========
+# ========== ЗАПУСК И ОСТАНОВКА ==========
 
 async def on_startup():
     """Действия при запуске бота"""
@@ -618,26 +956,8 @@ async def on_startup():
     periodic_task = asyncio.create_task(periodic_check())
     logger.info("🔄 Периодическая проверка запущена (интервал 5 минут)")
     
-    # Отправляем уведомление администратору
-    try:
-        stats = get_admin_stats()
-        await bot.send_message(
-            YOUR_USER_ID, 
-            "🟢 *Бот запущен и начал мониторинг вакансий!*\n\n"
-            f"📊 *Статистика на момент запуска:*\n"
-            f"👥 Подписчиков: {stats['subscribers']}\n"
-            f"📝 Заполненных профилей: {stats['full_profiles']}\n"
-            f"💬 Всего откликов: {stats['responses']}\n\n"
-            "⏱️ Интервал проверки: 5 минут\n\n"
-            "📋 *Доступные команды:*\n"
-            "/status — статус бота\n"
-            "/check_now — ручная проверка\n"
-            "/admin — панель администратора\n"
-            "/debug_last — отчёт парсера",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.error(f"Не удалось отправить уведомление о запуске: {e}")
+    # Логируем ID админа (без отправки сообщения)
+    logger.info(f"👑 Администратор ID: {YOUR_USER_ID}")
 
 
 async def on_shutdown():
@@ -655,12 +975,6 @@ async def on_shutdown():
     
     # Закрываем сессию бота
     await bot.session.close()
-    
-    # Отправляем уведомление о остановке
-    try:
-        await bot.send_message(YOUR_USER_ID, "🔴 *Бот остановлен.*", parse_mode="Markdown")
-    except:
-        pass
     
     logger.info("👋 Бот остановлен")
 
