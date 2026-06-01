@@ -158,13 +158,12 @@ async def send_vacancy_to_subscribers(order: dict):
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
 async def notify_closed_vacancies(closed_data: list):
-    """closed_data: list of (vacancy_id, [user_ids])"""
     for vacancy_id, user_ids in closed_data:
         for uid in user_ids:
             try:
                 await bot.send_message(uid, f"🔒 *Вакансия, на которую вы откликались или получали, больше не актуальна (закрыта).*\nID вакансии: `{vacancy_id}`", parse_mode="Markdown")
             except Exception as e:
-                logger.error(f"Не удалось уведомить пользователя {uid} о закрытии вакансии {vacancy_id}: {e}")
+                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
 
 # ========== КЛАВИАТУРЫ ==========
 
@@ -178,7 +177,6 @@ def get_categories_keyboard():
             row = []
     buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 
 def get_main_keyboard(user_id: int):
     categories = get_user_categories(user_id)
@@ -198,7 +196,6 @@ def get_main_keyboard(user_id: int):
     )
     return keyboard, status_text
 
-
 def get_admin_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -211,7 +208,6 @@ def get_admin_keyboard():
         ],
         resize_keyboard=True
     )
-
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
 
@@ -311,7 +307,6 @@ async def process_birthdate(message: types.Message, state: FSMContext):
         return
     await state.update_data(birth_date=birth_date_str, age=age)
     
-    # Клавиатура с кнопкой отправки контакта
     phone_keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
         resize_keyboard=True,
@@ -348,7 +343,9 @@ async def process_phone(message: types.Message, state: FSMContext):
                 )
             )
             return
+
     data = await state.get_data()
+    await state.update_data(phone=phone)   # <-- СОХРАНЯЕМ ТЕЛЕФОН В СОСТОЯНИЕ
     update_subscriber_profile(user_id, data['full_name'], data['age'], phone)
     
     # Анкета
@@ -389,16 +386,8 @@ async def process_photo(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, отправьте фото или нажмите «Пропустить»")
         return
 
+    # Профиль уже полностью сохранён в БД, просто завершаем регистрацию
     data = await state.get_data()
-    questionnaire = f"""📝 *АНКЕТА КАНДИДАТА*
-
-👤 *ФИО:* {data['full_name']}
-🎂 *Возраст:* {data['age']} лет
-📞 *Телефон:* {data['phone']}
-🆔 *Telegram:* @{message.from_user.username if message.from_user.username else 'нет'}
-"""
-    update_candidate_questionnaire(user_id, questionnaire)
-
     await message.answer(
         "✅ *Профиль успешно создан!*\n\n"
         f"📝 ФИО: {data['full_name']}\n"
@@ -499,7 +488,6 @@ async def show_new_vacancies(message: types.Message):
         await message.answer("🔍 Новых вакансий по вашим категориям пока нет.\n\nЯ продолжаю мониторинг и сообщу, когда появятся!")
         return
 
-    # Сохраняем список в памяти для пагинации
     user_pages[user_id] = {
         "vacancies": all_vacancies,
         "page": 0,
@@ -541,7 +529,6 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         except Exception as e:
             logger.error(f"Ошибка отправки вакансии: {e}")
 
-    # Кнопки навигации
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"vac_page_{page-1}"))
@@ -571,7 +558,6 @@ async def show_my_categories(message: types.Message):
         text = "⚠️ Вы ещё не выбрали категории вакансий.\n\nИспользуйте кнопку «✏️ Изменить категории»"
     await message.answer(text, parse_mode="Markdown")
 
-
 @dp.message(lambda m: m.text == "✏️ Изменить категории")
 async def edit_categories(message: types.Message):
     await message.answer(
@@ -580,7 +566,6 @@ async def edit_categories(message: types.Message):
         parse_mode="Markdown",
         reply_markup=get_categories_keyboard()
     )
-
 
 @dp.message(lambda m: m.text == "📞 Мои контакты")
 async def show_my_contacts(message: types.Message):
@@ -597,7 +582,6 @@ async def show_my_contacts(message: types.Message):
     else:
         await message.answer("⚠️ Ваш профиль не заполнен. Нажмите /start для заполнения.")
 
-
 @dp.message(lambda m: m.text == "❌ Отписаться")
 async def unsubscribe_user(message: types.Message):
     user_id = message.from_user.id
@@ -609,7 +593,6 @@ async def unsubscribe_user(message: types.Message):
         reply_markup=ReplyKeyboardRemove()
     )
 
-
 @dp.message(lambda m: m.text == "❓ Поддержка")
 async def support_menu(message: types.Message, state: FSMContext):
     await message.answer(
@@ -619,7 +602,6 @@ async def support_menu(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
     await state.set_state(SupportState.waiting_for_question)
-
 
 @dp.message(SupportState.waiting_for_question)
 async def process_support_question(message: types.Message, state: FSMContext):
@@ -650,7 +632,6 @@ async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(ComplaintState.waiting_for_reason)
     await callback.answer()
 
-
 @dp.callback_query(lambda c: c.data and c.data.startswith("complaint_reason_"))
 async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
     reason_map = {
@@ -673,7 +654,6 @@ async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
         await state.clear()
     await callback.answer()
 
-
 @dp.message(ComplaintState.waiting_for_text)
 async def complaint_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -691,20 +671,15 @@ async def complaint_text(message: types.Message, state: FSMContext):
 async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     vacancy_id = callback.data.replace("respond_", "")
-
     if is_already_responded(user_id, vacancy_id):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
-
     profile = get_subscriber_profile(user_id)
     if not profile or not profile.get("full_name") or not profile.get("phone"):
         await callback.answer("⚠️ Сначала заполните профиль! Нажмите /start", show_alert=True)
         return
-
-    # Запрашиваем у пользователя фото для отклика, если его нет в профиле
     existing_photo = profile.get('photo_file_id')
     if existing_photo:
-        # Сразу отправляем отклик
         await send_application(callback, user_id, vacancy_id, existing_photo)
     else:
         await state.update_data(vacancy_id=vacancy_id)
@@ -718,32 +693,20 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         )
         await state.set_state(RespondWithPhotoState.waiting_for_photo)
     await callback.answer()
+
 @dp.callback_query(lambda c: c.data == "admin_vacancy")
 async def handle_admin_vacancy_response(callback: types.CallbackQuery):
-    """
-    Обработчик отклика на вакансию, отправленную администратором.
-    Отправляет анкету и фото (если есть) администратору.
-    """
     user_id = callback.from_user.id
     vacancy_text = callback.message.caption or callback.message.text
-
-    # Генерируем уникальный ID для этой админской вакансии (на основе ID сообщения)
     vacancy_id = f"admin_{callback.message.message_id}"
-
-    # Проверка, не откликался ли уже пользователь
     if is_already_responded(user_id, vacancy_id):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
-
     profile = get_subscriber_profile(user_id)
     if not profile or not profile.get("full_name") or not profile.get("phone"):
         await callback.answer("⚠️ Сначала заполните профиль! Нажмите /start", show_alert=True)
         return
-
-    # Сохраняем отклик в БД
     add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, None, profile.get('photo_file_id'))
-
-    # Формируем анкету
     candidate_questionnaire = profile.get('questionnaire') or f"""📝 *АНКЕТА КАНДИДАТА*
 
 👤 *ФИО:* {profile['full_name']}
@@ -751,33 +714,25 @@ async def handle_admin_vacancy_response(callback: types.CallbackQuery):
 📞 *Телефон:* {profile['phone']}
 🆔 *Telegram:* @{profile['username'] if profile['username'] else 'нет'}
 """
-
-    # Отправляем администратору
     admin_message = (
         f"🔔 *НОВЫЙ ОТКЛИК НА АДМИНСКУЮ ВАКАНСИЮ!*\n\n"
         f"📝 *Текст вакансии:*\n{vacancy_text}\n\n"
         f"{candidate_questionnaire}\n"
         f"👤 *Ссылка на кандидата:* [Написать](tg://user?id={user_id})"
     )
-
     photo_file_id = profile.get('photo_file_id')
     if photo_file_id:
         await bot.send_photo(YOUR_USER_ID, photo_file_id, caption=admin_message, parse_mode="Markdown")
     else:
         await bot.send_message(YOUR_USER_ID, admin_message, parse_mode="Markdown")
-
     await callback.answer("✅ Ваш отклик отправлен администратору!", show_alert=True)
-
-    # Убираем кнопку, чтобы нельзя было откликнуться дважды
     await callback.message.edit_reply_markup(reply_markup=None)
-
 
 @dp.callback_query(lambda c: c.data == "skip_photo_respond")
 async def skip_photo_respond(callback: types.CallbackQuery, state: FSMContext):
     await send_application(callback, callback.from_user.id, (await state.get_data()).get("vacancy_id"), None)
     await state.clear()
     await callback.answer()
-
 
 @dp.message(RespondWithPhotoState.waiting_for_photo)
 async def respond_photo_received(message: types.Message, state: FSMContext):
@@ -791,7 +746,6 @@ async def respond_photo_received(message: types.Message, state: FSMContext):
         return
     await state.clear()
 
-
 async def send_application(target, user_id: int, vacancy_id: str, photo_file_id: str = None):
     profile = get_subscriber_profile(user_id)
     conn = sqlite3.connect(DB_NAME)
@@ -802,11 +756,8 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
     if not vacancy_row:
         await target.answer("❌ Вакансия не найдена")
         return
-
     vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
-
     add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, photo_file_id)
-
     candidate_questionnaire = profile.get('questionnaire') or f"""📝 *АНКЕТА КАНДИДАТА*
 
 👤 *ФИО:* {profile['full_name']}
@@ -814,14 +765,11 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
 📞 *Телефон:* {profile['phone']}
 🆔 *Telegram:* @{profile['username'] if profile['username'] else 'нет'}
 """
-
     employer_contact = saved_contact
     if not employer_contact:
         employer_contact = extract_contact_from_text(vacancy_text)
-
     if employer_contact:
         try:
-            # Отправляем заказчику
             msg = f"🔔 *Новый отклик на вакансию!*\n\n📢 Вакансия из канала: {source_chat}\n\n{candidate_questionnaire}\n\n🔗 Ссылка на сообщение: {vacancy_link}"
             if photo_file_id:
                 await bot.send_photo(employer_contact, photo_file_id, caption=msg, parse_mode="Markdown")
@@ -834,7 +782,6 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
             await send_to_admin(target, profile, vacancy_row, candidate_questionnaire, photo_file_id)
     else:
         await send_to_admin(target, profile, vacancy_row, candidate_questionnaire, photo_file_id)
-
 
 async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_questionnaire: str, photo_file_id: str = None):
     vacancy_text, vacancy_link, source_chat, _, address = vacancy_row
@@ -857,10 +804,10 @@ async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_que
         await bot.send_message(YOUR_USER_ID, admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True)
     await target.answer("✅ Отклик отправлен администратору! Он свяжется с вами.", show_alert=True)
 
-
 @dp.callback_query(lambda c: c.data == "already_responded")
 async def already_responded(callback: types.CallbackQuery):
     await callback.answer("Вы уже откликались на эту вакансию", show_alert=True)
+
 
 # ========== АДМИНСКИЕ КОМАНДЫ ==========
 
@@ -882,7 +829,6 @@ async def admin_menu(message: types.Message):
         parse_mode="Markdown"
     )
 
-
 @dp.message(Command("status"))
 async def status_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -892,7 +838,6 @@ async def status_cmd(message: types.Message):
         f"📊 *Статус бота*\n\n✅ Активен\n🔄 Периодическая проверка: {'запущена' if periodic_task and not periodic_task.done() else 'остановлена'}\n⏱️ Интервал: 5 мин\n👥 Подписчиков: {stats['subscribers']}\n💬 Откликов: {stats['responses']}",
         parse_mode="Markdown"
     )
-
 
 @dp.message(Command("check_now"))
 async def check_now_cmd(message: types.Message):
@@ -906,7 +851,6 @@ async def check_now_cmd(message: types.Message):
         if not orders and not closed_data:
             await status_msg.edit_text("✅ Новых вакансий не найдено.")
             return
-        # Уведомляем о закрытых вакансиях
         if closed_data:
             await notify_closed_vacancies(closed_data)
         for order in orders:
@@ -916,13 +860,11 @@ async def check_now_cmd(message: types.Message):
         logger.error(f"Ошибка в check_now_cmd: {e}")
         await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
 
-
 @dp.message(Command("debug_last"))
 async def debug_last_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
     await message.answer(get_last_debug_report())
-
 
 @dp.message(Command("myid"))
 async def show_my_id(message: types.Message):
@@ -931,7 +873,6 @@ async def show_my_id(message: types.Message):
         f"ID в .env: `{YOUR_USER_ID}`\n"
         f"{'✅ Совпадает' if message.from_user.id == YOUR_USER_ID else '❌ НЕ СОВПАДАЕТ! Обновите .env'}"
     )
-
 
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: types.Message):
@@ -957,7 +898,6 @@ async def broadcast_cmd(message: types.Message):
             pass
     await status_msg.edit_text(f"✅ Отправлено {sent} из {len(subscribers)}")
 
-
 @dp.message(Command("clean_old"))
 async def clean_old_vacancies(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -970,14 +910,12 @@ async def clean_old_vacancies(message: types.Message):
     conn.close()
     await message.answer("✅ Удалены вакансии и обработанные сообщения старше 3 дней.")
 
-
 @dp.message(Command("addchat"))
 async def add_chat_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
         return
     await message.answer("➕ *Добавление нового чата для парсинга*\n\nВведите ссылку на чат (например, https://t.me/chatname):", parse_mode="Markdown")
     await state.set_state(AddChatState.waiting_for_link)
-
 
 @dp.message(AddChatState.waiting_for_link)
 async def process_add_chat(message: types.Message, state: FSMContext):
@@ -991,7 +929,6 @@ async def process_add_chat(message: types.Message, state: FSMContext):
         await message.answer(f"⚠️ Чат {chat_link} уже существует.")
     await state.clear()
 
-
 @dp.message(Command("removechat"))
 async def remove_chat_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -1004,14 +941,12 @@ async def remove_chat_cmd(message: types.Message):
     remove_target_chat(chat_link)
     await message.answer(f"🗑️ Чат {chat_link} удалён из парсинга.")
 
-
 @dp.message(Command("postvacancy"))
 async def post_vacancy_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
         return
     await message.answer("📤 *Отправка вакансии подписчикам*\n\nВыберите категорию:", parse_mode="Markdown", reply_markup=get_categories_keyboard())
     await state.set_state(PostVacancyState.waiting_for_category)
-
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cat_") and state == PostVacancyState.waiting_for_category)
 async def post_vacancy_category(callback: types.CallbackQuery, state: FSMContext):
@@ -1023,13 +958,11 @@ async def post_vacancy_category(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(PostVacancyState.waiting_for_text)
     await callback.answer()
 
-
 @dp.message(PostVacancyState.waiting_for_text)
 async def post_vacancy_text(message: types.Message, state: FSMContext):
     await state.update_data(message_text=message.text)
     await message.answer("🖼️ Отправьте фото для вакансии (необязательно) или нажмите «Пропустить»:", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⏩ Пропустить")]], resize_keyboard=True))
     await state.set_state(PostVacancyState.waiting_for_photo)
-
 
 @dp.message(PostVacancyState.waiting_for_photo)
 async def post_vacancy_photo(message: types.Message, state: FSMContext):
@@ -1045,14 +978,11 @@ async def post_vacancy_photo(message: types.Message, state: FSMContext):
     else:
         await message.answer("Пожалуйста, отправьте фото или нажмите «Пропустить»")
         return
-
-    # Отправляем всем подписчикам этой категории
     subscribers = get_subscribers_by_category(category_code)
     if not subscribers:
         await message.answer(f"⚠️ Нет подписчиков на категорию {category_name}. Вакансия не отправлена.")
         await state.clear()
         return
-
     text = f"{get_category_emoji(category_code)} *Вакансия от администратора:*\n\n{escape_markdown(vacancy_text[:500])}"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Откликнуться", callback_data="admin_vacancy", style=2)]])
     sent = 0
@@ -1137,7 +1067,6 @@ async def admin_complaints_button(message: types.Message):
     for c in complaints:
         text += f"ID: {c[0]}, от {c[2]} (user {c[1]})\nВакансия: {c[3]}\nПричина: {c[4]}\nТекст: {c[5] or '—'}\nДата: {c[6]}\n\n"
     await message.answer(text, parse_mode="Markdown")
-    # Кнопка "Разрешить" – можно добавить инлайн-кнопки, но для простоты оставим так.
 
 @dp.message(lambda m: m.text == "❓ Поддержка (админ)")
 async def admin_support_button(message: types.Message):
