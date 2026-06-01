@@ -125,7 +125,7 @@ def extract_contact_from_text(text: str) -> str:
     return None
 
 
-# ========== ФУНКЦИЯ ОПРЕДЕЛЕНИЯ КАТЕГОРИИ (РАСШИРЕННАЯ) ==========
+# ========== ФУНКЦИЯ ОПРЕДЕЛЕНИЯ КАТЕГОРИИ ==========
 
 def detect_category(text: str) -> str:
     """Определяет категорию вакансии по тексту"""
@@ -192,7 +192,7 @@ def detect_category(text: str) -> str:
     return "helper"
 
 
-# ========== ФУНКЦИЯ ПРОВЕРКИ СООБЩЕНИЯ (С ПОДДЕРЖКОЙ ГРУЗЧИКОВ) ==========
+# ========== ФУНКЦИЯ ПРОВЕРКИ СООБЩЕНИЯ ==========
 
 def is_helper_message(text: str) -> tuple[bool, str, list]:
     """
@@ -215,25 +215,16 @@ def is_helper_message(text: str) -> tuple[bool, str, list]:
             return True, "labor_work", [kw]
     
     # ========== СУЩЕСТВУЮЩАЯ ПРОВЕРКА ==========
-    # ШАГ 2: Проверяем, что это НЕ творческая профессия
     for category in EXCLUDE_CATEGORIES:
         if category.lower() in text_lower:
             if not any(hw in text_lower for hw in ["хелпер", "хэлпер", "промоутер", "аниматор", "грузчик"]):
                 return False, f"excluded_category: {category}", []
     
-    # ШАГ 3: Ищем прямые указания на хелперов
     found_helpers = [hw for hw in HELPER_KEYWORDS if hw.lower() in text_lower]
-    
-    # ШАГ 4: Ищем глаголы найма
     found_hiring = [hv for hv in HIRING_VERBS if hv.lower() in text_lower]
-    
-    # ШАГ 5: Ищем признаки разовой работы
     found_one_time = [ot for ot in ONE_TIME_JOB_KEYWORDS if ot.lower() in text_lower]
-    
-    # ШАГ 6: Ищем признаки оплаты
     found_payment = [pi for pi in PAYMENT_INDICATORS if pi.lower() in text_lower]
     
-    # ЛОГИКА ПРИНЯТИЯ РЕШЕНИЯ:
     if found_helpers and found_hiring:
         return True, "helper_plus_hiring", found_helpers + found_hiring[:2]
     
@@ -270,19 +261,50 @@ def get_message_link(chat_id: int, message_id: int) -> str:
     return f"https://t.me/c/{chat_id}/{message_id}"
 
 
+# ========== УЛУЧШЕННАЯ ФУНКЦИЯ ПОЛУЧЕНИЯ ДОСТУПА К КАНАЛУ ==========
+
 async def safe_get_entity(client: TelegramClient, chat_link: str):
+    """
+    Безопасное получение сущности канала с обработкой всех типов ошибок
+    """
     try:
+        # Пробуем получить как есть
         entity = await client.get_entity(chat_link)
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.5)
         return entity
+    except errors.rpcerrorlist.ChannelInvalidError:
+        logger.warning(f"⚠️ Недействительный канал: {chat_link}")
+        return None
+    except errors.rpcerrorlist.ChannelPrivateError:
+        logger.warning(f"⚠️ Приватный канал (нет доступа): {chat_link}")
+        return None
+    except errors.rpcerrorlist.ChatAdminRequiredError:
+        logger.warning(f"⚠️ Требуются права администратора: {chat_link}")
+        return None
+    except errors.rpcerrorlist.UsernameNotOccupiedError:
+        logger.warning(f"⚠️ Канал не найден (несуществующий username): {chat_link}")
+        return None
+    except errors.rpcerrorlist.InviteHashInvalidError:
+        logger.warning(f"⚠️ Недействительная ссылка-приглашение: {chat_link}")
+        return None
+    except errors.rpcerrorlist.InviteHashExpiredError:
+        logger.warning(f"⚠️ Ссылка-приглашение истекла: {chat_link}")
+        return None
+    except ValueError as e:
+        if "Cannot find any entity" in str(e):
+            logger.warning(f"⚠️ Не удалось найти канал: {chat_link}")
+        else:
+            logger.warning(f"⚠️ Ошибка значения: {chat_link} - {e}")
+        return None
     except Exception as e:
-        logger.error(f"❌ {chat_link}: {type(e).__name__}")
+        # Любая другая ошибка — логируем, но не прерываем
+        logger.warning(f"⚠️ Не удалось получить доступ к {chat_link}: {type(e).__name__}")
         return None
 
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ПАРСИНГА ==========
 
-async def get_new_messages(limit_per_chat: int = 30) -> list:
+async def get_new_messages(limit_per_chat: int = 100) -> list:
     """
     Парсит сообщения из чатов и возвращает список новых вакансий
     Каждая вакансия содержит: chat_title, message_text, message_link, category
@@ -298,8 +320,11 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
         
         logger.info(f"🎯 ИЩЕМ ТОЛЬКО: {', '.join(HELPER_KEYWORDS[:10])}...")
         logger.info(f"🚫 ИСКЛЮЧАЕМ: {', '.join(EXCLUDE_CATEGORIES[:10])}...")
+        logger.info(f"📋 Всего каналов для проверки: {len(TARGET_CHATS)}")
         
-        for chat_link in TARGET_CHATS:
+        for i, chat_link in enumerate(TARGET_CHATS, 1):
+            logger.info(f"🔍 [{i}/{len(TARGET_CHATS)}] Проверяю: {chat_link}")
+            
             entity = await safe_get_entity(client, chat_link)
             if not entity:
                 LAST_DEBUG_STATS["chats_failed"] += 1
@@ -309,10 +334,13 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
             chat_title = getattr(entity, 'title', None) or 'Без названия'
             chat_id = str(entity.id)
             LAST_DEBUG_STATS["chats_ok"] += 1
+            logger.info(f"✅ Успешно подключился к: {chat_title}")
             
+            message_count = 0
             async for message in client.iter_messages(entity, limit=limit_per_chat):
                 try:
                     LAST_DEBUG_STATS["messages_scanned"] += 1
+                    message_count += 1
                     
                     if not message.text:
                         LAST_DEBUG_STATS["no_text"] += 1
@@ -341,14 +369,18 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                     message_link = get_message_link(entity.id, message.id)
                     vacancy_id = f"{chat_id}_{message_id}"
 
+                    # Извлекаем контакт заказчика
+                    author_contact = extract_contact_from_text(message.text)
+
                     # Сохраняем вакансию в БД
                     save_vacancy(
                         vacancy_id=vacancy_id,
                         source_chat=chat_id,
                         source_chat_title=chat_title,
                         category_code=category,
-                        message_text=cleaned_text[:1000],
-                        message_link=message_link
+                        message_text=cleaned_text[:2000],
+                        message_link=message_link,
+                        author_contact=author_contact
                     )
 
                     result = {
@@ -360,6 +392,7 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                         "message_id": message_id,
                         "keywords": keywords[:5],
                         "reason": reason,
+                        "author_contact": author_contact,
                     }
                     all_results.append(result)
                     LAST_DEBUG_STATS["matched"] += 1
@@ -369,7 +402,7 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                     
                     logger.info(f"✅ {chat_title} [{category}]: {cleaned_text[:60]}... (причина: {reason})")
 
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.2)
                     
                 except Exception as e:
                     LAST_DEBUG_STATS["errors"] += 1
@@ -382,14 +415,16 @@ async def get_new_messages(limit_per_chat: int = 30) -> list:
                     )
                     continue
             
-            await asyncio.sleep(2)
+            logger.info(f"📊 В канале {chat_title} просмотрено {message_count} сообщений")
+            await asyncio.sleep(1)
         
-        logger.info(f"🏁 Найдено вакансий: {len(all_results)}")
+        logger.info(f"🏁 Парсинг завершён! Найдено вакансий: {len(all_results)}")
+        logger.info(f"📊 Статистика: успешно обработано {LAST_DEBUG_STATS['chats_ok']} из {LAST_DEBUG_STATS['chats_total']} каналов")
         if LAST_DEBUG_STATS["categories"]:
             logger.info(f"📊 Распределение по категориям: {LAST_DEBUG_STATS['categories']}")
         
     except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
+        logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
     finally:
         LAST_DEBUG_STATS["finished_at"] = _iso_now()
         if client.is_connected():
@@ -415,11 +450,12 @@ async def test_filter(chat_link: str, limit: int = 30):
     try:
         await client.start()
         logger.info(f"\n{'='*60}")
-        logger.info(f"🧪 ТЕСТ ФИЛЬТРА ХЕЛПЕРОВ: {chat_link}")
+        logger.info(f"🧪 ТЕСТ ФИЛЬТРА: {chat_link}")
         logger.info(f"{'='*60}\n")
         
         entity = await safe_get_entity(client, chat_link)
         if not entity:
+            logger.error("❌ Не удалось получить доступ к каналу")
             return
         
         passed = 0

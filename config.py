@@ -16,7 +16,6 @@ TARGET_CHATS = [
     "https://t.me/he1pers",
     "https://t.me/eventbaran",
     "https://t.me/eventori",
-    "https://t.me/meropriyatiyachat",
     "https://t.me/EventFamily",
     "https://t.me/rabotakastingi",
     "https://t.me/mskeventjob",
