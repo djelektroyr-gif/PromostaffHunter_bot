@@ -1,7 +1,13 @@
 import sqlite3
 import time
+import os
 
-DB_NAME = "bot_database.db"
+# Постоянный каталог для данных (можно переопределить через переменную окружения)
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_NAME = os.path.join(DATA_DIR, "bot_database.db")
+
 
 def _table_exists(table_name: str) -> bool:
     conn = sqlite3.connect(DB_NAME)

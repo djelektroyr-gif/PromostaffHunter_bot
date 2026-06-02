@@ -12,6 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
+from db import DB_NAME
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text
