@@ -19,7 +19,7 @@ from db import *
 from db import DB_NAME
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
-    start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text
+    get_new_messages, extract_address_from_text
 )
 from config import BOT_TOKEN, YOUR_USER_ID
 
@@ -63,6 +63,20 @@ class RespondWithPhotoState(StatesGroup):
 
 class ResponseDraftState(StatesGroup):
     waiting_for_comment = State()
+
+async def periodic_polling():
+    """Запускает парсинг каждые 60 секунд"""
+    while True:
+        try:
+            logger.info("🔍 Периодическая проверка новых сообщений...")
+            orders, closed_data = await get_new_messages(limit_per_chat=100)
+            if closed_data:
+                await notify_closed_vacancies(closed_data)
+            for order in orders:
+                await send_vacancy_to_subscribers(order)
+        except Exception as e:
+            logger.error(f"Ошибка в периодической проверке: {e}")
+        await asyncio.sleep(60)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -1014,7 +1028,7 @@ async def status_cmd(message: types.Message):
         return
     stats = get_admin_stats()
     await message.answer(
-        f"📊 *Статус бота*\n\n✅ Активен\n📡 Режим: real‑time (мгновенные уведомления)\n👥 Подписчиков: {stats['subscribers']}\n💬 Откликов: {stats['responses']}",
+        f"📊 *Статус бота*\n\n✅ Активен\n📡 Режим: периодический опрос (каждые 60 секунд)\n👥 Подписчиков: {stats['subscribers']}\n💬 Откликов: {stats['responses']}",
         parse_mode="Markdown"
     )
 
@@ -1383,8 +1397,7 @@ async def on_startup():
     init_db()
     logger.info("📁 База данных инициализирована")
 
-    # Один раз прогоняем парсер, чтобы подхватить сообщения за последние несколько минут (гарантия)
-    logger.info("🔄 Однократная проверка новых сообщений (для синхронизации)...")
+    logger.info("🔄 Однократная проверка новых сообщений...")
     orders, closed = await get_new_messages(limit_per_chat=200)
     if closed:
         await notify_closed_vacancies(closed)
@@ -1392,17 +1405,15 @@ async def on_startup():
         await send_vacancy_to_subscribers(order)
     logger.info("✅ Однократная проверка завершена")
 
-    # Запускаем real-time listener
-    asyncio.create_task(start_realtime_listener(send_vacancy_to_subscribers))
-    logger.info("📡 Real-time listener запущен")
+    # Запускаем периодический поллинг
+    asyncio.create_task(periodic_polling())
+    logger.info("📡 Периодический поллинг запущен (интервал 60 секунд)")
 
-    # Запускаем polling для бота
     logger.info("📡 Запуск polling...")
     await dp.start_polling(bot)
 
 async def on_shutdown():
     logger.info("🛑 Остановка бота...")
-    await stop_realtime_listener()
     await bot.session.close()
     logger.info("👋 Бот остановлен")
 
