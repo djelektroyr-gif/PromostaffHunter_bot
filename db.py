@@ -78,6 +78,11 @@ def init_db():
         cur.execute("ALTER TABLE vacancies ADD COLUMN address TEXT DEFAULT NULL")
     if "is_closed" not in cols:
         cur.execute("ALTER TABLE vacancies ADD COLUMN is_closed BOOLEAN DEFAULT 0")
+    if "dedupe_key" not in cols:
+        cur.execute("ALTER TABLE vacancies ADD COLUMN dedupe_key TEXT DEFAULT NULL")
+    if "published_at" not in cols:
+        cur.execute("ALTER TABLE vacancies ADD COLUMN published_at TEXT DEFAULT NULL")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sent_vacancies (
@@ -313,22 +318,69 @@ def get_subscribers_by_category(category_code: str) -> list:
 # ========== ВАКАНСИИ ==========
 def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  category_code: str, message_text: str, message_link: str,
-                 author_contact: str = None, address: str = None, is_closed: bool = False):
+                 author_contact: str = None, address: str = None, is_closed: bool = False,
+                 dedupe_key: str = None, published_at: str = None):
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
     cur.execute("""
         INSERT OR IGNORE INTO vacancies 
-        (id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed))
+        (id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed, dedupe_key, published_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed, dedupe_key, published_at))
     conn.commit()
     conn.close()
+
+def has_recent_duplicate_vacancy(dedupe_key: str, max_age_days: int = 1) -> bool:
+    if not dedupe_key:
+        return False
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM vacancies
+        WHERE dedupe_key = ?
+          AND is_closed = 0
+          AND datetime(found_at) >= datetime('now', ?)
+        LIMIT 1
+        """,
+        (dedupe_key, f"-{max_age_days} days"),
+    )
+    result = cur.fetchone() is not None
+    conn.close()
+    return result
+
+def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200) -> list:
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, message_text, author_contact, dedupe_key
+        FROM vacancies
+        WHERE is_closed = 0
+          AND datetime(found_at) >= datetime('now', ?)
+        ORDER BY found_at DESC
+        LIMIT ?
+        """,
+        (f"-{max_age_days} days", limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "message_text": row[1] or "",
+            "author_contact": row[2],
+            "dedupe_key": row[3],
+        }
+        for row in rows
+    ]
 
 def get_unsent_vacancies_by_category(category_code: str) -> list:
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, source_chat_title, message_text, message_link, author_contact, address
+        SELECT id, source_chat_title, message_text, message_link, author_contact, address, found_at, published_at
         FROM vacancies
         WHERE category_code = ? AND is_sent = 0 AND is_closed = 0
         ORDER BY found_at DESC
@@ -338,7 +390,8 @@ def get_unsent_vacancies_by_category(category_code: str) -> list:
     result = []
     for r in rows:
         result.append({
-            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5]
+            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
+            "found_at": r[6], "published_at": r[7]
         })
     return result
 
@@ -572,6 +625,74 @@ def get_admin_stats() -> dict:
         "total_vacancies": total_vacancies, "pending_complaints": pending_complaints,
         "pending_support": pending_support
     }
+
+def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT user_id, username, first_name, last_name, full_name, age, phone, registered_at, is_active
+        FROM subscribers
+        ORDER BY registered_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    )
+    rows = cur.fetchall()
+    cards = []
+    for row in rows:
+        user_id = row[0]
+        cur.execute(
+            """
+            SELECT c.name, c.emoji
+            FROM user_categories uc
+            JOIN categories c ON c.code = uc.category_code
+            WHERE uc.user_id = ?
+            ORDER BY c.name
+            """,
+            (user_id,),
+        )
+        cats = [f"{c[1]} {c[0]}" for c in cur.fetchall()]
+        cards.append({
+            "user_id": user_id,
+            "username": row[1],
+            "first_name": row[2],
+            "last_name": row[3],
+            "full_name": row[4],
+            "age": row[5],
+            "phone": row[6],
+            "registered_at": row[7],
+            "is_active": bool(row[8]),
+            "categories": cats,
+        })
+    conn.close()
+    return cards
+
+def get_user_category_mapping() -> list:
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT c.code, c.name, c.emoji, COUNT(uc.user_id) as subscribers_count
+        FROM categories c
+        LEFT JOIN user_categories uc ON uc.category_code = c.code
+        LEFT JOIN subscribers s ON s.user_id = uc.user_id
+        WHERE s.is_active = 1 OR s.is_active IS NULL
+        GROUP BY c.code, c.name, c.emoji
+        ORDER BY subscribers_count DESC, c.name ASC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "code": r[0],
+            "name": r[1],
+            "emoji": r[2],
+            "subscribers_count": r[3] or 0,
+        }
+        for r in rows
+    ]
 
 def is_message_processed(message_id: str, chat_id: str) -> bool:
     conn = sqlite3.connect(DB_NAME, timeout=10.0)

@@ -4,6 +4,7 @@ import logging
 import hashlib
 import sqlite3
 from datetime import datetime
+from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
@@ -13,7 +14,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from db import *
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
-    start_realtime_listener, stop_realtime_listener, get_new_messages
+    start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text
 )
 from config import BOT_TOKEN, YOUR_USER_ID
 
@@ -55,6 +56,9 @@ class PostVacancyState(StatesGroup):
 class RespondWithPhotoState(StatesGroup):
     waiting_for_photo = State()
 
+class ResponseDraftState(StatesGroup):
+    waiting_for_comment = State()
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def escape_markdown(text: str) -> str:
@@ -63,8 +67,8 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
-def generate_vacancy_id(chat_id: str, message_id: str) -> str:
-    unique_str = f"{chat_id}_{message_id}"
+def generate_vacancy_id(chat_id: str, message_id: str, dedupe_key: str = None) -> str:
+    unique_str = dedupe_key or f"{chat_id}_{message_id}"
     return hashlib.md5(unique_str.encode()).hexdigest()[:16]
 
 def get_category_emoji(category_code: str) -> str:
@@ -86,18 +90,127 @@ def calculate_age(birth_date_str: str) -> int:
     except ValueError:
         return None
 
+def format_user_card(card: dict, idx: int = None) -> str:
+    prefix = f"{idx}. " if idx is not None else ""
+    name = card.get("full_name") or "—"
+    username = f"@{card['username']}" if card.get("username") else "нет"
+    cats = ", ".join(card.get("categories") or []) or "не выбраны"
+    status = "активен" if card.get("is_active") else "неактивен"
+    return (
+        f"{prefix}👤 *{escape_markdown(name)}*\n"
+        f"ID: `{card['user_id']}`\n"
+        f"Username: {escape_markdown(username)}\n"
+        f"Телефон: {escape_markdown(card.get('phone') or '—')}\n"
+        f"Возраст: {escape_markdown(str(card.get('age') or '—'))}\n"
+        f"Статус: {escape_markdown(status)}\n"
+        f"Категории: {escape_markdown(cats)}"
+    )
+
+def format_publication_time(raw_dt: str) -> str:
+    if not raw_dt:
+        return "сейчас"
+    try:
+        dt = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return raw_dt
+
+def get_freshness_label(raw_dt: str) -> str:
+    if not raw_dt:
+        return "🟢 Актуальна"
+    try:
+        published = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S")
+        delta_minutes = (datetime.now() - published).total_seconds() / 60
+        if delta_minutes <= 30:
+            return "🟢 Актуальна: только что"
+        if delta_minutes <= 180:
+            return "🟢 Актуальна: сегодня"
+        return "🟡 Актуальна: ранее сегодня"
+    except Exception:
+        return "🟢 Актуальна"
+
+def normalize_chat_link(raw: str) -> str:
+    if not raw:
+        return None
+    link = raw.strip()
+    if link.startswith("@"):
+        return f"https://t.me/{link[1:]}"
+    if link.startswith("https://t.me/"):
+        return link.rstrip("/")
+    if link.startswith("http://t.me/"):
+        return "https://" + link[len("http://") :].rstrip("/")
+    if link.startswith("t.me/"):
+        return f"https://{link}".rstrip("/")
+    if re.fullmatch(r"[a-zA-Z0-9_]{5,32}", link):
+        return f"https://t.me/{link}"
+    return None
+
+def extract_required_fields_from_vacancy(vacancy_text: str) -> list:
+    if not vacancy_text:
+        return []
+    txt = vacancy_text.lower()
+    required = []
+    checks = [
+        ("Возраст", ["возраст", "лет"]),
+        ("Гражданство", ["гражданств", "рф", "снг"]),
+        ("Опыт", ["опыт", "стаж"]),
+        ("Размер одежды", ["размер одежды", "размер"]),
+        ("Паспорт", ["паспорт"]),
+        ("Медкнижка", ["медкниж", "мед книж"]),
+        ("Самозанятость", ["самозанят", "самозанятость"]),
+    ]
+    for label, keys in checks:
+        if any(k in txt for k in keys):
+            required.append(label)
+    return required
+
+def build_candidate_profile_text(profile: dict, extra_comment: str = None) -> str:
+    lines = [
+        "Здравствуйте! Откликаюсь на вашу вакансию.",
+        "",
+        "Анкета кандидата:",
+        f"• ФИО: {profile.get('full_name') or '—'}",
+        f"• Возраст: {profile.get('age') or '—'}",
+        f"• Телефон: {profile.get('phone') or '—'}",
+        f"• Telegram: @{profile.get('username') if profile.get('username') else 'нет'}",
+    ]
+    if extra_comment:
+        lines.extend(["", "Дополнительно:", extra_comment.strip()])
+    return "\n".join(lines).strip()
+
+def build_contact_link(contact: str, text: str) -> str:
+    if not contact:
+        return None
+    contact = contact.strip()
+    if contact.startswith("@"):
+        username = contact[1:]
+        return f"https://t.me/{username}?text={quote(text)}"
+    digits = re.sub(r"\D", "", contact)
+    if digits:
+        if len(digits) == 11 and digits.startswith("8"):
+            digits = "7" + digits[1:]
+        if len(digits) == 11 and digits.startswith("7"):
+            return f"tel:+{digits}"
+    return None
+
 # ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
 
 async def send_vacancy_to_subscribers(order: dict):
     category_code = order.get('category', detect_category(order['message_text']))
-    vacancy_id = generate_vacancy_id(order.get('chat_id', ''), order.get('message_id', ''))
+    dedupe_key = order.get("dedupe_key")
+    vacancy_id = generate_vacancy_id(order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=dedupe_key)
     subscribers = get_subscribers_by_category(category_code)
     if not subscribers:
         logger.info(f"Нет подписчиков на категорию {category_code}")
         return
 
+    published_raw = order.get("published_at")
+    published_at = format_publication_time(published_raw)
+    freshness = get_freshness_label(published_raw)
     text = (
         f"{get_category_emoji(category_code)} *Вакансия:*\n\n"
+        f"{escape_markdown(freshness)}\n"
+        f"🕒 Опубликовано: {escape_markdown(published_at)}\n\n"
         f"{escape_markdown(order['message_text'][:500])}\n\n"
         f"📢 Источник: {escape_markdown(order['chat_title'])}"
     )
@@ -118,7 +231,9 @@ async def send_vacancy_to_subscribers(order: dict):
         message_text=order['message_text'][:1000],
         message_link=order['message_link'],
         author_contact=order.get('author_contact'),
-        address=order.get('address')
+        address=order.get('address'),
+        dedupe_key=dedupe_key,
+        published_at=order.get("published_at")
     )
 
     sent_count = 0
@@ -192,6 +307,7 @@ def get_admin_keyboard():
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔍 Ручная проверка")],
             [KeyboardButton(text="📋 Список откликов"), KeyboardButton(text="📝 Отчёт парсера")],
             [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="🗂️ Карточки пользователей"), KeyboardButton(text="🧭 Маппинг категорий")],
             [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
             [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📤 Отправить вакансию")],
             [KeyboardButton(text="❌ Закрыть меню")]
@@ -500,8 +616,11 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
 
     await message.answer(f"📬 *Вакансии (страница {page+1} из {(total-1)//10 + 1})*", parse_mode="Markdown")
     for vac in vacancies[start:end]:
+        raw_pub = vac.get('published_at') or vac.get('found_at')
         text = (
             f"{vac['category']['emoji']} *{vac['category']['name']}*\n"
+            f"{escape_markdown(get_freshness_label(raw_pub))}\n"
+            f"🕒 Опубликовано: {escape_markdown(format_publication_time(raw_pub))}\n"
             f"📢 Из чата: {escape_markdown(vac['source'])}\n\n"
             f"{escape_markdown(vac['text'][:400])}\n\n"
             f"🔗 [Ссылка на сообщение]({vac['link']})"
@@ -668,20 +787,39 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if not profile or not profile.get("full_name") or not profile.get("phone"):
         await callback.answer("⚠️ Сначала заполните профиль! Нажмите /start", show_alert=True)
         return
-    existing_photo = profile.get('photo_file_id')
-    if existing_photo:
-        await send_application(callback, user_id, vacancy_id, existing_photo)
-    else:
-        await state.update_data(vacancy_id=vacancy_id)
-        await callback.message.answer(
-            "📸 *Для отклика отправьте ваше фото*\n\n"
-            "Это поможет работодателю лучше вас узнать. Отправьте фото сейчас или нажмите «Пропустить».",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_photo_respond")]
-            ])
-        )
-        await state.set_state(RespondWithPhotoState.waiting_for_photo)
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT message_text, message_link, source_chat_title, author_contact, address FROM vacancies WHERE id = ?", (vacancy_id,))
+    vacancy_row = cur.fetchone()
+    conn.close()
+    if not vacancy_row:
+        await callback.answer("❌ Вакансия не найдена", show_alert=True)
+        return
+    vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
+    employer_contact = saved_contact or extract_contact_from_text(vacancy_text or "")
+    if not employer_contact:
+        await callback.answer("⚠️ Контакт заказчика не найден. Отправлю отклик администратору.", show_alert=True)
+        await send_to_admin(callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get('photo_file_id'))
+        return
+    required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
+    draft_text = build_candidate_profile_text(profile)
+    contact_link = build_contact_link(employer_contact, draft_text)
+    await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
+    req_line = ", ".join(required_fields) if required_fields else "явных требований не найдено"
+    msg = (
+        "📨 *Черновик отклика готов*\n\n"
+        f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
+        f"📌 Источник: {escape_markdown(source_chat or '—')}\n"
+        f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
+        "Нажмите кнопку ниже, откроется личный чат с заказчиком и готовым текстом анкеты.\n"
+        "Перед отправкой можно отредактировать сообщение вручную."
+    )
+    buttons = []
+    if contact_link:
+        buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
+    buttons.append([InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data=f"respond_add_{vacancy_id}")])
+    buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
+    await callback.message.answer(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_vacancy")
@@ -723,6 +861,52 @@ async def skip_photo_respond(callback: types.CallbackQuery, state: FSMContext):
     await send_application(callback, callback.from_user.id, (await state.get_data()).get("vacancy_id"), None)
     await state.clear()
     await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("respond_add_"))
+async def respond_add_comment(callback: types.CallbackQuery, state: FSMContext):
+    vacancy_id = callback.data.replace("respond_add_", "")
+    await state.update_data(vacancy_id=vacancy_id)
+    await callback.message.answer("✏️ Напишите, что добавить в отклик одним сообщением:")
+    await state.set_state(ResponseDraftState.waiting_for_comment)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "respond_cancel")
+async def respond_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.answer("Отклик отменён", show_alert=False)
+
+@dp.message(ResponseDraftState.waiting_for_comment)
+async def respond_comment_received(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    vacancy_id = data.get("vacancy_id")
+    profile = get_subscriber_profile(message.from_user.id)
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT message_text, author_contact FROM vacancies WHERE id = ?", (vacancy_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        await message.answer("❌ Вакансия не найдена.")
+        await state.clear()
+        return
+    vacancy_text, saved_contact = row
+    contact = saved_contact or extract_contact_from_text(vacancy_text or "")
+    draft_text = build_candidate_profile_text(profile, extra_comment=message.text)
+    link = build_contact_link(contact, draft_text)
+    if not link:
+        await message.answer(
+            f"⚠️ Не удалось собрать ссылку для чата. Контакт: {contact or 'не найден'}\n\n"
+            f"Скопируйте и отправьте вручную:\n\n{draft_text}"
+        )
+        await state.clear()
+        return
+    await message.answer(
+        "✅ Обновил черновик. Откройте чат с заказчиком:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="✅ Открыть чат и отправить", url=link)]]
+        )
+    )
+    await state.clear()
 
 @dp.message(RespondWithPhotoState.waiting_for_photo)
 async def respond_photo_received(message: types.Message, state: FSMContext):
@@ -854,6 +1038,25 @@ async def debug_last_cmd(message: types.Message):
         return
     await message.answer(get_last_debug_report())
 
+@dp.message(Command("usercards"))
+async def usercards_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await show_admin_user_cards(message, page=0)
+
+@dp.message(Command("catmap"))
+async def catmap_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    mapping = get_user_category_mapping()
+    if not mapping:
+        await message.answer("📭 Маппинг пуст.")
+        return
+    lines = ["🧭 *Маппинг категорий (активные подписчики):*"]
+    for row in mapping:
+        lines.append(f"• {row['emoji']} {row['name']} (`{row['code']}`): *{row['subscribers_count']}*")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
 @dp.message(Command("myid"))
 async def show_my_id(message: types.Message):
     await message.answer(
@@ -907,12 +1110,15 @@ async def add_chat_cmd(message: types.Message, state: FSMContext):
 
 @dp.message(AddChatState.waiting_for_link)
 async def process_add_chat(message: types.Message, state: FSMContext):
-    chat_link = message.text.strip()
-    if not chat_link.startswith("https://t.me/"):
-        await message.answer("❌ Неверный формат ссылки. Ссылка должна начинаться с https://t.me/")
+    chat_link = normalize_chat_link(message.text)
+    if not chat_link:
+        await message.answer("❌ Неверный формат. Отправьте @username, username или ссылку t.me/...")
         return
     if add_target_chat(chat_link):
-        await message.answer(f"✅ Чат {chat_link} добавлен для парсинга.")
+        await message.answer(
+            f"✅ Чат {chat_link} добавлен для парсинга.\n"
+            "Новые сообщения будут подхватываться автоматически."
+        )
     else:
         await message.answer(f"⚠️ Чат {chat_link} уже существует.")
     await state.clear()
@@ -1048,6 +1254,48 @@ async def admin_subscribers_button(message: types.Message):
 async def admin_broadcast_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
         await message.answer("📢 Используйте команду `/broadcast Текст`", parse_mode="Markdown")
+
+async def show_admin_user_cards(message: types.Message, page: int = 0):
+    limit = 5
+    offset = page * limit
+    cards = get_subscriber_cards(limit=limit, offset=offset)
+    if not cards:
+        await message.answer("📭 Карточек больше нет.")
+        return
+    total_subs = len(get_all_subscribers())
+    pages_total = max(1, (total_subs + limit - 1) // limit)
+    lines = [f"🗂️ *Карточки пользователей* (страница {page + 1}/{pages_total})"]
+    for i, card in enumerate(cards, 1):
+        lines.append("")
+        lines.append(format_user_card(card, idx=offset + i))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_cards_{page-1}"))
+    if page + 1 < pages_total:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_cards_{page+1}"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[nav]) if nav else None
+    await message.answer("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+
+@dp.message(lambda m: m.text == "🗂️ Карточки пользователей")
+async def admin_user_cards_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await show_admin_user_cards(message, page=0)
+
+@dp.message(lambda m: m.text == "🧭 Маппинг категорий")
+async def admin_category_mapping_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await catmap_cmd(message)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("admin_cards_"))
+async def admin_cards_page_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    page = int(callback.data.split("_")[2])
+    await show_admin_user_cards(callback.message, page=page)
+    await callback.answer()
 
 @dp.message(lambda m: m.text == "⚠️ Жалобы")
 async def admin_complaints_button(message: types.Message):

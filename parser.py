@@ -1,5 +1,7 @@
 import re
 import logging
+import hashlib
+from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon import errors
 import asyncio
@@ -8,7 +10,8 @@ from config import API_ID, API_HASH, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_P
 from db import (
     get_target_chats, is_message_processed, mark_vacancy_closed,
     get_last_processed_id, update_last_processed_id,
-    save_vacancy, mark_message_processed
+    save_vacancy, mark_message_processed, has_recent_duplicate_vacancy,
+    get_recent_open_vacancies_for_dedupe
 )
 
 logger = logging.getLogger(__name__)
@@ -24,24 +27,46 @@ async def start_realtime_listener(bot_callback):
     logger.info("✅ Real-time listener подключён")
 
     target_chats = get_target_chats()
+    target_chat_set = set(target_chats)
     for link in target_chats:
         try:
             await _realtime_client.get_entity(link)
         except Exception as e:
             logger.warning(f"Не удалось получить entity для {link}: {e}")
 
-    @_realtime_client.on(events.NewMessage(chats=target_chats))
+    @_realtime_client.on(events.NewMessage())
     async def handler(event):
+        nonlocal target_chat_set
+        # Динамически подхватываем новые чаты, добавленные админом в БД
+        latest_targets = get_target_chats()
+        if set(latest_targets) != target_chat_set:
+            target_chat_set = set(latest_targets)
+        if not latest_targets:
+            return
+
+        chat = await event.get_chat()
+        username = getattr(chat, "username", None)
+        chat_link_variants = {str(chat.id), str(event.chat_id)}
+        if username:
+            chat_link_variants.update({
+                f"https://t.me/{username}",
+                f"t.me/{username}",
+                f"@{username}",
+                username,
+            })
+
+        if not any(v in target_chat_set for v in chat_link_variants):
+            return
+
         logger.info(f"⚡ Real-time: получено новое сообщение из чата {event.chat_id}")
         message = event.message
-        chat = await event.get_chat()
         chat_id = str(chat.id)
         message_id = message.id
 
         if is_message_processed(str(message_id), chat_id):
             return
 
-        if (datetime.now(message.date.tzinfo) - message.date).days > 3:
+        if not is_message_for_today(message.date):
             return
 
         if message.is_reply:
@@ -64,6 +89,13 @@ async def start_realtime_listener(bot_callback):
         vacancy_id = f"{chat_id}_{message_id}"
         author_contact = extract_contact_from_text(message.text)
         address = extract_address_from_text(message.text)
+        dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
+
+        duplicate_type = detect_duplicate_type(message.text, author_contact, dedupe_key)
+        if duplicate_type:
+            mark_message_processed(str(message_id), chat_id)
+            update_last_processed_id(chat_id, message_id)
+            return
 
         save_vacancy(
             vacancy_id=vacancy_id,
@@ -74,7 +106,9 @@ async def start_realtime_listener(bot_callback):
             message_link=message_link,
             author_contact=author_contact,
             address=address,
-            is_closed=False
+            is_closed=False,
+            dedupe_key=dedupe_key,
+            published_at=message.date.strftime("%Y-%m-%d %H:%M:%S")
         )
 
         order = {
@@ -86,6 +120,8 @@ async def start_realtime_listener(bot_callback):
             "message_id": str(message_id),
             "address": address,
             "author_contact": author_contact,
+            "dedupe_key": dedupe_key,
+            "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
         }
 
         await bot_callback(order)
@@ -125,6 +161,8 @@ def _new_stats() -> dict:
         "categories": {},
         "old_messages": 0,
         "closed_vacancies": 0,
+        "duplicates_exact": 0,
+        "duplicates_fuzzy": 0,
     }
 
 LAST_DEBUG_STATS = _new_stats()
@@ -141,6 +179,7 @@ def get_last_debug_report() -> str:
         f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
         f"Совпадений найдено: {s.get('matched', 0)}",
         f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | уже обработано: {s.get('already_sent', 0)} | старых: {s.get('old_messages', 0)} | закрыто: {s.get('closed_vacancies', 0)}",
+        f"Дубли: exact={s.get('duplicates_exact', 0)} | fuzzy={s.get('duplicates_fuzzy', 0)}",
         f"Локальных ошибок: {s.get('errors', 0)}",
     ]
     categories = s.get("categories") or {}
@@ -164,6 +203,9 @@ def get_last_debug_report() -> str:
 def extract_contact_from_text(text: str) -> str:
     if not text:
         return None
+    resolve_match = re.search(r'tg://resolve\?domain=([a-zA-Z0-9_]{5,32})', text, re.IGNORECASE)
+    if resolve_match:
+        return f"@{resolve_match.group(1)}"
     username_match = re.search(r'@([a-zA-Z0-9_]{5,32})', text)
     if username_match:
         return username_match.group(0)
@@ -181,17 +223,80 @@ def extract_contact_from_text(text: str) -> str:
 def extract_address_from_text(text: str) -> str:
     if not text:
         return None
-    text_lower = text.lower()
-    metro_match = re.search(r'м\.\s*([А-Яа-яёЁ\-]+)', text)
+    direct_match = re.search(r'(?:адрес|локация|место)\s*[:\-]\s*([^\n]{6,120})', text, re.IGNORECASE)
+    if direct_match:
+        return direct_match.group(1).strip(" .,")
+    metro_match = re.search(r'(?:м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁ\-\s]{2,50})', text, re.IGNORECASE)
     if metro_match:
-        return f"метро {metro_match.group(1)}"
-    street_match = re.search(r'(ул\.|улица)\s+([А-Яа-яёЁ\-\.\s]+?)(?:\s|$)', text)
+        return f"метро {metro_match.group(1).strip(' .,')}"
+    street_match = re.search(
+        r'((?:ул\.|улица|пр-т|проспект|пер\.|переулок|шоссе|наб\.|набережная)\s+[А-Яа-яёЁ0-9\-\.\s]{3,80}(?:,\s*\d+[А-Яа-яёЁA-Za-z0-9\/-]*)?)',
+        text,
+        re.IGNORECASE
+    )
     if street_match:
-        return f"{street_match.group(1)} {street_match.group(2)}".strip()
-    city_match = re.search(r'(?:в\s+)?(Москва|МО|Подольск|Химки|Мытищи|Красногорск|Люберцы|Балашиха|Королёв|Одинцово|Домодедово|Железнодорожный|Видное|Щёлково|Электросталь|Коломна|Серпухов)', text_lower)
+        return street_match.group(1).strip(" .,")
+    city_match = re.search(
+        r'\b(Москва|МО|Подольск|Химки|Мытищи|Красногорск|Люберцы|Балашиха|Корол[её]в|Одинцово|Домодедово|Железнодорожный|Видное|Щ[её]лково|Электросталь|Коломна|Серпухов)\b',
+        text,
+        re.IGNORECASE
+    )
     if city_match:
-        return city_match.group(0)
+        return city_match.group(1)
     return None
+
+def _normalize_for_dedupe(text: str) -> str:
+    if not text:
+        return ""
+    normalized = re.sub(r'https?://\S+|t\.me/\S+', ' ', text.lower())
+    normalized = re.sub(r'@\w+', ' ', normalized)
+    normalized = re.sub(r'[\W_]+', ' ', normalized, flags=re.UNICODE)
+    return re.sub(r'\s+', ' ', normalized).strip()
+
+def build_vacancy_dedupe_key(text: str, author_contact: str) -> str:
+    normalized_text = _normalize_for_dedupe(text)[:280]
+    normalized_contact = (author_contact or "").strip().lower()
+    payload = f"{normalized_contact}|{normalized_text}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]
+
+def _extract_phone_digits(text: str) -> str:
+    if not text:
+        return None
+    match = re.search(r'(\+7|8)[\s\-]?\(?(\d{3})\)?[\s\-]?(\d{3})[\s\-]?(\d{2})[\s\-]?(\d{2})', text)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(0))
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return digits if len(digits) == 11 else None
+
+def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> str:
+    if has_recent_duplicate_vacancy(dedupe_key, max_age_days=1):
+        return "exact"
+    normalized_text = _normalize_for_dedupe(text)
+    if not normalized_text:
+        return None
+    phone_digits = _extract_phone_digits(text)
+    normalized_contact = (author_contact or "").strip().lower()
+    recent = get_recent_open_vacancies_for_dedupe(max_age_days=1, limit=250)
+    for row in recent:
+        candidate_text = _normalize_for_dedupe(row.get("message_text", ""))
+        if not candidate_text:
+            continue
+        same_contact = normalized_contact and normalized_contact == (row.get("author_contact") or "").strip().lower()
+        same_phone = phone_digits and phone_digits == _extract_phone_digits(row.get("message_text", ""))
+        if not (same_contact or same_phone):
+            continue
+        similarity = SequenceMatcher(None, normalized_text, candidate_text).ratio()
+        if similarity >= 0.82:
+            return "fuzzy"
+    return None
+
+def is_message_for_today(message_dt: datetime) -> bool:
+    if not message_dt:
+        return False
+    now = datetime.now(message_dt.tzinfo)
+    return message_dt.date() == now.date()
 
 def detect_category(text: str) -> str:
     if not text:
@@ -298,8 +403,6 @@ async def get_new_messages(limit_per_chat: int = 500):
     client = TelegramClient('user_session', API_ID, API_HASH)
     all_results = []
     closed_vacancies_users = []
-    MAX_AGE_DAYS = 3
-
     target_chats = get_target_chats()
     if not target_chats:
         logger.warning("Нет чатов для парсинга. Добавьте чаты через /addchat")
@@ -311,7 +414,7 @@ async def get_new_messages(limit_per_chat: int = 500):
         logger.info(f"🎯 ИЩЕМ ТОЛЬКО: {', '.join(HELPER_KEYWORDS[:10])}...")
         logger.info(f"🚫 ИСКЛЮЧАЕМ: {', '.join(EXCLUDE_CATEGORIES[:10])}...")
         logger.info(f"📋 Всего каналов для проверки: {len(target_chats)}")
-        logger.info(f"⏳ Пропускаем сообщения старше {MAX_AGE_DAYS} дней")
+        logger.info("⏳ Пропускаем сообщения не за сегодня")
 
         for i, chat_link in enumerate(target_chats, 1):
             logger.info(f"🔍 [{i}/{len(target_chats)}] Проверяю: {chat_link}")
@@ -340,7 +443,7 @@ async def get_new_messages(limit_per_chat: int = 500):
                         LAST_DEBUG_STATS["already_sent"] += 1
                         continue
 
-                    if (datetime.now(message.date.tzinfo) - message.date).days > MAX_AGE_DAYS:
+                    if not is_message_for_today(message.date):
                         LAST_DEBUG_STATS["old_messages"] += 1
                         continue
 
@@ -370,6 +473,16 @@ async def get_new_messages(limit_per_chat: int = 500):
                     vacancy_id = f"{chat_id}_{message_id}"
                     author_contact = extract_contact_from_text(message.text)
                     address = extract_address_from_text(message.text)
+                    dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
+
+                    duplicate_type = detect_duplicate_type(message.text, author_contact, dedupe_key)
+                    if duplicate_type:
+                        if duplicate_type == "exact":
+                            LAST_DEBUG_STATS["duplicates_exact"] += 1
+                        else:
+                            LAST_DEBUG_STATS["duplicates_fuzzy"] += 1
+                        mark_message_processed(message_id, chat_id)
+                        continue
 
                     save_vacancy(
                         vacancy_id=vacancy_id,
@@ -380,7 +493,9 @@ async def get_new_messages(limit_per_chat: int = 500):
                         message_link=message_link,
                         author_contact=author_contact,
                         address=address,
-                        is_closed=False
+                        is_closed=False,
+                        dedupe_key=dedupe_key,
+                        published_at=message.date.strftime("%Y-%m-%d %H:%M:%S")
                     )
 
                     result = {
@@ -394,6 +509,8 @@ async def get_new_messages(limit_per_chat: int = 500):
                         "reason": reason,
                         "author_contact": author_contact,
                         "address": address,
+                        "dedupe_key": dedupe_key,
+                        "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
                     }
                     all_results.append(result)
                     LAST_DEBUG_STATS["matched"] += 1
