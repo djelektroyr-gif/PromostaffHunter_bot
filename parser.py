@@ -17,11 +17,6 @@ logger = logging.getLogger(__name__)
 _realtime_client = None
 
 async def start_realtime_listener(bot_callback):
-    """
-    Запускает real-time прослушивание новых сообщений.
-    bot_callback – асинхронная функция, которая будет вызвана для каждого нового сообщения.
-    Она должна принимать параметр order (словарь с вакансией).
-    """
     global _realtime_client
     _realtime_client = TelegramClient('user_session', API_ID, API_HASH)
     await _realtime_client.start()
@@ -32,11 +27,10 @@ async def start_realtime_listener(bot_callback):
         try:
             entity = await _realtime_client.get_entity(link)
             last_id = get_last_processed_id(str(entity.id))
-            # Не передаём offset_id, Telethon сам будет получать только новые сообщения
         except Exception as e:
             logger.warning(f"Не удалось получить entity для {link}: {e}")
 
-        @_realtime_client.on(events.NewMessage(chats=target_chats))
+    @_realtime_client.on(events.NewMessage(chats=target_chats))
     async def handler(event):
         logger.info(f"⚡ Real-time: получено новое сообщение из чата {event.chat_id}")
         message = event.message
