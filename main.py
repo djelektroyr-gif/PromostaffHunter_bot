@@ -63,8 +63,12 @@ class RespondWithPhotoState(StatesGroup):
 class ResponseDraftState(StatesGroup):
     waiting_for_comment = State()
 
+class CategorySelectionState(StatesGroup):
+    choosing = State()
+
 # ========== ПЕРИОДИЧЕСКИЙ ПОЛЛИНГ ==========
 async def periodic_polling():
+    await asyncio.sleep(2)  # Даём время завершиться стартовому парсингу
     while True:
         try:
             logger.info("🔍 Периодическая проверка новых сообщений...")
@@ -73,8 +77,12 @@ async def periodic_polling():
                 await notify_closed_vacancies(closed_data)
             for order in orders:
                 await send_vacancy_to_subscribers(order)
+        except asyncio.CancelledError:
+            logger.info("Периодическая проверка остановлена")
+            break
         except Exception as e:
-            logger.error(f"Ошибка в периодической проверке: {e}")
+            logger.error(f"Ошибка в периодической проверке: {e}", exc_info=True)
+            await asyncio.sleep(30)
         await asyncio.sleep(60)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
@@ -536,7 +544,9 @@ async def show_my_categories(message: types.Message):
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(lambda m: m.text == "✏️ Изменить категории")
-async def edit_categories(message: types.Message):
+async def edit_categories(message: types.Message, state: FSMContext):   # добавьте state в аргументы
+    await state.set_state(CategorySelectionState.choosing)
+    await state.update_data(selected_categories=[])   # очищаем предыдущий выбор
     await message.answer(
         "📋 *Выберите категории вакансий:*\n\n"
         "Когда закончите, нажмите «Завершить выбор»",
@@ -846,6 +856,109 @@ async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_que
 async def already_responded(callback: types.CallbackQuery):
     await callback.answer("Вы уже откликались на эту вакансию", show_alert=True)
 
+# ========== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ (FSM) ==========
+@dp.message(Command("start"))
+async def start_cmd(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    profile = get_subscriber_profile(user_id)
+    
+    if profile and profile.get("full_name"):
+        # Уже зарегистрирован – показываем меню
+        keyboard, status_text = get_main_keyboard(user_id)
+        await message.answer(
+            f"🏠 *Главное меню*\n\n{status_text}",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+    else:
+        # Новая регистрация
+        await message.answer(
+            "👋 *Добро пожаловать в бот по поиску работы!*\n\n"
+            "Давайте заполним вашу анкету.\n\n"
+            "Как вас зовут? (ФИО полностью)",
+            parse_mode="Markdown"
+        )
+        await state.set_state(RegistrationState.waiting_for_name)
+
+@dp.message(RegistrationState.waiting_for_name)
+async def reg_name(message: types.Message, state: FSMContext):
+    await state.update_data(full_name=message.text.strip())
+    await message.answer("Введите дату рождения в формате ДД.ММ.ГГГГ (например, 15.05.1990):")
+    await state.set_state(RegistrationState.waiting_for_birthdate)
+
+@dp.message(RegistrationState.waiting_for_birthdate)
+async def reg_birthdate(message: types.Message, state: FSMContext):
+    birth_str = message.text.strip()
+    age = calculate_age(birth_str)
+    if age is None:
+        await message.answer("Неверный формат. Попробуйте ещё раз (ДД.ММ.ГГГГ):")
+        return
+    await state.update_data(birthdate=birth_str, age=age)
+    await message.answer(
+        "Отправьте ваш номер телефона (нажмите кнопку ниже) или введите вручную:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 Отправить номер", request_contact=True)]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(RegistrationState.waiting_for_phone)
+
+@dp.message(RegistrationState.waiting_for_phone)
+async def reg_phone(message: types.Message, state: FSMContext):
+    phone = None
+    if message.contact:
+        phone = message.contact.phone_number
+    else:
+        phone = message.text.strip()
+    await state.update_data(phone=phone)
+    await message.answer(
+        "Отправьте ваше фото (для портфолио) или нажмите «Пропустить»:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⏩ Пропустить")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(RegistrationState.waiting_for_photo)
+
+@dp.message(RegistrationState.waiting_for_photo)
+async def reg_photo(message: types.Message, state: FSMContext):
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    elif message.text == "⏩ Пропустить":
+        pass
+    else:
+        await message.answer("Пожалуйста, отправьте фото или нажмите «Пропустить»")
+        return
+    
+    data = await state.get_data()
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+
+    save_subscriber_profile(
+        user_id=user_id,
+        full_name=data['full_name'],
+        birthdate=data['birthdate'],
+        age=data['age'],
+        phone=data['phone'],
+        username=username,
+        first_name=first_name,
+        photo_file_id=photo_id
+    )
+    
+    await message.answer(
+        "✅ Регистрация завершена! Теперь выберите категории вакансий:",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await state.set_state(CategorySelectionState.choosing)
+    await message.answer(
+        "📋 *Выберите категории вакансий:*\n\nКогда закончите, нажмите «Завершить выбор»",
+        parse_mode="Markdown",
+        reply_markup=get_categories_keyboard()
+    )
+    # state.clear() НЕ вызываем – переходим в режим выбора категорий
+
 # ========== АДМИНСКИЕ КОМАНДЫ ==========
 @dp.message(Command("admin"))
 async def admin_menu(message: types.Message):
@@ -1004,7 +1117,7 @@ async def post_vacancy_cmd(message: types.Message, state: FSMContext):
     await message.answer("📤 *Отправка вакансии подписчикам*\n\nВыберите категорию:", parse_mode="Markdown", reply_markup=get_categories_keyboard())
     await state.set_state(PostVacancyState.waiting_for_category)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
+@dp.callback_query(lambda c: c.data and c.data.startswith("cat_"), PostVacancyState.waiting_for_category)
 async def post_vacancy_category(callback: types.CallbackQuery, state: FSMContext):
     current_state = await state.get_state()
     if current_state != PostVacancyState.waiting_for_category:
@@ -1245,6 +1358,39 @@ async def admin_close_menu(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
         await message.answer("Меню закрыто. Для открытия напишите /start", reply_markup=ReplyKeyboardRemove())
 
+# ========== ВЫБОР КАТЕГОРИЙ ПОЛЬЗОВАТЕЛЕМ ==========
+@dp.callback_query(lambda c: c.data and c.data.startswith("cat_") and c.data != "finish_categories", CategorySelectionState.choosing)
+async def select_category(callback: types.CallbackQuery, state: FSMContext):
+    category_code = callback.data.replace("cat_", "")
+    data = await state.get_data()
+    selected = data.get("selected_categories", [])
+    if category_code not in selected:
+        selected.append(category_code)
+        await state.update_data(selected_categories=selected)
+        await callback.answer(f"✅ Добавлено", show_alert=False)
+    else:
+        await callback.answer(f"⚠️ Уже выбрано", show_alert=False)
+
+@dp.callback_query(lambda c: c.data == "finish_categories", CategorySelectionState.choosing)
+async def finish_categories(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    selected = data.get("selected_categories", [])
+    if not selected:
+        await callback.message.edit_text("⚠️ Вы не выбрали ни одной категории. Выберите хотя бы одну.")
+        await callback.answer()
+        return
+    set_user_categories(user_id, selected)
+    await callback.message.edit_text("✅ Категории сохранены!")
+    keyboard, status_text = get_main_keyboard(user_id)
+    await callback.message.answer(
+        f"🏠 *Главное меню*\n\n{status_text}",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await state.clear()
+    await callback.answer()
+
 # ========== ЗАПУСК И ОСТАНОВКА ==========
 async def on_startup():
     logger.info("🚀 Запуск бота...")
@@ -1257,9 +1403,11 @@ async def on_startup():
         await notify_closed_vacancies(closed)
     for order in orders:
         await send_vacancy_to_subscribers(order)
-    logger.info("✅ Однократная проверка завершена")
 
-    asyncio.create_task(periodic_polling())
+    logger.info("✅ Однократная проверка завершена")
+    await asyncio.sleep(2)   # даём время на освобождение ресурсов Telethon
+
+    asyncio.create_task(periodic_polling())   # используем глобальную функцию
     logger.info("📡 Периодический поллинг запущен (интервал 60 секунд)")
 
     logger.info("📡 Запуск polling...")

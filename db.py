@@ -239,6 +239,18 @@ def update_subscriber_profile(user_id: int, full_name: str, age: int, phone: str
     conn.commit()
     conn.close()
 
+def save_subscriber_profile(user_id: int, full_name: str, birthdate: str, age: int, phone: str,
+                            username: str = None, first_name: str = None, photo_file_id: str = None):
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT OR REPLACE INTO subscribers
+        (user_id, full_name, age, phone, username, first_name, photo_file_id, registered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (user_id, full_name, age, phone, username, first_name, photo_file_id))
+    conn.commit()
+    conn.close()
+
 def update_subscriber_photo(user_id: int, photo_file_id: str):
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
