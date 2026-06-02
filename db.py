@@ -8,7 +8,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
 
-    # 1. Таблица подписчиков (расширенная с анкетой и фото)
+    # 1. Таблица подписчиков
     cur.execute("""
         CREATE TABLE IF NOT EXISTS subscribers (
             user_id INTEGER PRIMARY KEY,
@@ -24,12 +24,10 @@ def init_db():
             is_active BOOLEAN DEFAULT 1
         )
     """)
-    # Добавляем колонку photo_file_id если её нет
     cur.execute("PRAGMA table_info(subscribers)")
     cols = [c[1] for c in cur.fetchall()]
     if "photo_file_id" not in cols:
         cur.execute("ALTER TABLE subscribers ADD COLUMN photo_file_id TEXT DEFAULT NULL")
-    # Добавляем колонку questionnaire если её нет
     if "questionnaire" not in cols:
         cur.execute("ALTER TABLE subscribers ADD COLUMN questionnaire TEXT DEFAULT NULL")
 
@@ -43,7 +41,7 @@ def init_db():
         )
     """)
 
-    # 3. Таблица подписок (какие категории выбрал пользователь)
+    # 3. Таблица подписок
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_categories (
             user_id INTEGER,
@@ -55,7 +53,7 @@ def init_db():
         )
     """)
 
-    # 4. Таблица найденных вакансий (с добавлением колонок address и is_closed)
+    # 4. Таблица найденных вакансий
     cur.execute("""
         CREATE TABLE IF NOT EXISTS vacancies (
             id TEXT PRIMARY KEY,
@@ -78,7 +76,7 @@ def init_db():
     if "is_closed" not in cols:
         cur.execute("ALTER TABLE vacancies ADD COLUMN is_closed BOOLEAN DEFAULT 0")
 
-    # 5. Таблица отправленных вакансий (кому и что отправили)
+    # 5. Таблица отправленных вакансий
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sent_vacancies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +88,7 @@ def init_db():
         )
     """)
 
-    # 6. Таблица откликов (уже содержит vacancy_text и vacancy_link, добавим фото)
+    # 6. Таблица откликов
     cur.execute("""
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +118,7 @@ def init_db():
         )
     """)
 
-    # 8. Таблица жалоб на вакансии
+    # 8. Таблица жалоб
     cur.execute("""
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,6 +191,15 @@ def init_db():
             categories
         )
 
+    # 11. Таблица для хранения последнего обработанного message_id по чату (для real-time)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS last_processed (
+            chat_id TEXT PRIMARY KEY,
+            last_message_id INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -202,10 +209,17 @@ def init_db():
 def add_subscriber(user_id: int, username: str, first_name: str, last_name: str = None):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
+    # Пытаемся вставить, если такого user_id ещё нет
     cur.execute("""
-        INSERT OR REPLACE INTO subscribers (user_id, username, first_name, last_name, is_active)
+        INSERT OR IGNORE INTO subscribers (user_id, username, first_name, last_name, is_active)
         VALUES (?, ?, ?, ?, 1)
     """, (user_id, username, first_name, last_name))
+    # Если запись уже была, обновляем только username, first_name, last_name (не трогаем остальное)
+    cur.execute("""
+        UPDATE subscribers 
+        SET username = ?, first_name = ?, last_name = ?, is_active = 1
+        WHERE user_id = ?
+    """, (username, first_name, last_name, user_id))
     conn.commit()
     conn.close()
 
@@ -643,3 +657,23 @@ def get_admin_stats() -> dict:
         "pending_complaints": pending_complaints,
         "pending_support": pending_support
     }
+
+def get_last_processed_id(chat_id: str) -> int:
+    """Возвращает последний обработанный message_id для чата"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT last_message_id FROM last_processed WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def update_last_processed_id(chat_id: str, message_id: int):
+    """Обновляет последний обработанный message_id для чата"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO last_processed (chat_id, last_message_id, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+    """, (chat_id, message_id))
+    conn.commit()
+    conn.close()

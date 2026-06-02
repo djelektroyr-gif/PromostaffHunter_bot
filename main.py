@@ -11,7 +11,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
-from parser import run_parser, get_last_debug_report, detect_category, extract_contact_from_text
+from parser import (
+    run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
+    start_realtime_listener, stop_realtime_listener, get_new_messages
+)
 from config import BOT_TOKEN, YOUR_USER_ID
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -20,11 +23,9 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-periodic_task = None
 
-# Flood control
-SENT_THIS_CHECK = 0
-MAX_SEND_PER_CHECK = 20
+# Flood control для real-time (необязательно, но оставим паузу между отправками)
+SEND_DELAY = 1  # секунда между отправками одному пользователю
 
 # Пагинация
 user_pages = {}
@@ -85,14 +86,9 @@ def calculate_age(birth_date_str: str) -> int:
     except ValueError:
         return None
 
-# ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ ==========
+# ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
 
 async def send_vacancy_to_subscribers(order: dict):
-    global SENT_THIS_CHECK
-    if SENT_THIS_CHECK >= MAX_SEND_PER_CHECK:
-        logger.info(f"Достигнут лимит отправки {MAX_SEND_PER_CHECK} вакансий за проверку")
-        return
-
     category_code = order.get('category', detect_category(order['message_text']))
     vacancy_id = generate_vacancy_id(order.get('chat_id', ''), order.get('message_id', ''))
     subscribers = get_subscribers_by_category(category_code)
@@ -106,7 +102,7 @@ async def send_vacancy_to_subscribers(order: dict):
         f"📢 Источник: {escape_markdown(order['chat_title'])}"
     )
 
-    buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}", style=2)]]
+    buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}")]]
     if order.get('address'):
         address = order['address']
         maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
@@ -139,15 +135,9 @@ async def send_vacancy_to_subscribers(order: dict):
             )
             mark_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
             sent_count += 1
-            SENT_THIS_CHECK += 1
-            if SENT_THIS_CHECK >= MAX_SEND_PER_CHECK:
-                break
-            await asyncio.sleep(1)
+            await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
         except Exception as e:
-            if "Flood control" in str(e):
-                logger.warning(f"Flood control, прерываем отправку {vacancy_id}")
-                break
-            elif "bot was blocked by the user" in str(e):
+            if "bot was blocked by the user" in str(e):
                 logger.info(f"Пользователь {subscriber['user_id']} заблокировал бота")
             else:
                 logger.error(f"Ошибка отправки {subscriber['user_id']}: {e}")
@@ -516,7 +506,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
             f"{escape_markdown(vac['text'][:400])}\n\n"
             f"🔗 [Ссылка на сообщение]({vac['link']})"
         )
-        buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vac['id']}", style=2)]]
+        buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vac['id']}")]]
         if vac.get('address'):
             address = vac['address']
             maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
@@ -835,16 +825,14 @@ async def status_cmd(message: types.Message):
         return
     stats = get_admin_stats()
     await message.answer(
-        f"📊 *Статус бота*\n\n✅ Активен\n🔄 Периодическая проверка: {'запущена' if periodic_task and not periodic_task.done() else 'остановлена'}\n⏱️ Интервал: 5 мин\n👥 Подписчиков: {stats['subscribers']}\n💬 Откликов: {stats['responses']}",
+        f"📊 *Статус бота*\n\n✅ Активен\n📡 Режим: real‑time (мгновенные уведомления)\n👥 Подписчиков: {stats['subscribers']}\n💬 Откликов: {stats['responses']}",
         parse_mode="Markdown"
     )
 
 @dp.message(Command("check_now"))
 async def check_now_cmd(message: types.Message):
-    global SENT_THIS_CHECK
     if message.from_user.id != YOUR_USER_ID:
         return
-    SENT_THIS_CHECK = 0
     status_msg = await message.answer("🔍 Начинаю проверку...")
     try:
         orders, closed_data = await run_parser()
@@ -948,8 +936,14 @@ async def post_vacancy_cmd(message: types.Message, state: FSMContext):
     await message.answer("📤 *Отправка вакансии подписчикам*\n\nВыберите категорию:", parse_mode="Markdown", reply_markup=get_categories_keyboard())
     await state.set_state(PostVacancyState.waiting_for_category)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("cat_") and state == PostVacancyState.waiting_for_category)
+@dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
 async def post_vacancy_category(callback: types.CallbackQuery, state: FSMContext):
+    # Проверяем, что мы действительно в состоянии ожидания категории
+    current_state = await state.get_state()
+    if current_state != PostVacancyState.waiting_for_category:
+        await callback.answer("❌ Сначала выполните команду /postvacancy", show_alert=True)
+        return
+    
     category_code = callback.data.replace("cat_", "")
     all_cats = get_all_categories()
     cat_name = next((cat['name'] for cat in all_cats if cat['code'] == category_code), category_code)
@@ -984,7 +978,7 @@ async def post_vacancy_photo(message: types.Message, state: FSMContext):
         await state.clear()
         return
     text = f"{get_category_emoji(category_code)} *Вакансия от администратора:*\n\n{escape_markdown(vacancy_text[:500])}"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Откликнуться", callback_data="admin_vacancy", style=2)]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Откликнуться", callback_data="admin_vacancy")]])
     sent = 0
     for sub in subscribers:
         try:
@@ -1129,56 +1123,39 @@ async def admin_close_menu(message: types.Message):
         await message.answer("Меню закрыто. Для открытия напишите /start", reply_markup=ReplyKeyboardRemove())
 
 
-# ========== ПЕРИОДИЧЕСКАЯ ПРОВЕРКА ==========
-async def periodic_check():
-    global SENT_THIS_CHECK
-    logger.info("🔄 Периодическая проверка запущена")
-    while True:
-        try:
-            SENT_THIS_CHECK = 0
-            logger.info("🔍 Выполняю периодическую проверку...")
-            orders, closed_data = await run_parser()
-            if orders or closed_data:
-                if closed_data:
-                    await notify_closed_vacancies(closed_data)
-                if orders:
-                    logger.info(f"📬 Найдено {len(orders)} новых вакансий")
-                    for order in orders:
-                        await send_vacancy_to_subscribers(order)
-            else:
-                logger.info("✅ Нет новых вакансий")
-        except Exception as e:
-            logger.error(f"Ошибка в periodic_check: {e}", exc_info=True)
-        await asyncio.sleep(300)
-
-
 # ========== ЗАПУСК И ОСТАНОВКА ==========
+
 async def on_startup():
     logger.info("🚀 Запуск бота...")
     init_db()
     logger.info("📁 База данных инициализирована")
-    global periodic_task
-    periodic_task = asyncio.create_task(periodic_check())
-    logger.info("🔄 Периодическая проверка запущена (интервал 5 минут)")
-    logger.info(f"👑 Администратор ID: {YOUR_USER_ID}")
+
+    # Один раз прогоняем парсер, чтобы подхватить сообщения за последние несколько минут (гарантия)
+    logger.info("🔄 Однократная проверка новых сообщений (для синхронизации)...")
+    orders, closed = await get_new_messages(limit_per_chat=200)
+    if closed:
+        await notify_closed_vacancies(closed)
+    for order in orders:
+        await send_vacancy_to_subscribers(order)
+    logger.info("✅ Однократная проверка завершена")
+
+    # Запускаем real-time listener
+    asyncio.create_task(start_realtime_listener(send_vacancy_to_subscribers))
+    logger.info("📡 Real-time listener запущен")
+
+    # Запускаем polling для бота
+    logger.info("📡 Запуск polling...")
+    await dp.start_polling(bot)
 
 async def on_shutdown():
     logger.info("🛑 Остановка бота...")
-    global periodic_task
-    if periodic_task and not periodic_task.done():
-        periodic_task.cancel()
-        try:
-            await periodic_task
-        except asyncio.CancelledError:
-            logger.info("✅ Периодическая задача отменена")
+    await stop_realtime_listener()
     await bot.session.close()
     logger.info("👋 Бот остановлен")
 
 async def main():
     try:
         await on_startup()
-        logger.info("📡 Запуск polling...")
-        await dp.start_polling(bot)
     except KeyboardInterrupt:
         logger.info("⚠️ Получен сигнал остановки")
     except Exception as e:

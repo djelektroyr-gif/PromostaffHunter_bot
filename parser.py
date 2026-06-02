@@ -1,38 +1,128 @@
-import asyncio
-import logging
 import re
-from datetime import datetime, timedelta
-from telethon import TelegramClient, errors
-from config import API_ID, API_HASH
-from db import get_target_chats, is_message_processed, mark_message_processed, save_vacancy, mark_vacancy_closed
-from config import HELPER_KEYWORDS, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS, EXCLUDE_CATEGORIES, STOP_PHRASES
+import logging
+from telethon import TelegramClient, events
+from telethon import errors
+import asyncio
+from datetime import datetime
+from config import API_ID, API_HASH, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS
+from db import (
+    get_target_chats, is_message_processed, mark_vacancy_closed,
+    get_last_processed_id, update_last_processed_id,
+    save_vacancy, mark_message_processed
+)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-LAST_DEBUG_STATS = {
-    "started_at": None,
-    "finished_at": None,
-    "chats_total": 0,
-    "chats_ok": 0,
-    "chats_failed": 0,
-    "messages_scanned": 0,
-    "already_sent": 0,
-    "no_text": 0,
-    "non_relevant": 0,
-    "matched": 0,
-    "errors": 0,
-    "reasons": {},
-    "errors_by_chat": {},
-    "categories": {},
-    "old_messages": 0,
-    "closed_vacancies": 0,
-}
+# Глобальный клиент для real-time режима (один на весь бот)
+_realtime_client = None
 
+async def start_realtime_listener(bot_callback):
+    """
+    Запускает real-time прослушивание новых сообщений.
+    bot_callback – асинхронная функция, которая будет вызвана для каждого нового сообщения.
+    Она должна принимать параметр order (словарь с вакансией).
+    """
+    global _realtime_client
+    _realtime_client = TelegramClient('user_session', API_ID, API_HASH)
+    await _realtime_client.start()
+    logger.info("✅ Real-time listener подключён")
+
+    target_chats = get_target_chats()
+    for link in target_chats:
+        try:
+            entity = await _realtime_client.get_entity(link)
+            last_id = get_last_processed_id(str(entity.id))
+            # Не передаём offset_id, Telethon сам будет получать только новые сообщения
+        except Exception as e:
+            logger.warning(f"Не удалось получить entity для {link}: {e}")
+
+    @_realtime_client.on(events.NewMessage(chats=target_chats))
+    async def handler(event):
+        message = event.message
+        chat = await event.get_chat()
+        chat_id = str(chat.id)
+        message_id = message.id
+
+        # Пропускаем уже обработанные
+        if is_message_processed(str(message_id), chat_id):
+            return
+
+        # Проверяем, не старше ли сообщение 3 дней
+        if (datetime.now(message.date.tzinfo) - message.date).days > 3:
+            return
+
+        # Проверяем, не является ли сообщение ответом с маркером "закрыто"
+        if message.is_reply:
+            original = await message.get_reply_message()
+            if original:
+                close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
+                if any(m in message.text.lower() for m in close_markers):
+                    original_id = str(original.id)
+                    users = mark_vacancy_closed(original_id, chat_id)
+                    if users:
+                        logger.info(f"🔒 Вакансия {original_id} закрыта, уведомлены {len(users)} пользователей")
+                    return
+
+        # Проверка релевантности
+        is_rel, reason, keywords = is_helper_message(message.text)
+        if not is_rel:
+            return
+
+        # Определение категории, адреса, контакта
+        category = detect_category(message.text)
+        cleaned_text = clean_message_text(message.text)
+        message_link = get_message_link(chat.id, message.id)
+        vacancy_id = f"{chat_id}_{message_id}"
+        author_contact = extract_contact_from_text(message.text)
+        address = extract_address_from_text(message.text)
+
+        # Сохраняем в БД
+        save_vacancy(
+            vacancy_id=vacancy_id,
+            source_chat=chat_id,
+            source_chat_title=chat.title or "Без названия",
+            category_code=category,
+            message_text=cleaned_text[:2000],
+            message_link=message_link,
+            author_contact=author_contact,
+            address=address,
+            is_closed=False
+        )
+
+        # Формируем order для отправки подписчикам
+        order = {
+            "chat_title": chat.title or "Без названия",
+            "message_text": cleaned_text,
+            "message_link": message_link,
+            "category": category,
+            "chat_id": chat_id,
+            "message_id": str(message_id),
+            "address": address,
+            "author_contact": author_contact,
+        }
+
+        # Вызываем колбэк для отправки подписчикам
+        await bot_callback(order)
+
+        # Отмечаем сообщение как обработанное
+        mark_message_processed(str(message_id), chat_id)
+        update_last_processed_id(chat_id, message_id)
+        logger.info(f"⚡ Real-time: новая вакансия из {chat.title}")
+
+    # Держим соединение открытым
+    await _realtime_client.run_until_disconnected()
+
+async def stop_realtime_listener():
+    """Останавливает real-time listener"""
+    global _realtime_client
+    if _realtime_client and _realtime_client.is_connected():
+        await _realtime_client.disconnect()
+
+
+# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ПАРСЕРА (НЕ ИЗМЕНЯЮТСЯ) ==========
 
 def _iso_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
 
 def _new_stats() -> dict:
     return {
@@ -54,6 +144,7 @@ def _new_stats() -> dict:
         "closed_vacancies": 0,
     }
 
+LAST_DEBUG_STATS = _new_stats()
 
 def get_last_debug_report() -> str:
     s = LAST_DEBUG_STATS
@@ -226,12 +317,12 @@ async def safe_get_entity(client: TelegramClient, chat_link: str):
         return None
 
 
-async def get_new_messages(limit_per_chat: int = 100) -> tuple[list, list]:
+async def get_new_messages(limit_per_chat: int = 500) -> tuple[list, list]:
     global LAST_DEBUG_STATS
     LAST_DEBUG_STATS = _new_stats()
     client = TelegramClient('user_session', API_ID, API_HASH)
     all_results = []
-    closed_vacancies_users = []   # список (vacancy_id, [user_ids])
+    closed_vacancies_users = []
     MAX_AGE_DAYS = 3
 
     target_chats = get_target_chats()
@@ -278,7 +369,7 @@ async def get_new_messages(limit_per_chat: int = 100) -> tuple[list, list]:
                         LAST_DEBUG_STATS["old_messages"] += 1
                         continue
 
-                    # Обработка закрытых вакансий через ответные сообщения
+                    # Обработка закрытых вакансий
                     if message.is_reply:
                         original_message = await message.get_reply_message()
                         if original_message and original_message.id:
@@ -290,7 +381,7 @@ async def get_new_messages(limit_per_chat: int = 100) -> tuple[list, list]:
                                     closed_vacancies_users.append((f"{chat_id}_{original_id}", users))
                                 LAST_DEBUG_STATS["closed_vacancies"] += 1
                                 logger.info(f"🔒 Вакансия {original_id} в {chat_title} помечена как закрытая, уведомлены {len(users)} пользователей")
-                        continue   # само ответное сообщение не публикуем
+                                continue
 
                     is_relevant, reason, keywords = is_helper_message(message.text)
                     LAST_DEBUG_STATS["reasons"][reason] = LAST_DEBUG_STATS["reasons"].get(reason, 0) + 1
@@ -399,19 +490,3 @@ async def test_filter(chat_link: str, limit: int = 30):
     finally:
         if client.is_connected():
             await client.disconnect()
-
-
-if __name__ == "__main__":
-    async def main():
-        from db import init_db
-        init_db()
-        choice = input("1 - парсинг, 2 - тест: ").strip()
-        if choice == "1":
-            msgs, closed = await get_new_messages()
-            print(f"\nНайдено вакансий: {len(msgs)}")
-            if closed:
-                print(f"Закрытых вакансий с уведомлениями: {len(closed)}")
-        elif choice == "2":
-            link = input("Ссылка на чат: ").strip()
-            await test_filter(link)
-    asyncio.run(main())
