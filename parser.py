@@ -36,8 +36,9 @@ async def start_realtime_listener(bot_callback):
         except Exception as e:
             logger.warning(f"Не удалось получить entity для {link}: {e}")
 
-    @_realtime_client.on(events.NewMessage(chats=target_chats))
+        @_realtime_client.on(events.NewMessage(chats=target_chats))
     async def handler(event):
+        logger.info(f"⚡ Real-time: получено новое сообщение из чата {event.chat_id}")
         message = event.message
         chat = await event.get_chat()
         chat_id = str(chat.id)
@@ -108,15 +109,6 @@ async def start_realtime_listener(bot_callback):
         mark_message_processed(str(message_id), chat_id)
         update_last_processed_id(chat_id, message_id)
         logger.info(f"⚡ Real-time: новая вакансия из {chat.title}")
-
-    # Держим соединение открытым
-    await _realtime_client.run_until_disconnected()
-
-async def stop_realtime_listener():
-    """Останавливает real-time listener"""
-    global _realtime_client
-    if _realtime_client and _realtime_client.is_connected():
-        await _realtime_client.disconnect()
 
 
 # ========== ОСТАЛЬНЫЕ ФУНКЦИИ ПАРСЕРА (НЕ ИЗМЕНЯЮТСЯ) ==========
