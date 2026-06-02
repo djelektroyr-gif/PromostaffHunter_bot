@@ -13,8 +13,9 @@ from db import (
 
 logger = logging.getLogger(__name__)
 
-# Глобальный клиент для real-time режима (один на весь бот)
 _realtime_client = None
+
+# ===================== REAL‑TIME LISTENER =====================
 
 async def start_realtime_listener(bot_callback):
     global _realtime_client
@@ -25,8 +26,7 @@ async def start_realtime_listener(bot_callback):
     target_chats = get_target_chats()
     for link in target_chats:
         try:
-            entity = await _realtime_client.get_entity(link)
-            last_id = get_last_processed_id(str(entity.id))
+            await _realtime_client.get_entity(link)
         except Exception as e:
             logger.warning(f"Не удалось получить entity для {link}: {e}")
 
@@ -38,32 +38,26 @@ async def start_realtime_listener(bot_callback):
         chat_id = str(chat.id)
         message_id = message.id
 
-        # Пропускаем уже обработанные
         if is_message_processed(str(message_id), chat_id):
             return
 
-        # Проверяем, не старше ли сообщение 3 дней
         if (datetime.now(message.date.tzinfo) - message.date).days > 3:
             return
 
-        # Проверяем, не является ли сообщение ответом с маркером "закрыто"
         if message.is_reply:
             original = await message.get_reply_message()
             if original:
                 close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
                 if any(m in message.text.lower() for m in close_markers):
-                    original_id = str(original.id)
-                    users = mark_vacancy_closed(original_id, chat_id)
+                    users = mark_vacancy_closed(str(original.id), chat_id)
                     if users:
-                        logger.info(f"🔒 Вакансия {original_id} закрыта, уведомлены {len(users)} пользователей")
+                        logger.info(f"🔒 Вакансия {original.id} закрыта, уведомлены {len(users)}")
                     return
 
-        # Проверка релевантности
         is_rel, reason, keywords = is_helper_message(message.text)
         if not is_rel:
             return
 
-        # Определение категории, адреса, контакта
         category = detect_category(message.text)
         cleaned_text = clean_message_text(message.text)
         message_link = get_message_link(chat.id, message.id)
@@ -71,7 +65,6 @@ async def start_realtime_listener(bot_callback):
         author_contact = extract_contact_from_text(message.text)
         address = extract_address_from_text(message.text)
 
-        # Сохраняем в БД
         save_vacancy(
             vacancy_id=vacancy_id,
             source_chat=chat_id,
@@ -84,7 +77,6 @@ async def start_realtime_listener(bot_callback):
             is_closed=False
         )
 
-        # Формируем order для отправки подписчикам
         order = {
             "chat_title": chat.title or "Без названия",
             "message_text": cleaned_text,
@@ -96,16 +88,21 @@ async def start_realtime_listener(bot_callback):
             "author_contact": author_contact,
         }
 
-        # Вызываем колбэк для отправки подписчикам
         await bot_callback(order)
 
-        # Отмечаем сообщение как обработанное
         mark_message_processed(str(message_id), chat_id)
         update_last_processed_id(chat_id, message_id)
         logger.info(f"⚡ Real-time: новая вакансия из {chat.title}")
 
+    await _realtime_client.run_until_disconnected()
 
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ПАРСЕРА (НЕ ИЗМЕНЯЮТСЯ) ==========
+async def stop_realtime_listener():
+    global _realtime_client
+    if _realtime_client and _realtime_client.is_connected():
+        await _realtime_client.disconnect()
+        logger.info("🛑 Real-time listener остановлен")
+
+# ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
 
 def _iso_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -164,7 +161,6 @@ def get_last_debug_report() -> str:
             lines.append(f"  • {chat}: {count}")
     return "\n".join(lines)
 
-
 def extract_contact_from_text(text: str) -> str:
     if not text:
         return None
@@ -182,7 +178,6 @@ def extract_contact_from_text(text: str) -> str:
         return f"@{ls_match.group(1)}"
     return None
 
-
 def extract_address_from_text(text: str) -> str:
     if not text:
         return None
@@ -197,7 +192,6 @@ def extract_address_from_text(text: str) -> str:
     if city_match:
         return city_match.group(0)
     return None
-
 
 def detect_category(text: str) -> str:
     if not text:
@@ -236,8 +230,7 @@ def detect_category(text: str) -> str:
                 return category
     return "helper"
 
-
-def is_helper_message(text: str) -> tuple[bool, str, list]:
+def is_helper_message(text: str):
     if not text:
         return False, "empty", []
     text_lower = text.lower()
@@ -268,13 +261,11 @@ def is_helper_message(text: str) -> tuple[bool, str, list]:
         return True, "hiring_plus_promoter_text", found_hiring + ["промоутер"]
     return False, "no_match", []
 
-
 def clean_message_text(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
-
 
 def get_message_link(chat_id: int, message_id: int) -> str:
     str_id = str(chat_id)
@@ -286,8 +277,7 @@ def get_message_link(chat_id: int, message_id: int) -> str:
         return f"https://t.me/c/{clean_id}/{message_id}"
     return f"https://t.me/c/{chat_id}/{message_id}"
 
-
-async def safe_get_entity(client: TelegramClient, chat_link: str):
+async def safe_get_entity(client, chat_link: str):
     try:
         entity = await client.get_entity(chat_link)
         await asyncio.sleep(0.5)
@@ -302,8 +292,7 @@ async def safe_get_entity(client: TelegramClient, chat_link: str):
         logger.warning(f"⚠️ Ошибка доступа к {chat_link}: {type(e).__name__}")
         return None
 
-
-async def get_new_messages(limit_per_chat: int = 500) -> tuple[list, list]:
+async def get_new_messages(limit_per_chat: int = 500):
     global LAST_DEBUG_STATS
     LAST_DEBUG_STATS = _new_stats()
     client = TelegramClient('user_session', API_ID, API_HASH)
@@ -355,7 +344,6 @@ async def get_new_messages(limit_per_chat: int = 500) -> tuple[list, list]:
                         LAST_DEBUG_STATS["old_messages"] += 1
                         continue
 
-                    # Обработка закрытых вакансий
                     if message.is_reply:
                         original_message = await message.get_reply_message()
                         if original_message and original_message.id:
@@ -366,7 +354,7 @@ async def get_new_messages(limit_per_chat: int = 500) -> tuple[list, list]:
                                 if users:
                                     closed_vacancies_users.append((f"{chat_id}_{original_id}", users))
                                 LAST_DEBUG_STATS["closed_vacancies"] += 1
-                                logger.info(f"🔒 Вакансия {original_id} в {chat_title} помечена как закрытая, уведомлены {len(users)} пользователей")
+                                logger.info(f"🔒 Вакансия {original_id} в {chat_title} помечена как закрытая, уведомлены {len(users)}")
                                 continue
 
                     is_relevant, reason, keywords = is_helper_message(message.text)
@@ -436,11 +424,9 @@ async def get_new_messages(limit_per_chat: int = 500) -> tuple[list, list]:
 
     return all_results, closed_vacancies_users
 
-
-async def run_parser() -> tuple[list, list]:
+async def run_parser():
     orders, closed_data = await get_new_messages()
     return orders, closed_data
-
 
 async def test_filter(chat_link: str, limit: int = 30):
     client = TelegramClient('user_session', API_ID, API_HASH)
