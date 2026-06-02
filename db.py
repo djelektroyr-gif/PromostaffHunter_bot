@@ -532,17 +532,28 @@ def mark_support_answered(request_id: int, admin_response: str = None):
 
 
 # ========== ФУНКЦИИ ДЛЯ ДИНАМИЧЕСКИХ ЧАТОВ ==========
+def _table_exists(table_name: str) -> bool:
+    """Проверяет, существует ли таблица в базе данных"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+    exists = cur.fetchone() is not None
+    conn.close()
+    return exists
 
 def get_target_chats() -> list:
+    if not _table_exists("target_chats"):
+        return []
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("SELECT chat_link FROM target_chats WHERE is_active = 1")
     rows = cur.fetchall()
     conn.close()
     return [row[0] for row in rows]
-
-
+    
 def add_target_chat(chat_link: str) -> bool:
+    if not _table_exists("target_chats"):
+        return False
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     try:
@@ -554,8 +565,9 @@ def add_target_chat(chat_link: str) -> bool:
     conn.close()
     return ok
 
-
 def remove_target_chat(chat_link: str):
+    if not _table_exists("target_chats"):
+        return
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute("UPDATE target_chats SET is_active = 0 WHERE chat_link = ?", (chat_link,))
