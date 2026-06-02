@@ -1,6 +1,10 @@
 import re
 import logging
 import hashlib
+import os
+import time
+os.environ['TZ'] = 'Europe/Moscow'
+time.tzset()
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon import errors

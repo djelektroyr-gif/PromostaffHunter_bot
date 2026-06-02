@@ -3,6 +3,10 @@ import re
 import logging
 import hashlib
 import sqlite3
+import os
+import time
+os.environ['TZ'] = 'Europe/Moscow'
+time.tzset()   
 from datetime import datetime
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
