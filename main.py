@@ -17,11 +17,13 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
 from db import DB_NAME
+from db import get_unsent_count_by_category
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     get_new_messages, extract_address_from_text
 )
 from config import BOT_TOKEN, YOUR_USER_ID
+from telethon import errors
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,13 +32,10 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# Flood control для real-time (необязательно, но оставим паузу между отправками)
-SEND_DELAY = 1  # секунда между отправками одному пользователю
-
-# Пагинация
+SEND_DELAY = 1
 user_pages = {}
 
-# Состояния FSM
+# ========== FSM СОСТОЯНИЯ ==========
 class RegistrationState(StatesGroup):
     waiting_for_name = State()
     waiting_for_birthdate = State()
@@ -64,8 +63,8 @@ class RespondWithPhotoState(StatesGroup):
 class ResponseDraftState(StatesGroup):
     waiting_for_comment = State()
 
+# ========== ПЕРИОДИЧЕСКИЙ ПОЛЛИНГ ==========
 async def periodic_polling():
-    """Запускает парсинг каждые 60 секунд"""
     while True:
         try:
             logger.info("🔍 Периодическая проверка новых сообщений...")
@@ -79,7 +78,6 @@ async def periodic_polling():
         await asyncio.sleep(60)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
 def escape_markdown(text: str) -> str:
     if not text:
         return ""
@@ -157,7 +155,7 @@ def normalize_chat_link(raw: str) -> str:
     if link.startswith("https://t.me/"):
         return link.rstrip("/")
     if link.startswith("http://t.me/"):
-        return "https://" + link[len("http://") :].rstrip("/")
+        return "https://" + link[len("http://"):].rstrip("/")
     if link.startswith("t.me/"):
         return f"https://{link}".rstrip("/")
     if re.fullmatch(r"[a-zA-Z0-9_]{5,32}", link):
@@ -212,8 +210,37 @@ def build_contact_link(contact: str, text: str) -> str:
             return f"tel:+{digits}"
     return None
 
-# ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
+async def check_chats_access():
+    """Проверяет доступность чатов из target_chats и возвращает строку с результатом"""
+    from telethon import TelegramClient, errors
+    from config import API_ID, API_HASH
+    from db import get_target_chats
+    
+    target_chats = get_target_chats()
+    if not target_chats:
+        return "📭 Список чатов для парсинга пуст."
+    
+    client = TelegramClient('user_session', API_ID, API_HASH)
+    await client.start()
+    
+    results = []
+    for chat_link in target_chats:
+        try:
+            entity = await client.get_entity(chat_link)
+            # Если получили entity – значит доступ есть
+            chat_title = getattr(entity, 'title', 'Без названия')
+            results.append(f"✅ {chat_link} – {chat_title}")
+        except errors.rpcerrorlist.ChannelPrivateError:
+            results.append(f"⚠️ {chat_link} – приватный канал/группа (нет доступа)")
+        except errors.rpcerrorlist.UsernameNotOccupiedError:
+            results.append(f"❌ {chat_link} – канал/группа не найдена")
+        except Exception as e:
+            results.append(f"❓ {chat_link} – ошибка: {type(e).__name__}")
+    
+    await client.disconnect()
+    return "\n".join(results)
 
+# ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ ==========
 async def send_vacancy_to_subscribers(order: dict):
     category_code = order.get('category', detect_category(order['message_text']))
     dedupe_key = order.get("dedupe_key")
@@ -237,7 +264,8 @@ async def send_vacancy_to_subscribers(order: dict):
     buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}")]]
     if order.get('address'):
         address = order['address']
-        maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
+        # ИСПРАВЛЕНИЕ: используем quote()
+        maps_url = f"https://yandex.ru/maps/?text={quote(address)}"
         buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
     buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vacancy_id}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -269,7 +297,7 @@ async def send_vacancy_to_subscribers(order: dict):
             )
             mark_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
             sent_count += 1
-            await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
+            await asyncio.sleep(SEND_DELAY)
         except Exception as e:
             if "bot was blocked by the user" in str(e):
                 logger.info(f"Пользователь {subscriber['user_id']} заблокировал бота")
@@ -279,8 +307,7 @@ async def send_vacancy_to_subscribers(order: dict):
     logger.info(f"Вакансия {vacancy_id} (категория {category_code}) отправлена {sent_count} подписчикам")
     mark_vacancy_sent(vacancy_id)
 
-# ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
-
+# ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ==========
 async def notify_closed_vacancies(closed_data: list):
     for vacancy_id, user_ids in closed_data:
         for uid in user_ids:
@@ -290,7 +317,6 @@ async def notify_closed_vacancies(closed_data: list):
                 logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
 
 # ========== КЛАВИАТУРЫ ==========
-
 def get_categories_keyboard():
     categories = get_all_categories()
     buttons, row = [], []
@@ -328,299 +354,122 @@ def get_admin_keyboard():
             [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="📢 Рассылка")],
             [KeyboardButton(text="🗂️ Карточки пользователей"), KeyboardButton(text="🧭 Маппинг категорий")],
             [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
-            [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📤 Отправить вакансию")],
-            [KeyboardButton(text="❌ Закрыть меню")]
+            [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📋 Список чатов парсинга")],   # новая кнопка
+            [KeyboardButton(text="📤 Отправить вакансию"), KeyboardButton(text="❌ Закрыть меню")]
         ],
         resize_keyboard=True
     )
 
-# ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
-
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
-
-    if user_id == YOUR_USER_ID:
-        await message.answer(
-            f"👋 Здравствуйте, Администратор {first_name}!\n\n"
-            f"📊 *Бот работает в штатном режиме.*\n\n"
-            f"Используйте кнопки для управления:",
-            parse_mode="Markdown",
-            reply_markup=get_admin_keyboard()
-        )
-        return
-
-    add_subscriber(user_id, username, first_name, last_name)
-    profile = get_subscriber_profile(user_id)
-    if profile and profile.get("full_name") and profile.get("phone"):
-        categories = get_user_categories(user_id)
-        if categories:
-            keyboard, status_text = get_main_keyboard(user_id)
-            await message.answer(
-                f"👋 С возвращением, {first_name}!\n\n{status_text}\n\n"
-                f"Используйте кнопки для управления:",
-                reply_markup=keyboard
-            )
-            return
-        else:
-            await message.answer(
-                f"👋 С возвращением, {first_name}!\n\n"
-                f"Ваш профиль уже заполнен, но вы ещё не выбрали категории вакансий.\n\n"
-                f"📋 *Выберите категории вакансий:*",
-                parse_mode="Markdown",
-                reply_markup=get_categories_keyboard()
-            )
-            return
-
-    await message.answer(
-        "👋 *Добро пожаловать в бот поиска работы!*\n\n"
-        "Я помогу вам найти подходящие вакансии.\n\n"
-        "📝 *Давайте заполним ваш профиль*\n\n"
-        "Как вас зовут? (ФИО полностью)\n\nПример: *Иван Петров*",
-        parse_mode="Markdown"
-    )
-    await state.set_state(RegistrationState.waiting_for_name)
-
-
-@dp.message(RegistrationState.waiting_for_name)
-async def process_name(message: types.Message, state: FSMContext):
-    full_name = message.text.strip()
-    if len(full_name.split()) < 2:
-        await message.answer("❌ Пожалуйста, введите полное имя и фамилию (минимум 2 слова).")
-        return
-    if not re.match(r'^[a-zA-Zа-яА-ЯёЁ\s\-\.]+$', full_name):
-        await message.answer("❌ Имя может содержать только буквы, пробелы, дефисы и точки.")
-        return
-    await state.update_data(full_name=full_name)
-    await message.answer(
-        "🎂 *Дата рождения*\n\n"
-        "Введите вашу дату рождения в формате: **ДД.ММ.ГГГГ**\n\n"
-        "Пример: `25.12.1990`\n\n"
-        "Я автоматически рассчитаю ваш возраст.",
-        parse_mode="Markdown"
-    )
-    await state.set_state(RegistrationState.waiting_for_birthdate)
-
-
-@dp.message(RegistrationState.waiting_for_birthdate)
-async def process_birthdate(message: types.Message, state: FSMContext):
-    birth_date_str = message.text.strip()
-    if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', birth_date_str):
-        await message.answer(
-            "❌ Неверный формат!\n\n"
-            "Пожалуйста, введите дату в формате: **ДД.ММ.ГГГГ**\n\n"
-            "Пример: `25.12.1990`",
-            parse_mode="Markdown"
-        )
-        return
-    age = calculate_age(birth_date_str)
-    if age is None:
-        await message.answer(
-            "❌ Неверная дата! Проверьте, что:\n"
-            "- День от 1 до 31\n"
-            "- Месяц от 1 до 12\n"
-            "- Год реальный\n\n"
-            "Пример: `25.12.1990`",
-            parse_mode="Markdown"
-        )
-        return
-    if age < 16 or age > 100:
-        await message.answer(f"❌ Возраст должен быть от 16 до 100 лет. Ваш возраст: {age}.", parse_mode="Markdown")
-        return
-    await state.update_data(birth_date=birth_date_str, age=age)
-    
-    phone_keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    await message.answer(
-        f"✅ Возраст: {age} лет\n\n"
-        "📞 *Контактный телефон*\n\n"
-        "Нажмите на кнопку ниже, чтобы отправить ваш номер телефона.\n"
-        "Он будет передан работодателю при отклике на вакансию.",
-        parse_mode="Markdown",
-        reply_markup=phone_keyboard
-    )
-    await state.set_state(RegistrationState.waiting_for_phone)
-
-
-@dp.message(RegistrationState.waiting_for_phone)
-async def process_phone(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if message.contact:
-        phone = message.contact.phone_number
-    else:
-        phone = message.text.strip()
-        digits_only = re.sub(r'\D', '', phone)
-        if len(digits_only) < 10 or len(digits_only) > 15:
-            await message.answer(
-                "❌ Пожалуйста, введите корректный номер телефона.\n\n"
-                "Примеры: +7 999 123-45-67 или 89991234567\n\n"
-                "Или нажмите кнопку «Отправить мой номер телефона»",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
-                    resize_keyboard=True,
-                    one_time_keyboard=True
-                )
-            )
-            return
-
-    data = await state.get_data()
-    await state.update_data(phone=phone)   # <-- СОХРАНЯЕМ ТЕЛЕФОН В СОСТОЯНИЕ
-    update_subscriber_profile(user_id, data['full_name'], data['age'], phone)
-    
-    # Анкета
-    questionnaire = f"""📝 *АНКЕТА КАНДИДАТА*
-
-👤 *ФИО:* {data['full_name']}
-🎂 *Дата рождения:* {data['birth_date']}
-📊 *Возраст:* {data['age']} лет
-📞 *Телефон:* {phone}
-🆔 *Telegram:* @{message.from_user.username if message.from_user.username else 'нет'}
-"""
-    update_candidate_questionnaire(user_id, questionnaire)
-    
-    # Запрос фото (необязательно)
-    await message.answer(
-        "📸 *Фото для отклика*\n\n"
-        "При отклике на вакансию вы можете приложить своё фото.\n"
-        "Это повышает шансы на положительный ответ.\n\n"
-        "Отправьте фото сейчас или нажмите «Пропустить»",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="⏩ Пропустить")]],
-            resize_keyboard=True
-        )
-    )
-    await state.set_state(RegistrationState.waiting_for_photo)
-
-
-@dp.message(RegistrationState.waiting_for_photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if message.text == "⏩ Пропустить":
-        photo_file_id = None
-    elif message.photo:
-        photo_file_id = message.photo[-1].file_id
-        update_subscriber_photo(user_id, photo_file_id)
-    else:
-        await message.answer("Пожалуйста, отправьте фото или нажмите «Пропустить»")
-        return
-
-    # Профиль уже полностью сохранён в БД, просто завершаем регистрацию
-    data = await state.get_data()
-    await message.answer(
-        "✅ *Профиль успешно создан!*\n\n"
-        f"📝 ФИО: {data['full_name']}\n"
-        f"🎂 Возраст: {data['age']} лет\n"
-        f"📞 Телефон: {data['phone']}\n\n"
-        "Теперь выберите категории вакансий, которые вас интересуют.\n\n"
-        "Вы можете выбрать несколько:",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await message.answer(
-        "📋 *Выберите категории вакансий:*",
-        parse_mode="Markdown",
-        reply_markup=get_categories_keyboard()
-    )
-    await state.clear()
-
-
-# ========== ОБРАБОТКА КАТЕГОРИЙ (с отметками) ==========
-
-@dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
-async def select_category(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    category_code = callback.data.replace("cat_", "")
-    current_codes = [c['code'] for c in get_user_categories(user_id)]
-    if category_code in current_codes:
-        current_codes.remove(category_code)
-        await callback.answer(f"❌ Категория удалена", show_alert=False)
-    else:
-        current_codes.append(category_code)
-        await callback.answer(f"✅ Категория добавлена", show_alert=False)
-    set_user_categories(user_id, current_codes)
-
-    updated_codes = [c['code'] for c in get_user_categories(user_id)]
-    all_cats = get_all_categories()
-    buttons = []
-    row = []
-    for i, cat in enumerate(all_cats):
-        prefix = "✅" if cat['code'] in updated_codes else "⬜"
-        row.append(InlineKeyboardButton(text=f"{prefix} {cat['emoji']} {cat['name']}", callback_data=f"cat_{cat['code']}"))
-        if len(row) == 2 or i == len(all_cats) - 1:
-            buttons.append(row)
-            row = []
-    buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
-    new_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    try:
-        await callback.message.edit_text(
-            "📋 *Выберите категории вакансий:*\n\n"
-            "✅ — уже выбраны\n"
-            "⬜ — можно добавить\n\n"
-            "Когда закончите, нажмите «Завершить выбор»",
-            parse_mode="Markdown",
-            reply_markup=new_markup
-        )
-    except Exception as e:
-        if "message is not modified" not in str(e):
-            logger.error(f"Ошибка: {e}")
-
-
-@dp.callback_query(lambda c: c.data == "finish_categories")
-async def finish_categories(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
+def get_vacancies_choice_keyboard(user_id: int):
+    """Инлайн-клавиатура с категориями пользователя и количеством неотправленных вакансий"""
     categories = get_user_categories(user_id)
     if not categories:
-        await callback.answer("⚠️ Вы не выбрали ни одной категории!", show_alert=True)
+        return None
+    buttons = []
+    row = []
+    for cat in categories:
+        count = get_unsent_count_by_category(user_id, cat['code'])
+        text = f"{cat['emoji']} {cat['name']} ({count})"
+        row.append(InlineKeyboardButton(text=text, callback_data=f"view_cat_{cat['code']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ========== НОВАЯ КНОПКА ПОСМОТРА ВАКАНСИЙ (ВЫБОР КАТЕГОРИИ) ==========
+@dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
+async def show_vacancies_choice(message: types.Message):
+    user_id = message.from_user.id
+    categories = get_user_categories(user_id)
+    if not categories:
+        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «✏️ Изменить категории»")
         return
-    categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
+    keyboard = get_vacancies_choice_keyboard(user_id)
+    if not keyboard:
+        await message.answer("⚠️ Нет доступных категорий для просмотра.")
+        return
+    await message.answer("🔍 Выберите категорию для просмотра новых вакансий:", reply_markup=keyboard)
+
+# ========== ОБРАБОТЧИК ВЫБОРА КАТЕГОРИИ ==========
+@dp.callback_query(lambda c: c.data and c.data.startswith("view_cat_"))
+async def view_vacancies_by_category(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    category_code = callback.data.replace("view_cat_", "")
+    all_cats = get_all_categories()
+    cat_info = next((c for c in all_cats if c['code'] == category_code), None)
+    if not cat_info:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    # Получаем неотправленные вакансии для данного пользователя по категории
+    vacancies = []
+    all_vacancies = get_unsent_vacancies_by_category(category_code)
+    for vac in all_vacancies:
+        if not has_user_received_vacancy(user_id, vac['id']):
+            vac['category'] = cat_info
+            vacancies.append(vac)
+    if not vacancies:
+        await callback.answer(f"Нет новых вакансий в категории {cat_info['emoji']} {cat_info['name']}", show_alert=True)
+        return
+    user_pages[user_id] = {
+        "vacancies": vacancies,
+        "page": 0,
+        "total": len(vacancies),
+        "category_code": category_code
+    }
+    await send_vacancy_page(callback.message, user_id, 0)
+    await callback.answer()
+
+# ========== ОБРАБОТЧИК ОБНОВЛЕНИЯ ==========
+@dp.callback_query(lambda c: c.data and c.data.startswith("refresh_vacancies_"))
+async def refresh_vacancies(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    page = int(callback.data.split("_")[2])
+    data = user_pages.get(user_id)
+    if not data or not data.get("category_code"):
+        await callback.answer("Не удалось обновить, выберите категорию заново", show_alert=True)
+        return
+    category_code = data["category_code"]
+    all_cats = get_all_categories()
+    cat_info = next((c for c in all_cats if c['code'] == category_code), None)
+    if not cat_info:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+    vacancies = []
+    all_vacancies = get_unsent_vacancies_by_category(category_code)
+    for vac in all_vacancies:
+        if not has_user_received_vacancy(user_id, vac['id']):
+            vac['category'] = cat_info
+            vacancies.append(vac)
+    if not vacancies:
+        await callback.message.edit_text(f"Нет новых вакансий в категории {cat_info['emoji']} {cat_info['name']}")
+        await callback.answer()
+        return
+    user_pages[user_id] = {
+        "vacancies": vacancies,
+        "page": 0 if page >= len(vacancies)//10 else page,
+        "total": len(vacancies),
+        "category_code": category_code
+    }
+    new_page = user_pages[user_id]["page"]
+    await send_vacancy_page(callback.message, user_id, new_page)
+    await callback.answer()
+
+# ========== ВОЗВРАТ В ГЛАВНОЕ МЕНЮ ==========
+@dp.callback_query(lambda c: c.data == "back_to_main")
+async def back_to_main_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
     keyboard, status_text = get_main_keyboard(user_id)
-    await callback.message.delete()
-    await callback.message.answer(
-        f"✅ *Вы подписались на вакансии!*\n\n"
-        f"📌 Ваши категории:\n{categories_text}\n\n"
-        f"Теперь я буду присылать вам новые вакансии по мере их появления.\n\n"
-        f"Используйте кнопки для управления:",
+    await callback.message.edit_text(
+        f"🏠 *Главное меню*\n\n{status_text}",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
     await callback.answer()
 
-# ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
-
-@dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
-async def show_new_vacancies(message: types.Message):
-    user_id = message.from_user.id
-    user_categories = get_user_categories(user_id)
-    if not user_categories:
-        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «✏️ Изменить категории»")
-        return
-
-    all_vacancies = []
-    for cat in user_categories:
-        vacancies = get_unsent_vacancies_by_category(cat['code'])
-        for vac in vacancies:
-            vac['category'] = cat
-            all_vacancies.append(vac)
-
-    if not all_vacancies:
-        await message.answer("🔍 Новых вакансий по вашим категориям пока нет.\n\nЯ продолжаю мониторинг и сообщу, когда появятся!")
-        return
-
-    user_pages[user_id] = {
-        "vacancies": all_vacancies,
-        "page": 0,
-        "total": len(all_vacancies)
-    }
-    await send_vacancy_page(message, user_id, 0)
-
-
+# ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ (ИСПРАВЛЕНА) ==========
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     data = user_pages.get(user_id)
     if not data:
@@ -647,7 +496,8 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vac['id']}")]]
         if vac.get('address'):
             address = vac['address']
-            maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
+            # ИСПРАВЛЕНИЕ: используем quote()
+            maps_url = f"https://yandex.ru/maps/?text={quote(address)}"
             buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
         buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vac['id']}")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -657,15 +507,16 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         except Exception as e:
             logger.error(f"Ошибка отправки вакансии: {e}")
 
+    # Панель навигации с кнопкой "Обновить"
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"vac_page_{page-1}"))
     if end < total:
         nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"vac_page_{page+1}"))
-    if nav_buttons:
-        nav_markup = InlineKeyboardMarkup(inline_keyboard=[nav_buttons])
-        await message.answer("📄 *Навигация*", parse_mode="Markdown", reply_markup=nav_markup)
-
+    # Кнопка обновления всегда
+    nav_buttons.append(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh_vacancies_{page}"))
+    nav_markup = InlineKeyboardMarkup(inline_keyboard=[nav_buttons])
+    await message.answer("📄 *Управление*", parse_mode="Markdown", reply_markup=nav_markup)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_page_"))
 async def vacancy_page_callback(callback: types.CallbackQuery):
@@ -674,9 +525,7 @@ async def vacancy_page_callback(callback: types.CallbackQuery):
     await send_vacancy_page(callback.message, user_id, page)
     await callback.answer()
 
-
 # ========== ОСНОВНЫЕ КОМАНДЫ ПОЛЬЗОВАТЕЛЯ ==========
-
 @dp.message(lambda m: m.text == "📋 Мои категории")
 async def show_my_categories(message: types.Message):
     categories = get_user_categories(message.from_user.id)
@@ -739,9 +588,7 @@ async def process_support_question(message: types.Message, state: FSMContext):
     await message.answer("✅ Ваш вопрос отправлен администратору. Ответ придёт сюда.")
     await state.clear()
 
-
-# ========== ЖАЛОБЫ НА ВАКАНСИИ ==========
-
+# ========== ЖАЛОБЫ ==========
 @dp.callback_query(lambda c: c.data and c.data.startswith("complain_"))
 async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
     vacancy_id = callback.data.replace("complain_", "")
@@ -792,9 +639,7 @@ async def complaint_text(message: types.Message, state: FSMContext):
     await message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
     await state.clear()
 
-
-# ========== ОТКЛИКИ НА ВАКАНСИИ С ВОЗМОЖНОСТЬЮ ПРИКРЕПИТЬ ФОТО ==========
-
+# ========== ОТКЛИКИ ==========
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_"))
 async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -1001,9 +846,7 @@ async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_que
 async def already_responded(callback: types.CallbackQuery):
     await callback.answer("Вы уже откликались на эту вакансию", show_alert=True)
 
-
 # ========== АДМИНСКИЕ КОМАНДЫ ==========
-
 @dp.message(Command("admin"))
 async def admin_menu(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -1163,12 +1006,10 @@ async def post_vacancy_cmd(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
 async def post_vacancy_category(callback: types.CallbackQuery, state: FSMContext):
-    # Проверяем, что мы действительно в состоянии ожидания категории
     current_state = await state.get_state()
     if current_state != PostVacancyState.waiting_for_category:
         await callback.answer("❌ Сначала выполните команду /postvacancy", show_alert=True)
         return
-    
     category_code = callback.data.replace("cat_", "")
     all_cats = get_all_categories()
     cat_name = next((cat['name'] for cat in all_cats if cat['code'] == category_code), category_code)
@@ -1218,9 +1059,7 @@ async def post_vacancy_photo(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Вакансия отправлена {sent} подписчикам категории {category_name}.", reply_markup=ReplyKeyboardRemove())
     await state.clear()
 
-
 # ========== КНОПКИ АДМИН-МЕНЮ ==========
-
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def admin_stats_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
@@ -1379,6 +1218,23 @@ async def admin_add_chat_button(message: types.Message, state: FSMContext):
     if message.from_user.id == YOUR_USER_ID:
         await add_chat_cmd(message, state)
 
+@dp.message(lambda m: m.text == "📋 Список чатов парсинга")
+async def admin_chat_list_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    status_msg = await message.answer("🔍 Проверяю доступ к чатам... Подождите.")
+    try:
+        result = await check_chats_access()
+        # Разбиваем на части, если сообщение слишком длинное
+        if len(result) > 4000:
+            parts = [result[i:i+4000] for i in range(0, len(result), 4000)]
+            for part in parts:
+                await message.answer(part, parse_mode="Markdown")
+        else:
+            await status_msg.edit_text(result, parse_mode="Markdown")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка при проверке: {e}")
+
 @dp.message(lambda m: m.text == "📤 Отправить вакансию")
 async def admin_post_vacancy_button(message: types.Message, state: FSMContext):
     if message.from_user.id == YOUR_USER_ID:
@@ -1389,9 +1245,7 @@ async def admin_close_menu(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
         await message.answer("Меню закрыто. Для открытия напишите /start", reply_markup=ReplyKeyboardRemove())
 
-
 # ========== ЗАПУСК И ОСТАНОВКА ==========
-
 async def on_startup():
     logger.info("🚀 Запуск бота...")
     init_db()
@@ -1405,7 +1259,6 @@ async def on_startup():
         await send_vacancy_to_subscribers(order)
     logger.info("✅ Однократная проверка завершена")
 
-    # Запускаем периодический поллинг
     asyncio.create_task(periodic_polling())
     logger.info("📡 Периодический поллинг запущен (интервал 60 секунд)")
 

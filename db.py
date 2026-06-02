@@ -732,3 +732,22 @@ def update_last_processed_id(chat_id: str, message_id: int):
     """, (chat_id, message_id))
     conn.commit()
     conn.close()
+def get_unsent_count_by_category(user_id: int, category_code: str) -> int:
+    """Возвращает количество неотправленных вакансий для пользователя по категории"""
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    # Получаем вакансии, которые не были отправлены этому пользователю
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM vacancies v
+        WHERE v.category_code = ?
+          AND v.is_sent = 0
+          AND v.is_closed = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM sent_vacancies sv
+              WHERE sv.vacancy_id = v.id AND sv.user_id = ?
+          )
+    """, (category_code, user_id))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
