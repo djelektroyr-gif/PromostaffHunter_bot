@@ -11,7 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
-from db_backend import db_conn, fetchone, now_minus_days
+from db_backend import db_conn, fetchone, now_minus_days, bool_false
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
@@ -1743,7 +1743,7 @@ async def answer_support(message: types.Message):
         await message.answer("❌ Неверный ID обращения")
         return
     row = fetchone(
-        "SELECT user_id FROM support_requests WHERE id = ? AND answered = 0",
+        f"SELECT user_id FROM support_requests WHERE id = ? AND answered = {bool_false()}",
         (req_id,),
     )
     if not row:

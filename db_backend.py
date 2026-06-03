@@ -137,6 +137,14 @@ def bool_default_false() -> str:
     return "DEFAULT FALSE" if IS_POSTGRES else "DEFAULT 0"
 
 
+def bool_true() -> str:
+    return "TRUE" if IS_POSTGRES else "1"
+
+
+def bool_false() -> str:
+    return "FALSE" if IS_POSTGRES else "0"
+
+
 def execute(sql: str, params=()):
     with db_conn() as conn:
         conn.cursor().execute(q(sql), params)

@@ -9,6 +9,8 @@ from db_backend import (
     add_column_if_missing,
     bool_default_false,
     bool_default_true,
+    bool_false,
+    bool_true,
     db_conn,
     db_info_label,
     execute,
@@ -287,14 +289,14 @@ def init_db():
 
 
 def add_subscriber(user_id: int, username: str, first_name: str, last_name: str = None):
-    execute("""
+    execute(f"""
         INSERT INTO subscribers (user_id, username, first_name, last_name, is_active)
-        VALUES (?, ?, ?, ?, 1)
+        VALUES (?, ?, ?, ?, {bool_true()})
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
-            is_active = 1
+            is_active = {bool_true()}
     """, (user_id, username, first_name, last_name))
 
 
@@ -369,7 +371,7 @@ def count_premium_subscribers() -> int:
     return fetchval(
         f"""
         SELECT COUNT(*) FROM subscribers
-        WHERE is_active = 1 AND plan = 'premium'
+        WHERE is_active = {bool_true()} AND plan = 'premium'
           AND {paid_until_active()}
         """,
         default=0,
@@ -390,7 +392,7 @@ def grant_trial_if_eligible(user_id: int, trial_days: int) -> bool:
     execute(
         f"""
         UPDATE subscribers
-        SET plan = 'premium', paid_until = {now_plus_days(trial_days)}, trial_used = 1
+        SET plan = 'premium', paid_until = {now_plus_days(trial_days)}, trial_used = {bool_true()}
         WHERE user_id = ?
         """,
         (user_id,),
@@ -453,11 +455,11 @@ def set_user_categories(user_id: int, category_codes: list):
 
 
 def get_subscribers_by_category(category_code: str) -> list:
-    rows = fetchall("""
+    rows = fetchall(f"""
         SELECT s.user_id, s.full_name, s.phone, s.username, s.metro_zones
         FROM subscribers s
         JOIN user_categories uc ON s.user_id = uc.user_id
-        WHERE uc.category_code = ? AND s.is_active = 1
+        WHERE uc.category_code = ? AND s.is_active = {bool_true()}
     """, (category_code,))
     return [
         {"user_id": r[0], "full_name": r[1], "phone": r[2], "username": r[3], "metro_zones": r[4]}
@@ -553,7 +555,7 @@ def has_recent_duplicate_vacancy(dedupe_key: str, max_age_days: int = 1) -> bool
         SELECT 1
         FROM vacancies
         WHERE dedupe_key = ?
-          AND is_closed = 0
+          AND is_closed = {bool_false()}
           AND found_at >= {now_minus_days(max_age_days)}
         LIMIT 1
         """,
@@ -566,7 +568,7 @@ def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200
         f"""
         SELECT id, message_text, author_contact, dedupe_key
         FROM vacancies
-        WHERE is_closed = 0
+        WHERE is_closed = {bool_false()}
           AND found_at >= {now_minus_days(max_age_days)}
         ORDER BY found_at DESC
         LIMIT ?
@@ -585,10 +587,10 @@ def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200
 
 
 def get_unsent_vacancies_by_category(category_code: str) -> list:
-    rows = fetchall("""
+    rows = fetchall(f"""
         SELECT id, source_chat_title, message_text, message_link, author_contact, address, found_at, published_at
         FROM vacancies
-        WHERE category_code = ? AND is_sent = 0 AND is_closed = 0
+        WHERE category_code = ? AND is_sent = {bool_false()} AND is_closed = {bool_false()}
         ORDER BY found_at DESC
     """, (category_code,))
     result = []
@@ -601,7 +603,7 @@ def get_unsent_vacancies_by_category(category_code: str) -> list:
 
 
 def mark_vacancy_sent(vacancy_id: str):
-    execute("UPDATE vacancies SET is_sent = 1 WHERE id = ?", (vacancy_id,))
+    execute(f"UPDATE vacancies SET is_sent = {bool_true()} WHERE id = ?", (vacancy_id,))
 
 
 def mark_vacancy_sent_to_user(vacancy_id: str, user_id: int):
@@ -644,7 +646,7 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
         cur.execute(q("SELECT user_id FROM sent_vacancies WHERE vacancy_id = ?"), (vacancy_id,))
         users = [r[0] for r in cur.fetchall()]
         cur.execute(
-            q("UPDATE vacancies SET is_closed = 1 WHERE id = ? OR id = ?"),
+            q(f"UPDATE vacancies SET is_closed = {bool_true()} WHERE id = ? OR id = ?"),
             (vacancy_id, legacy_id),
         )
     return vacancy_id, users
@@ -682,18 +684,18 @@ def add_complaint(user_id: int, vacancy_id: str, reason: str, complaint_text: st
 
 
 def get_recent_complaints(limit: int = 20):
-    return fetchall("""
+    return fetchall(f"""
         SELECT c.id, c.user_id, s.full_name, c.vacancy_id, c.reason, c.complaint_text, c.created_at
         FROM complaints c
         JOIN subscribers s ON c.user_id = s.user_id
-        WHERE c.resolved = 0
+        WHERE c.resolved = {bool_false()}
         ORDER BY c.created_at DESC
         LIMIT ?
     """, (limit,))
 
 
 def resolve_complaint(complaint_id: int):
-    execute("UPDATE complaints SET resolved = 1 WHERE id = ?", (complaint_id,))
+    execute(f"UPDATE complaints SET resolved = {bool_true()} WHERE id = ?", (complaint_id,))
 
 
 # ========== ПОДДЕРЖКА ==========
@@ -705,10 +707,10 @@ def add_support_request(user_id: int, message_text: str, username: str = None):
 
 
 def get_unanswered_support_requests(limit: int = 20):
-    return fetchall("""
+    return fetchall(f"""
         SELECT id, user_id, user_username, message_text, created_at
         FROM support_requests
-        WHERE answered = 0
+        WHERE answered = {bool_false()}
         ORDER BY created_at ASC
         LIMIT ?
     """, (limit,))
@@ -716,7 +718,7 @@ def get_unanswered_support_requests(limit: int = 20):
 
 def mark_support_answered(request_id: int, admin_response: str = None):
     execute(
-        "UPDATE support_requests SET answered = 1, admin_response = ? WHERE id = ?",
+        f"UPDATE support_requests SET answered = {bool_true()}, admin_response = ? WHERE id = ?",
         (admin_response, request_id),
     )
 
@@ -725,7 +727,7 @@ def mark_support_answered(request_id: int, admin_response: str = None):
 def get_target_chats() -> list:
     if not table_exists("target_chats"):
         return []
-    rows = fetchall("SELECT chat_link FROM target_chats WHERE is_active = 1")
+    rows = fetchall(f"SELECT chat_link FROM target_chats WHERE is_active = {bool_true()}")
     return [row[0] for row in rows]
 
 
@@ -752,12 +754,12 @@ def add_target_chat(chat_link: str) -> bool:
 def remove_target_chat(chat_link: str):
     if not table_exists("target_chats"):
         return
-    execute("UPDATE target_chats SET is_active = 0 WHERE chat_link = ?", (chat_link,))
+    execute(f"UPDATE target_chats SET is_active = {bool_false()} WHERE chat_link = ?", (chat_link,))
 
 
 # ========== АДМИНСКАЯ СТАТИСТИКА ==========
 def get_all_subscribers() -> list:
-    rows = fetchall("SELECT user_id FROM subscribers WHERE is_active = 1")
+    rows = fetchall(f"SELECT user_id FROM subscribers WHERE is_active = {bool_true()}")
     return [row[0] for row in rows]
 
 
@@ -787,19 +789,21 @@ def get_subscriber_by_id(user_id: int) -> dict:
 def get_admin_stats() -> dict:
     with db_conn(commit=False) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM subscribers WHERE is_active = 1")
+        cur.execute(f"SELECT COUNT(*) FROM subscribers WHERE is_active = {bool_true()}")
         total_subscribers = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM subscribers WHERE full_name IS NOT NULL")
         full_profiles = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM responses")
         total_responses = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM vacancies WHERE is_sent = 0 AND is_closed = 0")
+        cur.execute(
+            f"SELECT COUNT(*) FROM vacancies WHERE is_sent = {bool_false()} AND is_closed = {bool_false()}"
+        )
         pending_vacancies = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM vacancies")
         total_vacancies = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM complaints WHERE resolved = 0")
+        cur.execute(f"SELECT COUNT(*) FROM complaints WHERE resolved = {bool_false()}")
         pending_complaints = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM support_requests WHERE answered = 0")
+        cur.execute(f"SELECT COUNT(*) FROM support_requests WHERE answered = {bool_false()}")
         pending_support = cur.fetchone()[0]
     return {
         "subscribers": total_subscribers, "full_profiles": full_profiles,
@@ -853,12 +857,12 @@ def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
 
 def get_user_category_mapping() -> list:
     rows = fetchall(
-        """
+        f"""
         SELECT c.code, c.name, c.emoji, COUNT(uc.user_id) as subscribers_count
         FROM categories c
         LEFT JOIN user_categories uc ON uc.category_code = c.code
         LEFT JOIN subscribers s ON s.user_id = uc.user_id
-        WHERE s.is_active = 1 OR s.is_active IS NULL
+        WHERE s.is_active = {bool_true()} OR s.is_active IS NULL
         GROUP BY c.code, c.name, c.emoji
         ORDER BY subscribers_count DESC, c.name ASC
         """
