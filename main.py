@@ -17,6 +17,7 @@ from parser import (
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
     make_vacancy_id, PARSER_LABEL, inspect_parser_chats, format_parser_chats_report,
     get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
+    spawn_background_task,
 )
 from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
@@ -1787,7 +1788,7 @@ async def on_startup():
     logger.info("📁 База данных инициализирована")
 
     # Парсер групп (Telethon) — reconnect, health alerts, session lock
-    asyncio.create_task(
+    spawn_background_task(
         start_realtime_listener(
             send_vacancy_to_subscribers,
             notify_closed_vacancies,

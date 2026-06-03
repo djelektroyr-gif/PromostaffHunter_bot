@@ -24,6 +24,7 @@ _realtime_client = None
 _monitored_chat_ids = set()
 _parser_lock = asyncio.Lock()
 _last_health_alert = {}
+_background_tasks: set[asyncio.Task] = set()
 PARSER_POLL_INTERVAL_SEC = 300
 PARSER_HEALTH_INTERVAL_SEC = 600
 PARSER_RECONNECT_DELAY_SEC = 30
@@ -32,6 +33,14 @@ PER_CHAT_SCAN_LIMIT = 120
 PARSER_LABEL = "Парсер групп (Telethon)"
 MOSCOW_TZ = timezone(timedelta(hours=3))
 _session_config_alert_sent = False
+
+
+def spawn_background_task(coro) -> asyncio.Task:
+    """create_task + ссылка, иначе GC убивает задачу (asyncio docs)."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 class SessionNotConfiguredError(Exception):
@@ -304,7 +313,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                 pass
         return
 
-    asyncio.create_task(_parser_health_loop(health_notify_callback))
+    spawn_background_task(_parser_health_loop(health_notify_callback))
     reconnect_delay = PARSER_RECONNECT_DELAY_SEC
 
     while True:
@@ -326,7 +335,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                 await bot_callback(order)
             logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
 
-            asyncio.create_task(_periodic_scan_loop(bot_callback, closed_callback))
+            spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
 
             @_realtime_client.on(events.NewMessage())
             async def handler(event):
@@ -393,6 +402,11 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
 
 async def stop_realtime_listener():
     global _realtime_client
+    for task in list(_background_tasks):
+        if not task.done():
+            task.cancel()
+    if _background_tasks:
+        await asyncio.gather(*list(_background_tasks), return_exceptions=True)
     if _realtime_client and _realtime_client.is_connected():
         await _realtime_client.disconnect()
         logger.info(f"🛑 {PARSER_LABEL} остановлен")
