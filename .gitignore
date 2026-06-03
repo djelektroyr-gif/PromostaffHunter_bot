@@ -5,3 +5,5 @@ config.py
 *.db
 __pycache__/
 *.pyc
+*.session
+user_session.session
