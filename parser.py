@@ -91,6 +91,7 @@ async def refresh_monitored_chat_ids(client) -> set:
         try:
             entity = await client.get_entity(link)
             ids.add(str(entity.id))
+            await asyncio.sleep(1.2)
         except Exception as e:
             logger.warning(f"Не удалось резолвить чат {link}: {e}")
     _monitored_chat_ids = ids

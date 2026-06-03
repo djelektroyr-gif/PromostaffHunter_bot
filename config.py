@@ -2,6 +2,9 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# PostgreSQL (прод Bothost): если задан — вместо SQLite
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
 # Bot Settings
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUR_USER_ID = int(os.getenv("YOUR_USER_ID", "0"))
@@ -82,6 +85,21 @@ def describe_session_search() -> str:
 
 # Обратная совместимость (не использовать для Telethon — только runtime get_telegram_session_name)
 TELEGRAM_SESSION_NAME = "user_session"
+
+
+def get_database_path() -> str:
+    """SQLite на Bothost — лучше в /app/shared, чтобы не терять подписчиков при git-deploy."""
+    explicit = os.getenv("DATABASE_PATH", "").strip()
+    if explicit:
+        return explicit
+    shared_candidates = [p for p in (SHARED_DIR, "/app/shared") if p and os.path.isdir(p)]
+    for directory in shared_candidates:
+        shared_db = os.path.join(directory, "bot_database.db")
+        if os.path.isfile(shared_db):
+            return shared_db
+    if shared_candidates:
+        return os.path.join(shared_candidates[0], "bot_database.db")
+    return "bot_database.db"
 
 # List of chats for monitoring
 TARGET_CHATS = [

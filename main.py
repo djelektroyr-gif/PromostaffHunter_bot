@@ -1,7 +1,6 @@
 import asyncio
 import re
 import logging
-import sqlite3
 from datetime import datetime, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
@@ -12,6 +11,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
+from db_backend import db_conn, fetchone, now_minus_days
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
@@ -160,7 +160,7 @@ async def notify_admin_parser_issue(text: str):
     if not YOUR_USER_ID:
         return
     try:
-        await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown")
+        await bot.send_message(YOUR_USER_ID, text)
     except Exception as e:
         logger.warning(f"Не удалось отправить алерт админу: {e}")
 
@@ -1446,12 +1446,10 @@ async def broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
 async def clean_old_vacancies(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM vacancies WHERE found_at < datetime('now', '-3 days')")
-    cur.execute("DELETE FROM processed_messages WHERE processed_at < datetime('now', '-3 days')")
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(f"DELETE FROM vacancies WHERE found_at < {now_minus_days(3)}")
+        cur.execute(f"DELETE FROM processed_messages WHERE processed_at < {now_minus_days(3)}")
     await message.answer("✅ Удалены вакансии и обработанные сообщения старше 3 дней.")
 
 @dp.message(Command("addchat"))
@@ -1744,17 +1742,15 @@ async def answer_support(message: types.Message):
     except:
         await message.answer("❌ Неверный ID обращения")
         return
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM support_requests WHERE id = ? AND answered = 0", (req_id,))
-    row = cur.fetchone()
+    row = fetchone(
+        "SELECT user_id FROM support_requests WHERE id = ? AND answered = 0",
+        (req_id,),
+    )
     if not row:
-        conn.close()
         await message.answer("❌ Обращение не найдено или уже отвечено.")
         return
     user_id = row[0]
     mark_support_answered(req_id, answer_text)
-    conn.close()
     try:
         await bot.send_message(user_id, f"📞 *Ответ от администратора:*\n\n{answer_text}", parse_mode="Markdown")
         await message.answer(f"✅ Ответ отправлен пользователю {user_id}")

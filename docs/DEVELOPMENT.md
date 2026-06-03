@@ -3,7 +3,7 @@
 > Живой конспект проекта. Обновлять при каждой заметной доработке бота, парсера или продуктовых решений.  
 > Репозиторий: **PromostaffHunter_bot** (не путать с **promostaff-agency-bot** и **promostaff-bot**).
 
-Последнее обновление: **2026-06-03**
+Последнее обновление: **2026-06-04**
 
 ---
 
@@ -27,14 +27,14 @@ parser.py → save_vacancy → send_vacancy_to_subscribers()
     ↓ aiogram Bot (BOT_TOKEN): polling
 main.py → кнопки, админка, профили, отклики
     ↓
-SQLite bot_database.db
+SQLite bot_database.db  **или** PostgreSQL (`DATABASE_URL`)
 ```
 
 | Компонент | Файл | Роль |
 |-----------|------|------|
 | UI бота | `main.py` | Команды, FSM, рассылка, админ-меню |
 | Парсер | `parser.py` | Telethon, фильтры, категории, dedupe |
-| БД | `db.py` | SQLite, миграции в `init_db()` |
+| БД | `db.py`, `db_backend.py` | SQLite локально / PostgreSQL на Bothost prod |
 | Настройки | `config.py`, `.env` | Токены, список чатов по умолчанию |
 | Тесты | `tests/test_parser_quality.py` | Качество парсера (адрес, категории, dedupe) |
 
@@ -49,6 +49,9 @@ SQLite bot_database.db
 | `BOT_TOKEN` | Токен бота (BotFather) |
 | `YOUR_USER_ID` | Telegram ID администратора |
 | `API_ID`, `API_HASH` | Telethon (my.telegram.org) |
+| `DATABASE_URL` | PostgreSQL (прод Bothost): `postgresql://user:pass@host:5432/dbname` — если задан, SQLite не используется |
+| `DATABASE_PATH` | Явный путь к SQLite (Bothost shared: `/app/shared/bot_database.db`) |
+| `SHARED_DIR` | Каталог shared volume (Bothost: `/app/shared`) |
 | `SUBSCRIPTION_SUPPORT` | Контакт для оплаты подписки (например `@username`) |
 | `SUBSCRIPTION_PAY_URL` | Опционально: ссылка на оплату (когда появится) |
 
@@ -263,7 +266,7 @@ VACANCY_MAX_AGE_HOURS=36
 
 - [ ] Inline «Ответить» на жалобы/поддержку.
 - [ ] Экспорт подписчиков CSV.
-- [ ] PostgreSQL вместо SQLite при росте.
+- [ ] PostgreSQL вместо SQLite при росте — **реализовано** (`db_backend.py`, env `DATABASE_URL`); включить на Bothost prod при готовности managed DB.
 
 ---
 
@@ -277,10 +280,32 @@ VACANCY_MAX_AGE_HOURS=36
    - **Timeweb / свой VPS:** volume или `/app/user_session.session`
    - Env: `API_ID`, `API_HASH`; при нестандартном пути: `TELEGRAM_SESSION_NAME=/app/shared/user_session`
    - Без `.session` парсер не стартует (бот для пользователей работает)
-3. На сервере: **один** процесс бота, `user_session.session` на месте
-4. После выката: `/start` → **📊 Статистика** — строка парсера ✅, не «нет файла session»
-5. **📋 Список чатов парсинга** — все активные группы ✅
-6. Тестовая вакансия: push → «Откликнуться» → deeplink
+3. **База данных:**
+   - **Локально / dev:** SQLite (`bot_database.db` в корне проекта или `DATABASE_PATH`).
+   - **Bothost prod (рекомендуется):** **PostgreSQL** через managed DB на тарифе Basic/Pro+ — устойчивее при redeploy и росте подписчиков.
+   - **Bothost prod (SQLite):** «Общее хранилище» включено → БД в `/app/shared/bot_database.db` (не затирается при git-deploy).
+   - Перед деплоем: бэкап БД (файл или pg_dump).
+   - Env SQLite: `DATABASE_PATH=/app/shared/bot_database.db`
+   - Env PostgreSQL:
+     ```env
+     DATABASE_URL=postgresql://user:password@host.example.com:5432/promostaff_hunter
+     ```
+     При первом старте `init_db()` создаст таблицы и засеет категории/чаты автоматически.
+4. На сервере: **один** процесс бота, `user_session.session` на месте
+5. После выката: `/start` → **📊 Статистика** — строка парсера ✅, не «нет файла session»
+6. **📋 Список чатов парсинга** — все активные группы ✅
+7. Тестовая вакансия: push → «Откликнуться» → deeplink
+
+### 11.1 SQLite vs PostgreSQL (Hunter)
+
+| | SQLite в `/app/shared` | PostgreSQL (`DATABASE_URL`) |
+|---|------------------------|----------------------------|
+| Сложность | Работает из коробки | Managed DB на Bothost + env |
+| Bothost | Общее хранилище на тарифе | Managed PostgreSQL (Basic/Pro+) |
+| Масштаб | До тысяч подписчиков — норм | **Рекомендуется для prod Bothost** — не теряется при redeploy, проще бэкапы |
+| Локально | **По умолчанию** (без `DATABASE_URL`) | Опционально для проверки prod-схемы |
+
+Код поддерживает оба бэкенда через `db_backend.py`. Без `DATABASE_URL` — SQLite как раньше.
 
 ---
 
@@ -298,6 +323,7 @@ VACANCY_MAX_AGE_HOURS=36
 
 | Дата | Что добавлено |
 |------|----------------|
+| 2026-06-04 | Dual-backend БД: `db_backend.py`, PostgreSQL на Bothost prod (`DATABASE_URL`) |
 | 2026-06-03 | Закрыты слабые места: health/reconnect, session lock, 36h window, metro, premium push, trial |
 | 2026-06-03 | Первая версия: архитектура, админка, парсер, подписка (trial + ручная карта), бэклог |
 
