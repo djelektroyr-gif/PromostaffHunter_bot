@@ -73,27 +73,33 @@ def init_db():
         add_column_if_missing(
             "subscribers", "photo_file_id",
             "ALTER TABLE subscribers ADD COLUMN photo_file_id TEXT DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "subscribers", "questionnaire",
             "ALTER TABLE subscribers ADD COLUMN questionnaire TEXT DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "subscribers", "plan",
             "ALTER TABLE subscribers ADD COLUMN plan TEXT DEFAULT 'free'",
+            cur=cur,
         )
         add_column_if_missing(
             "subscribers", "paid_until",
             "ALTER TABLE subscribers ADD COLUMN paid_until TIMESTAMP DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "subscribers", "metro_zones",
             "ALTER TABLE subscribers ADD COLUMN metro_zones TEXT DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "subscribers", "trial_used",
             "ALTER TABLE subscribers ADD COLUMN trial_used BOOLEAN DEFAULT 0",
             "ALTER TABLE subscribers ADD COLUMN trial_used BOOLEAN DEFAULT FALSE",
+            cur=cur,
         )
 
         cur.execute(f"""
@@ -134,19 +140,23 @@ def init_db():
         add_column_if_missing(
             "vacancies", "address",
             "ALTER TABLE vacancies ADD COLUMN address TEXT DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "vacancies", "is_closed",
             f"ALTER TABLE vacancies ADD COLUMN is_closed BOOLEAN {bool_default_false()}",
             f"ALTER TABLE vacancies ADD COLUMN is_closed BOOLEAN {bool_default_false()}",
+            cur=cur,
         )
         add_column_if_missing(
             "vacancies", "dedupe_key",
             "ALTER TABLE vacancies ADD COLUMN dedupe_key TEXT DEFAULT NULL",
+            cur=cur,
         )
         add_column_if_missing(
             "vacancies", "published_at",
             "ALTER TABLE vacancies ADD COLUMN published_at TEXT DEFAULT NULL",
+            cur=cur,
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
 
@@ -182,6 +192,7 @@ def init_db():
         add_column_if_missing(
             "responses", "user_photo_file_id",
             "ALTER TABLE responses ADD COLUMN user_photo_file_id TEXT DEFAULT NULL",
+            cur=cur,
         )
 
         cur.execute("""

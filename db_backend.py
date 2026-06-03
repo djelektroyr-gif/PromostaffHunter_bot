@@ -68,28 +68,35 @@ def table_exists(table_name: str) -> bool:
 
 def column_exists(table_name: str, column_name: str) -> bool:
     with db_conn(commit=False) as conn:
-        cur = conn.cursor()
-        if IS_POSTGRES:
-            cur.execute(
-                """
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name=%s AND column_name=%s
-                """,
-                (table_name, column_name),
-            )
-        else:
-            cur.execute(f"PRAGMA table_info({table_name})")
-            cols = [c[1] for c in cur.fetchall()]
-            return column_name in cols
+        return column_exists_cur(conn.cursor(), table_name, column_name)
+
+
+def column_exists_cur(cur, table_name: str, column_name: str) -> bool:
+    if IS_POSTGRES:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=%s AND column_name=%s
+            """,
+            (table_name, column_name),
+        )
         return cur.fetchone() is not None
+    cur.execute(f"PRAGMA table_info({table_name})")
+    cols = [c[1] for c in cur.fetchall()]
+    return column_name in cols
 
 
-def add_column_if_missing(table: str, column: str, ddl_sqlite: str, ddl_pg: str = None):
-    if column_exists(table, column):
+def add_column_if_missing(table: str, column: str, ddl_sqlite: str, ddl_pg: str = None, cur=None):
+    ddl = ddl_pg if IS_POSTGRES and ddl_pg else ddl_sqlite
+    if cur is not None:
+        if column_exists_cur(cur, table, column):
+            return
+        cur.execute(ddl)
+        return
+    if not table_exists(table) or column_exists(table, column):
         return
     with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(ddl_pg if IS_POSTGRES and ddl_pg else ddl_sqlite)
+        conn.cursor().execute(ddl)
 
 
 def paid_until_active() -> str:
