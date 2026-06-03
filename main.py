@@ -20,7 +20,8 @@ from db import DB_NAME
 from db import get_unsent_count_by_category
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
-    get_new_messages, extract_address_from_text
+    get_new_messages, extract_address_from_text,
+    get_telethon_client, close_telethon_client   
 )
 from config import BOT_TOKEN, YOUR_USER_ID
 from telethon import errors
@@ -34,6 +35,7 @@ dp = Dispatcher(storage=storage)
 
 SEND_DELAY = 1
 user_pages = {}
+_tg_client = None
 
 # ========== FSM СОСТОЯНИЯ ==========
 class RegistrationState(StatesGroup):
@@ -67,14 +69,13 @@ class CategorySelectionState(StatesGroup):
     choosing = State()
 
 # ========== ПЕРИОДИЧЕСКИЙ ПОЛЛИНГ ==========
-async def periodic_polling():
+async def periodic_polling(client: TelegramClient):
     logger.info("📡 Периодическая задача запущена, ожидание 2 секунды...")
     await asyncio.sleep(2)
-    logger.info("📡 Начинаю бесконечный цикл проверки")
     while True:
         try:
             logger.info("🔍 Периодическая проверка новых сообщений...")
-            orders, closed_data = await get_new_messages(limit_per_chat=300)   # <-- увеличено с 100 до 300
+            orders, closed_data = await get_new_messages(client, limit_per_chat=300)
             if closed_data:
                 await notify_closed_vacancies(closed_data)
             for order in orders:
@@ -1007,7 +1008,8 @@ async def check_now_cmd(message: types.Message):
         return
     status_msg = await message.answer("🔍 Начинаю проверку...")
     try:
-        orders, closed_data = await run_parser()
+        # используем глобальный клиент
+        orders, closed_data = await run_parser(_tg_client)
         if not orders and not closed_data:
             await status_msg.edit_text("✅ Новых вакансий не найдено.")
             return
@@ -1406,26 +1408,40 @@ async def finish_categories(callback: types.CallbackQuery, state: FSMContext):
 
 # ========== ЗАПУСК И ОСТАНОВКА ==========
 async def on_startup():
+    global _tg_client
     logger.info("🚀 Запуск бота...")
     init_db()
     logger.info("📁 База данных инициализирована")
 
+    # Инициализируем клиент Telethon один раз
+    _tg_client = await get_telethon_client()
+    logger.info("✅ Telethon клиент готов")
+
     logger.info("🔄 Однократная проверка новых сообщений...")
-    orders, closed = await get_new_messages(limit_per_chat=300)
-    if closed:
-        await notify_closed_vacancies(closed)
-    for order in orders:
-        await send_vacancy_to_subscribers(order)
+    try:
+        orders, closed = await get_new_messages(_tg_client, limit_per_chat=300)
+        if closed:
+            await notify_closed_vacancies(closed)
+        for order in orders:
+            await send_vacancy_to_subscribers(order)
+    except Exception as e:
+        logger.error(f"❌ Ошибка при однократной проверке: {e}", exc_info=True)
 
     logger.info("✅ Однократная проверка завершена")
-    await asyncio.sleep(2)   # даём время на освобождение ресурсов Telethon
+    await asyncio.sleep(2)
 
-    asyncio.create_task(periodic_polling())
+    asyncio.create_task(periodic_polling(_tg_client))
     logger.info("📡 Задача periodic_polling создана")
     logger.info("📡 Периодический поллинг запущен (интервал 60 секунд)")
 
+    logger.info("📡 Запуск polling...")
+    await dp.start_polling(bot)
+
 async def on_shutdown():
+    global _tg_client
     logger.info("🛑 Остановка бота...")
+    if _tg_client:
+        await close_telethon_client()
     await bot.session.close()
     logger.info("👋 Бот остановлен")
 

@@ -18,8 +18,22 @@ from db import (
     get_recent_open_vacancies_for_dedupe
 )
 
-logger = logging.getLogger(__name__)
+_client = None
 
+async def get_telethon_client() -> TelegramClient:
+    global _client
+    if _client is None:
+        _client = TelegramClient('user_session', API_ID, API_HASH)
+        await _client.start()
+    return _client
+
+async def close_telethon_client():
+    global _client
+    if _client:
+        await _client.disconnect()
+        _client = None
+
+logger = logging.getLogger(__name__)
 
 # ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
 
@@ -84,6 +98,7 @@ def get_last_debug_report() -> str:
     return "\n".join(lines)
 
 def extract_contact_from_text(text: str) -> str:
+    # ... (без изменений, код тот же, что был)
     if not text:
         return None
     resolve_match = re.search(r'tg://resolve\?domain=([a-zA-Z0-9_]{5,32})', text, re.IGNORECASE)
@@ -104,6 +119,7 @@ def extract_contact_from_text(text: str) -> str:
     return None
 
 def extract_address_from_text(text: str) -> str:
+    # ... (без изменений)
     if not text:
         return None
     direct_match = re.search(r'(?:адрес|локация|место)\s*[:\-]\s*([^\n]{6,120})', text, re.IGNORECASE)
@@ -182,6 +198,7 @@ def is_message_for_today(message_dt: datetime) -> bool:
     return message_dt.date() == now.date()
 
 def detect_category(text: str) -> str:
+    # ... (без изменений, код длинный, оставляем как есть)
     if not text:
         return "helper"
     text_lower = text.lower()
@@ -219,6 +236,7 @@ def detect_category(text: str) -> str:
     return "helper"
 
 def is_helper_message(text: str):
+    # ... (без изменений)
     if not text:
         return False, "empty", []
     text_lower = text.lower()
@@ -280,11 +298,11 @@ async def safe_get_entity(client, chat_link: str):
         logger.warning(f"⚠️ Ошибка доступа к {chat_link}: {type(e).__name__}")
         return None
 
-async def get_new_messages(limit_per_chat: int = 500):
+# ========== ОСНОВНАЯ ФУНКЦИЯ ПАРСИНГА (ПРИНИМАЕТ КЛИЕНТ) ==========
+async def get_new_messages(client: TelegramClient, limit_per_chat: int = 500):
     global LAST_DEBUG_STATS
     LAST_DEBUG_STATS = _new_stats()
-    client = TelegramClient('user_session', API_ID, API_HASH)
-    all_results = []
+    all_results = []                     # <-- добавлено
     closed_vacancies_users = []
     target_chats = get_target_chats()
     if not target_chats:
@@ -292,8 +310,8 @@ async def get_new_messages(limit_per_chat: int = 500):
         return [], []
 
     try:
-        await client.start()
-        logger.info("✅ Telethon client started")
+        # Клиент уже запущен, не вызываем client.start()
+        logger.info("✅ Telethon client ready")
         logger.info(f"🎯 ИЩЕМ ТОЛЬКО: {', '.join(HELPER_KEYWORDS[:10])}...")
         logger.info(f"🚫 ИСКЛЮЧАЕМ: {', '.join(EXCLUDE_CATEGORIES[:10])}...")
         logger.info(f"📋 Всего каналов для проверки: {len(target_chats)}")
@@ -419,17 +437,17 @@ async def get_new_messages(limit_per_chat: int = 500):
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
     finally:
         LAST_DEBUG_STATS["finished_at"] = _iso_now()
-        if client.is_connected():
-            await client.disconnect()
+        # НЕ закрываем клиент здесь – он переиспользуется
 
     return all_results, closed_vacancies_users
 
-async def run_parser():
-    orders, closed_data = await get_new_messages()
+async def run_parser(client: TelegramClient):
+    orders, closed_data = await get_new_messages(client)
     return orders, closed_data
 
 async def test_filter(chat_link: str, limit: int = 30):
-    client = TelegramClient('user_session', API_ID, API_HASH)
+    # Для теста создаём отдельного клиента, чтобы не мешать основному
+    client = TelegramClient('test_session', API_ID, API_HASH)
     try:
         await client.start()
         logger.info(f"\n{'='*60}")
