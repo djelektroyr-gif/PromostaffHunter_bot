@@ -18,6 +18,7 @@ from db import (
     save_vacancy, mark_message_processed, has_recent_duplicate_vacancy,
     get_recent_open_vacancies_for_dedupe
 )
+from db_backend import run_db
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,7 @@ async def refresh_monitored_chat_ids(client) -> set:
     """Резолвит ссылки из БД в numeric chat_id — без этого Telethon-парсер не видит группы."""
     global _monitored_chat_ids
     ids = set()
-    for link in get_target_chats():
+    for link in await run_db(get_target_chats):
         try:
             entity = await client.get_entity(link)
             ids.add(str(entity.id))
@@ -109,7 +110,7 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
             stats["no_text"] += 1
         return None
     message_id = str(message.id)
-    if is_message_processed(message_id, chat_id):
+    if await run_db(is_message_processed, message_id, chat_id):
         if stats is not None:
             stats["already_sent"] += 1
         return None
@@ -124,7 +125,7 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
             close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
             if any(marker in message.text.lower() for marker in close_markers):
                 original_id = str(original_message.id)
-                vacancy_id, users = mark_vacancy_closed(original_id, chat_id)
+                vacancy_id, users = await run_db(mark_vacancy_closed, original_id, chat_id)
                 if stats is not None:
                     stats["closed_vacancies"] += 1
                 return {"type": "closed", "vacancy_id": vacancy_id, "users": users}
@@ -146,32 +147,33 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
     address = extract_address_from_text(message.text)
     dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
 
-    duplicate_type = detect_duplicate_type(message.text, author_contact, dedupe_key)
+    duplicate_type = await run_db(detect_duplicate_type, message.text, author_contact, dedupe_key)
     if duplicate_type:
         if stats is not None:
             if duplicate_type == "exact":
                 stats["duplicates_exact"] += 1
             else:
                 stats["duplicates_fuzzy"] += 1
-        mark_message_processed(message_id, chat_id)
+        await run_db(mark_message_processed, message_id, chat_id)
         return None
 
     vacancy_id = make_vacancy_id(chat_id, message_id, dedupe_key)
-    save_vacancy(
-        vacancy_id=vacancy_id,
-        source_chat=chat_id,
-        source_chat_title=chat_title,
-        category_code=category,
-        message_text=cleaned_text[:2000],
-        message_link=message_link,
-        author_contact=author_contact,
-        address=address,
-        is_closed=False,
-        dedupe_key=dedupe_key,
-        published_at=message.date.strftime("%Y-%m-%d %H:%M:%S"),
+    await run_db(
+        save_vacancy,
+        vacancy_id,
+        chat_id,
+        chat_title,
+        category,
+        cleaned_text[:2000],
+        message_link,
+        author_contact,
+        address,
+        False,
+        dedupe_key,
+        message.date.strftime("%Y-%m-%d %H:%M:%S"),
     )
-    mark_message_processed(message_id, chat_id)
-    update_last_processed_id(chat_id, message.id)
+    await run_db(mark_message_processed, message_id, chat_id)
+    await run_db(update_last_processed_id, chat_id, message.id)
     if stats is not None:
         stats["matched"] += 1
 
@@ -194,7 +196,7 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
 async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None):
     all_results = []
     closed_vacancies_users = []
-    target_chats = get_target_chats()
+    target_chats = await run_db(get_target_chats)
     if not target_chats:
         return [], []
 
@@ -216,6 +218,8 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
         async for message in client.iter_messages(entity, limit=limit_per_chat):
             if stats is not None:
                 stats["messages_scanned"] += 1
+                if stats["messages_scanned"] % 25 == 0:
+                    await asyncio.sleep(0)
             try:
                 result = await _process_single_message(message, entity, chat_id, chat_title, stats)
                 if result and result.get("type") == "closed":
@@ -669,7 +673,7 @@ async def inspect_parser_chats() -> tuple:
     """Проверка доступа Telethon к чатам из БД. Возвращает (список, статус парсера)."""
     from db import list_target_chats
 
-    chats_db = list_target_chats()
+    chats_db = await run_db(list_target_chats)
     if not chats_db:
         return [], "empty"
 

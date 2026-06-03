@@ -2,7 +2,10 @@
 import os
 import sqlite3
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 
 from config import get_database_path
 
@@ -11,6 +14,14 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 IS_POSTGRES = bool(DATABASE_URL)
 SQLITE_PATH = get_database_path() if not IS_POSTGRES else None
+
+_db_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="db")
+
+
+async def run_db(func, *args, **kwargs):
+    """Синхронные запросы к PG/SQLite в пуле потоков — не блокируют aiogram."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_db_executor, partial(func, *args, **kwargs))
 
 if IS_POSTGRES:
     import psycopg2

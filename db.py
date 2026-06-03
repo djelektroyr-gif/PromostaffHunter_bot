@@ -285,6 +285,19 @@ def init_db():
             )
         """)
 
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS premium_requests (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                category_codes TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
     logger.info(db_info_label())
 
 
@@ -472,7 +485,9 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  category_code: str, message_text: str, message_link: str,
                  author_contact: str = None, address: str = None, is_closed: bool = False,
                  dedupe_key: str = None, published_at: str = None):
-    execute("""
+    # PostgreSQL: в ON CONFLICT нужен префикс vacancies. — иначе ambiguous column
+    v = "vacancies." if IS_POSTGRES else ""
+    execute(f"""
         INSERT INTO vacancies
         (id, source_chat, source_chat_title, category_code, message_text, message_link,
          author_contact, address, is_closed, dedupe_key, published_at)
@@ -482,10 +497,10 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
             category_code = excluded.category_code,
             message_text = excluded.message_text,
             message_link = excluded.message_link,
-            author_contact = COALESCE(excluded.author_contact, author_contact),
-            address = COALESCE(excluded.address, address),
-            dedupe_key = COALESCE(excluded.dedupe_key, dedupe_key),
-            published_at = COALESCE(excluded.published_at, published_at)
+            author_contact = COALESCE(excluded.author_contact, {v}author_contact),
+            address = COALESCE(excluded.address, {v}address),
+            dedupe_key = COALESCE(excluded.dedupe_key, {v}dedupe_key),
+            published_at = COALESCE(excluded.published_at, {v}published_at)
     """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
           author_contact, address, is_closed, dedupe_key, published_at))
 
@@ -786,6 +801,21 @@ def get_subscriber_by_id(user_id: int) -> dict:
     return None
 
 
+def get_subscribers_display(limit: int = 20) -> list:
+    rows = fetchall(
+        f"""
+        SELECT user_id,
+               COALESCE(full_name, first_name, username, CAST(user_id AS TEXT)) AS name
+        FROM subscribers
+        WHERE is_active = {bool_true()}
+        ORDER BY registered_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [{"user_id": r[0], "name": r[1]} for r in rows]
+
+
 def get_admin_stats() -> dict:
     with db_conn(commit=False) as conn:
         cur = conn.cursor()
@@ -817,8 +847,10 @@ def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
     with db_conn(commit=False) as conn:
         cur = conn.cursor()
         cur.execute(
-            q("""
-                SELECT user_id, username, first_name, last_name, full_name, age, phone, registered_at, is_active
+            q(f"""
+                SELECT user_id, username, first_name, last_name, full_name, age, phone,
+                       registered_at, is_active, plan, paid_until,
+                       CASE WHEN plan = 'premium' AND ({paid_until_active()}) THEN 1 ELSE 0 END
                 FROM subscribers
                 ORDER BY registered_at DESC
                 LIMIT ? OFFSET ?
@@ -850,6 +882,9 @@ def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
                 "phone": row[6],
                 "registered_at": row[7],
                 "is_active": bool(row[8]),
+                "plan": row[9] or "free",
+                "paid_until": row[10],
+                "is_premium": bool(row[11]),
                 "categories": cats,
             })
     return cards
@@ -905,3 +940,63 @@ def update_last_processed_id(chat_id: str, message_id: int):
             last_message_id = excluded.last_message_id,
             updated_at = CURRENT_TIMESTAMP
     """, (chat_id, message_id))
+
+
+# ========== ЗАПРОСЫ PREMIUM ==========
+def add_premium_request(
+    user_id: int,
+    username: str = None,
+    full_name: str = None,
+    phone: str = None,
+    category_codes: str = None,
+):
+    execute(
+        f"UPDATE premium_requests SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'",
+        (user_id,),
+    )
+    execute(
+        """
+        INSERT INTO premium_requests (user_id, username, full_name, phone, category_codes, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """,
+        (user_id, username, full_name, phone, category_codes),
+    )
+
+
+def get_pending_premium_requests(limit: int = 20) -> list:
+    rows = fetchall(
+        f"""
+        SELECT id, user_id, username, full_name, phone, category_codes, created_at
+        FROM premium_requests
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        {
+            "id": r[0],
+            "user_id": r[1],
+            "username": r[2],
+            "full_name": r[3],
+            "phone": r[4],
+            "category_codes": r[5],
+            "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def count_pending_premium_requests() -> int:
+    return fetchval(
+        f"SELECT COUNT(*) FROM premium_requests WHERE status = 'pending'",
+        default=0,
+    )
+
+
+def resolve_premium_requests(user_id: int):
+    execute(
+        f"UPDATE premium_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'",
+        (user_id,),
+    )

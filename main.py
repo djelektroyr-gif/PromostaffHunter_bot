@@ -12,7 +12,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from db import *
-from db_backend import db_conn, fetchone, now_minus_days, bool_false
+from db_backend import db_conn, fetchone, now_minus_days, bool_false, run_db
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
@@ -36,6 +36,117 @@ dp = Dispatcher(storage=storage)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 FREE_CATEGORY_LIMIT = 3
+_processing_finish: set[int] = set()
+
+
+def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> str:
+    if is_user_premium(user_id):
+        limit_line = f"💎 Premium: без лимита. Выбрано: *{selected_count}*."
+    else:
+        limit_line = (
+            f"🆓 Free: до *{FREE_CATEGORY_LIMIT}* категорий (push — только Premium).\n"
+            f"Выбрано: *{selected_count}*."
+        )
+    hint_line = f"\n\n{hint}" if hint else ""
+    return (
+        "📋 *Выберите категории вакансий:*\n\n"
+        "✅ — выбраны · ⬜ — добавить\n"
+        f"{limit_line}{hint_line}\n\n"
+        "Готово — «✅ Завершить выбор»"
+    )
+
+
+def build_categories_markup(selected_codes: list, user_id: int) -> InlineKeyboardMarkup:
+    all_cats = get_all_categories()
+    buttons, row = [], []
+    for i, cat in enumerate(all_cats):
+        prefix = "✅" if cat["code"] in selected_codes else "⬜"
+        row.append(InlineKeyboardButton(
+            text=f"{prefix} {cat['emoji']} {cat['name']}",
+            callback_data=f"cat_{cat['code']}",
+        ))
+        if len(row) == 2 or i == len(all_cats) - 1:
+            buttons.append(row)
+            row = []
+    if not is_user_premium(user_id):
+        buttons.append([InlineKeyboardButton(
+            text="💎 Premium — больше категорий и push",
+            callback_data="subscription_from_categories",
+        )])
+    buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def edit_category_picker(message: types.Message, selected_codes: list, user_id: int, hint: str = ""):
+    try:
+        await message.edit_text(
+            category_picker_text(len(selected_codes), user_id, hint),
+            parse_mode="Markdown",
+            reply_markup=build_categories_markup(selected_codes, user_id),
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning(f"edit_category_picker: {e}")
+
+
+async def send_category_picker(chat_id: int, user_id: int, selected_codes: list = None):
+    if selected_codes is None:
+        selected_codes = [c["code"] for c in get_user_categories(user_id)]
+    return await bot.send_message(
+        chat_id,
+        category_picker_text(len(selected_codes), user_id),
+        parse_mode="Markdown",
+        reply_markup=build_categories_markup(selected_codes, user_id),
+    )
+
+
+def subscription_action_buttons(user_id: int) -> InlineKeyboardMarkup:
+    buttons = []
+    if SUBSCRIPTION_PAY_URL and not is_user_premium(user_id):
+        buttons.append([InlineKeyboardButton(text="💳 Оплатить Premium", url=SUBSCRIPTION_PAY_URL)])
+    if not is_user_premium(user_id):
+        buttons.append([InlineKeyboardButton(text="📩 Запросить Premium (перевод)", callback_data="subscription_request")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+
+async def notify_admin_premium_request(user_id: int, username: str, name: str, phone: str, categories: str):
+    if not YOUR_USER_ID:
+        return
+    pending = count_pending_premium_requests()
+    try:
+        await bot.send_message(
+            YOUR_USER_ID,
+            f"💳 *Запрос Premium* (#{pending})\n\n"
+            f"👤 {name}\n"
+            f"ID: `{user_id}`\n"
+            f"Username: @{username or '—'}\n"
+            f"📞 {phone or '—'}\n"
+            f"📋 Категории: {categories or '—'}\n\n"
+            f"После оплаты:\n"
+            f"`/setplan {user_id} premium 30`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning(f"premium_request notify admin: {e}")
+
+
+async def activate_premium_for_user(target_id: int, days: int) -> bool:
+    set_user_plan(target_id, plan="premium", days=days)
+    resolve_premium_requests(target_id)
+    try:
+        await bot.send_message(
+            target_id,
+            f"💎 *Premium активирован* на {days} дн.\n\n"
+            "• моментальные push-уведомления\n"
+            "• все категории без лимита\n"
+            "• фильтр по метро (📍 Мои районы)\n\n"
+            "Можете добавить категории в ✏️ Изменить категории.",
+            parse_mode="Markdown",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить {target_id} о Premium: {e}")
+        return False
 
 
 async def safe_callback_answer(
@@ -113,7 +224,8 @@ def build_admin_dashboard_text() -> str:
         f"• Вакансий в очереди: {stats['pending_vacancies']}\n"
         f"• Всего вакансий: {stats['total_vacancies']}\n"
         f"• ⚠️ Жалоб: {stats['pending_complaints']}\n"
-        f"• ❓ Поддержка: {stats['pending_support']}"
+        f"• ❓ Поддержка: {stats['pending_support']}\n"
+        f"• 💳 Ожидают Premium: {count_pending_premium_requests()}"
     )
 
 async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message = None):
@@ -272,12 +384,19 @@ def format_user_card(card: dict, idx: int = None) -> str:
     username = f"@{card['username']}" if card.get("username") else "нет"
     cats = ", ".join(card.get("categories") or []) or "не выбраны"
     status = "активен" if card.get("is_active") else "неактивен"
+    if card.get("is_premium"):
+        until = str(card.get("paid_until") or "")[:10]
+        plan_line = f"💎 Premium до {until}" if until else "💎 Premium"
+    elif (card.get("plan") or "free") == "premium":
+        plan_line = "💎 Premium (истёк)"
+    else:
+        plan_line = "🆓 Free"
     return (
         f"{prefix}👤 *{escape_markdown(name)}*\n"
         f"ID: `{card['user_id']}`\n"
         f"Username: {escape_markdown(username)}\n"
         f"Телефон: {escape_markdown(card.get('phone') or '—')}\n"
-        f"Возраст: {escape_markdown(str(card.get('age') or '—'))}\n"
+        f"Тариф: {escape_markdown(plan_line)}\n"
         f"Статус: {escape_markdown(status)}\n"
         f"Категории: {escape_markdown(cats)}"
     )
@@ -454,17 +573,6 @@ async def notify_closed_vacancies(closed_data: list):
 
 # ========== КЛАВИАТУРЫ ==========
 
-def get_categories_keyboard():
-    categories = get_all_categories()
-    buttons, row = [], []
-    for i, cat in enumerate(categories):
-        row.append(InlineKeyboardButton(text=f"{cat['emoji']} {cat['name']}", callback_data=f"cat_{cat['code']}"))
-        if len(row) == 2 or i == len(categories) - 1:
-            buttons.append(row)
-            row = []
-    buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
 def get_main_keyboard(user_id: int):
     categories = get_user_categories(user_id)
     if categories:
@@ -490,10 +598,10 @@ def get_admin_keyboard():
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔍 Ручная проверка")],
             [KeyboardButton(text="📋 Список откликов"), KeyboardButton(text="📝 Отчёт парсера")],
             [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="🗂️ Карточки пользователей"), KeyboardButton(text="🧭 Маппинг категорий")],
-            [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
-            [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📋 Список чатов парсинга")],
-            [KeyboardButton(text="📤 Отправить вакансию")],
+            [KeyboardButton(text="🗂️ Карточки пользователей"), KeyboardButton(text="💎 Запросы Premium")],
+            [KeyboardButton(text="🧭 Маппинг категорий"), KeyboardButton(text="⚠️ Жалобы")],
+            [KeyboardButton(text="❓ Поддержка (админ)"), KeyboardButton(text="➕ Добавить чат")],
+            [KeyboardButton(text="📋 Список чатов парсинга"), KeyboardButton(text="📤 Отправить вакансию")],
             [KeyboardButton(text="❌ Закрыть меню")]
         ],
         resize_keyboard=True
@@ -501,9 +609,9 @@ def get_admin_keyboard():
 
 ADMIN_MENU_BUTTONS = {
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
-    "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "🧭 Маппинг категорий",
-    "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат", "📋 Список чатов парсинга",
-    "💬 Чаты парсинга", "📤 Отправить вакансию", "❌ Закрыть меню",
+    "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
+    "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат",
+    "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию", "❌ Закрыть меню",
 }
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
@@ -541,13 +649,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
             )
             return
         else:
-            await message.answer(
-                f"👋 С возвращением, {first_name}!\n\n"
-                f"Ваш профиль уже заполнен, но вы ещё не выбрали категории вакансий.\n\n"
-                f"📋 *Выберите категории вакансий:*",
-                parse_mode="Markdown",
-                reply_markup=get_categories_keyboard()
-            )
+            await send_category_picker(message.chat.id, user_id)
             return
 
     await message.answer(
@@ -693,16 +795,11 @@ async def process_photo(message: types.Message, state: FSMContext):
         f"📝 ФИО: {data['full_name']}\n"
         f"🎂 Возраст: {data['age']} лет\n"
         f"📞 Телефон: {data['phone']}\n\n"
-        "Теперь выберите категории вакансий, которые вас интересуют.\n\n"
-        "Вы можете выбрать несколько:",
+        "Выберите категории вакансий ниже 👇",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=ReplyKeyboardRemove(),
     )
-    await message.answer(
-        "📋 *Выберите категории вакансий:*",
-        parse_mode="Markdown",
-        reply_markup=get_categories_keyboard()
-    )
+    await send_category_picker(message.chat.id, user_id)
     await state.clear()
 
 
@@ -710,84 +807,101 @@ async def process_photo(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
 async def select_category(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
     user_id = callback.from_user.id
     category_code = callback.data.replace("cat_", "")
-    current_codes = [c['code'] for c in get_user_categories(user_id)]
+    current_codes = [c["code"] for c in await run_db(get_user_categories, user_id)]
+    hint = ""
     if category_code in current_codes:
         current_codes.remove(category_code)
-        await safe_callback_answer(callback, "❌ Категория удалена")
+    elif not await run_db(is_user_premium, user_id) and len(current_codes) >= FREE_CATEGORY_LIMIT:
+        hint = (
+            f"⚠️ На Free — не больше *{FREE_CATEGORY_LIMIT}* категорий.\n"
+            "Нужно больше? Нажмите *💎 Premium* ниже."
+        )
     else:
-        if not is_user_premium(user_id) and len(current_codes) >= FREE_CATEGORY_LIMIT:
-            await safe_callback_answer(
-                callback,
-                f"🆓 Бесплатно — до {FREE_CATEGORY_LIMIT} категорий. Premium — без лимита (💎 Подписка).",
-                show_alert=True,
-            )
-            return
         current_codes.append(category_code)
-        await safe_callback_answer(callback, "✅ Категория добавлена")
-    set_user_categories(user_id, current_codes)
+    if hint:
+        await edit_category_picker(callback.message, current_codes, user_id, hint=hint)
+        return
+    await run_db(set_user_categories, user_id, current_codes)
+    await edit_category_picker(callback.message, current_codes, user_id)
 
-    updated_codes = [c['code'] for c in get_user_categories(user_id)]
-    all_cats = get_all_categories()
-    buttons = []
-    row = []
-    for i, cat in enumerate(all_cats):
-        prefix = "✅" if cat['code'] in updated_codes else "⬜"
-        row.append(InlineKeyboardButton(text=f"{prefix} {cat['emoji']} {cat['name']}", callback_data=f"cat_{cat['code']}"))
-        if len(row) == 2 or i == len(all_cats) - 1:
-            buttons.append(row)
-            row = []
-    buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
-    new_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.callback_query(lambda c: c.data == "back_to_categories")
+async def back_to_categories(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    user_id = callback.from_user.id
+    current_codes = [c["code"] for c in get_user_categories(user_id)]
+    await edit_category_picker(callback.message, current_codes, user_id)
+
+
+@dp.callback_query(lambda c: c.data == "subscription_from_categories")
+async def subscription_from_categories(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    user_id = callback.from_user.id
+    buttons = subscription_action_buttons(user_id)
+    nav = [[InlineKeyboardButton(text="◀️ К выбору категорий", callback_data="back_to_categories")]]
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=(buttons.inline_keyboard if buttons else []) + nav
+    )
     try:
         await callback.message.edit_text(
-            "📋 *Выберите категории вакансий:*\n\n"
-            "✅ — уже выбраны\n"
-            "⬜ — можно добавить\n\n"
-            "Когда закончите, нажмите «Завершить выбор»",
+            format_subscription_screen(user_id),
             parse_mode="Markdown",
-            reply_markup=new_markup
+            reply_markup=markup,
         )
-    except Exception as e:
-        if "message is not modified" not in str(e):
-            logger.error(f"Ошибка: {e}")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.warning(f"subscription_from_categories: {e}")
 
 
 @dp.callback_query(lambda c: c.data == "finish_categories")
 async def finish_categories(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    categories = get_user_categories(user_id)
-    if not categories:
-        await safe_callback_answer(callback, "⚠️ Вы не выбрали ни одной категории!", show_alert=True)
+    if user_id in _processing_finish:
+        await safe_callback_answer(callback, "⏳ Уже оформляем…")
         return
-    if not is_user_premium(user_id) and len(categories) > FREE_CATEGORY_LIMIT:
-        await safe_callback_answer(
-            callback,
-            f"🆓 На бесплатном тарифе — до {FREE_CATEGORY_LIMIT} категорий.",
-            show_alert=True,
-        )
-        return
-    await safe_callback_answer(callback)
-    categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
-    keyboard, status_text = get_main_keyboard(user_id)
-    trial_granted = grant_trial_if_eligible(user_id, TRIAL_DAYS)
-    trial_line = ""
-    if trial_granted:
-        trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро включены!"
+    _processing_finish.add(user_id)
     try:
-        await callback.message.delete()
-    except TelegramBadRequest:
-        pass
-    await callback.message.answer(
-        f"✅ *Вы подписались на вакансии!*\n\n"
-        f"📌 Ваши категории:\n{categories_text}\n\n"
-        f"{'💎 Новые вакансии приходят моментально в чат.' if is_user_premium(user_id) else '🔍 Free: смотрите новые вакансии кнопкой «Посмотреть новые» — push только в Premium.'}"
-        f"{trial_line}\n\n"
-        f"Используйте кнопки для управления:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+        categories = await run_db(get_user_categories, user_id)
+        if not categories:
+            await safe_callback_answer(callback, "⚠️ Выберите хотя бы одну категорию!", show_alert=True)
+            return
+        if not await run_db(is_user_premium, user_id) and len(categories) > FREE_CATEGORY_LIMIT:
+            await safe_callback_answer(
+                callback,
+                f"🆓 На Free — до {FREE_CATEGORY_LIMIT} категорий. Оформите Premium.",
+                show_alert=True,
+            )
+            return
+        await safe_callback_answer(callback)
+        categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
+        keyboard, _ = get_main_keyboard(user_id)
+        trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
+        trial_line = ""
+        if trial_granted:
+            trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро!"
+        title = "✅ *Вы подписались на вакансии!*" if trial_granted else "✅ *Категории сохранены!*"
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        await bot.send_message(
+            user_id,
+            f"{title}\n\n"
+            f"📌 Ваши категории:\n{categories_text}\n\n"
+            f"{'💎 Новые вакансии приходят моментально в чат.' if await run_db(is_user_premium, user_id) else '🔍 Free: новые вакансии — кнопка «Посмотреть новые».'}"
+            f"{trial_line}\n\n"
+            f"Используйте кнопки меню:",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+    finally:
+        _processing_finish.discard(user_id)
 
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
 
@@ -892,50 +1006,50 @@ async def subscription_menu(message: types.Message):
     user_id = message.from_user.id
     if user_id == YOUR_USER_ID:
         n = count_premium_subscribers()
+        pending = count_pending_premium_requests()
         await message.answer(
-            f"💎 Premium-подписчиков: *{n}*\n\n"
-            f"Выдать доступ: `/setplan USER_ID premium 30`\n"
-            f"Снять: `/setplan USER_ID free`",
+            f"💎 Premium-подписчиков: *{n}*\n"
+            f"💳 Ожидают подтверждения: *{pending}*\n\n"
+            f"Выдать: `/setplan USER_ID premium 30`\n"
+            f"Снять: `/setplan USER_ID free`\n\n"
+            f"Список запросов: кнопка «💎 Запросы Premium»",
             parse_mode="Markdown",
         )
         return
-    buttons = []
-    if SUBSCRIPTION_PAY_URL and not is_user_premium(user_id):
-        buttons.append([InlineKeyboardButton(text="💳 Оформить Premium", url=SUBSCRIPTION_PAY_URL)])
-    elif not is_user_premium(user_id):
-        buttons.append([InlineKeyboardButton(text="💳 Запросить Premium", callback_data="subscription_request")])
+    buttons = subscription_action_buttons(user_id)
     await message.answer(
         format_subscription_screen(user_id),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
+        reply_markup=buttons,
     )
 
 
 @dp.callback_query(lambda c: c.data == "subscription_request")
 async def subscription_request_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback, "Запрос отправлен")
     user_id = callback.from_user.id
     profile = get_subscriber_profile(user_id)
     name = profile.get("full_name") if profile else callback.from_user.first_name
-    await callback.answer("Запрос отправлен — мы свяжемся после проверки перевода.", show_alert=False)
+    phone = profile.get("phone") if profile else None
+    cats = ", ".join(c["name"] for c in get_user_categories(user_id)) or "—"
+    add_premium_request(
+        user_id,
+        callback.from_user.username,
+        name,
+        phone,
+        cats,
+    )
     await callback.message.answer(
-        f"✅ Запрос на Premium принят.\n\n"
-        f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* и пришлите скрин {SUBSCRIPTION_SUPPORT}.\n"
-        f"В комментарии к переводу укажите ID: `{user_id}`",
+        f"✅ *Запрос на Premium принят*\n\n"
+        f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
+        f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
+        f"В комментарии укажите ID: `{user_id}`\n\n"
+        f"После проверки оплаты включим Premium — можно будет выбрать больше категорий.",
         parse_mode="Markdown",
     )
-    if YOUR_USER_ID:
-        try:
-            await bot.send_message(
-                YOUR_USER_ID,
-                f"💳 *Запрос Premium*\n\n"
-                f"Пользователь: {name}\n"
-                f"ID: `{user_id}`\n"
-                f"Username: @{callback.from_user.username or '—'}\n\n"
-                f"Выдать: `/setplan {user_id} premium 30`",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.warning(f"subscription_request notify admin: {e}")
+    await notify_admin_premium_request(
+        user_id, callback.from_user.username, name, phone, cats
+    )
 
 
 @dp.message(lambda m: m.text == "📍 Мои районы")
@@ -1002,8 +1116,11 @@ async def setplan_cmd(message: types.Message):
         await message.answer(f"✅ Пользователь {target_id} переведён на free.")
         return
     days = int(parts[3]) if len(parts) > 3 else 30
-    set_user_plan(target_id, plan="premium", days=days)
-    await message.answer(f"✅ Premium для {target_id} на {days} дн.")
+    notified = await activate_premium_for_user(target_id, days)
+    await message.answer(
+        f"✅ Premium для {target_id} на {days} дн."
+        + ("" if notified else " (уведомление пользователю не доставлено)")
+    )
 
 @dp.message(lambda m: m.text == "📋 Мои категории")
 async def show_my_categories(message: types.Message):
@@ -1016,12 +1133,8 @@ async def show_my_categories(message: types.Message):
 
 @dp.message(lambda m: m.text == "✏️ Изменить категории")
 async def edit_categories(message: types.Message):
-    await message.answer(
-        "📋 *Выберите категории вакансий:*\n\n"
-        "Когда закончите, нажмите «Завершить выбор»",
-        parse_mode="Markdown",
-        reply_markup=get_categories_keyboard()
-    )
+    user_id = message.from_user.id
+    await send_category_picker(message.chat.id, user_id)
 
 @dp.message(lambda m: m.text == "📞 Мои контакты")
 async def show_my_contacts(message: types.Message):
@@ -1330,8 +1443,10 @@ async def already_responded(callback: types.CallbackQuery):
 async def admin_menu(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
+    await bot.send_chat_action(message.chat.id, "typing")
+    text = await run_db(build_admin_dashboard_text)
     await message.answer(
-        build_admin_dashboard_text(),
+        text,
         parse_mode="Markdown",
         reply_markup=get_admin_keyboard(),
     )
@@ -1526,14 +1641,18 @@ async def remove_chat_cmd(message: types.Message):
 async def list_chats_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    await message.answer("🔍 Проверяю доступ к чатам...")
-    chats, parser_status = await inspect_parser_chats()
-    report = format_parser_chats_report(chats, parser_status)
-    if len(report) > 4000:
-        await message.answer(report[:4000], parse_mode="Markdown")
-        await message.answer(report[4000:], parse_mode="Markdown")
-    else:
-        await message.answer(report, parse_mode="Markdown")
+    status_msg = await message.answer("🔍 Проверяю доступ к чатам… (до ~1 мин)")
+    try:
+        chats, parser_status = await inspect_parser_chats()
+        report = format_parser_chats_report(chats, parser_status)
+        if len(report) > 4000:
+            await status_msg.edit_text(report[:4000], parse_mode="Markdown")
+            await message.answer(report[4000:], parse_mode="Markdown")
+        else:
+            await status_msg.edit_text(report, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("list_chats_cmd")
+        await status_msg.edit_text(f"❌ Ошибка проверки чатов: {str(e)[:120]}")
 
 @dp.message(Command("postvacancy"))
 async def post_vacancy_cmd(message: types.Message, state: FSMContext):
@@ -1655,17 +1774,17 @@ async def admin_debug_button(message: types.Message):
 async def admin_subscribers_button(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    subs = get_all_subscribers()
+    await bot.send_chat_action(message.chat.id, "typing")
+    subs = await run_db(get_subscribers_display, 20)
     if not subs:
         await message.answer("📭 Нет подписчиков.")
         return
     text = "👥 *Список подписчиков:*\n\n"
-    for i, uid in enumerate(subs[:20], 1):
-        prof = get_subscriber_profile(uid)
-        name = prof.get('full_name') or prof.get('first_name') or f"ID:{uid}" if prof else f"ID:{uid}"
-        text += f"{i}. {name}\n"
-    if len(subs) > 20:
-        text += f"\n... и ещё {len(subs)-20}"
+    for i, row in enumerate(subs, 1):
+        text += f"{i}. {row['name']}\n"
+    total = await run_db(lambda: len(get_all_subscribers()))
+    if total > len(subs):
+        text += f"\n... всего активных: {total}"
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(lambda m: m.text == "📢 Рассылка")
@@ -1681,7 +1800,9 @@ async def admin_broadcast_button(message: types.Message, state: FSMContext):
 async def show_admin_user_cards(message: types.Message, page: int = 0, edit: bool = False):
     limit = 5
     offset = page * limit
-    cards = get_subscriber_cards(limit=limit, offset=offset)
+    if not edit:
+        await bot.send_chat_action(message.chat.id, "typing")
+    cards = await run_db(get_subscriber_cards, limit, offset)
     if not cards:
         text = "📭 Карточек больше нет."
         if edit:
@@ -1689,7 +1810,7 @@ async def show_admin_user_cards(message: types.Message, page: int = 0, edit: boo
         else:
             await message.answer(text)
         return
-    total_subs = len(get_all_subscribers())
+    total_subs = await run_db(lambda: len(get_all_subscribers()))
     pages_total = max(1, (total_subs + limit - 1) // limit)
     lines = [f"🗂️ *Карточки пользователей* (страница {page + 1}/{pages_total})"]
     for i, card in enumerate(cards, 1):
@@ -1710,6 +1831,27 @@ async def show_admin_user_cards(message: types.Message, page: int = 0, edit: boo
                 logger.warning(f"Не удалось обновить карточки: {e}")
     else:
         await message.answer(body, parse_mode="Markdown", reply_markup=markup)
+
+@dp.message(lambda m: m.text == "💎 Запросы Premium")
+async def admin_premium_requests_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    requests = get_pending_premium_requests(30)
+    if not requests:
+        await message.answer("📭 Нет ожидающих запросов Premium.")
+        return
+    lines = [f"💳 *Запросы Premium* ({len(requests)}):\n"]
+    for req in requests:
+        lines.append(
+            f"\n#{req['id']} · `{req['user_id']}`\n"
+            f"👤 {req['full_name'] or '—'}\n"
+            f"@{req['username'] or '—'} · 📞 {req['phone'] or '—'}\n"
+            f"📋 {req['category_codes'] or '—'}\n"
+            f"🕐 {req['created_at']}\n"
+            f"→ `/setplan {req['user_id']} premium 30`"
+        )
+    await send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+
 
 @dp.message(lambda m: m.text == "🗂️ Карточки пользователей")
 async def admin_user_cards_button(message: types.Message):
