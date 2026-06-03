@@ -24,44 +24,64 @@ API_HASH = os.getenv("API_HASH")
 SHARED_DIR = os.getenv("SHARED_DIR", "").strip()
 
 
-def _resolve_telegram_session_name() -> str:
-    """Путь к сессии Telethon (без .session). Выбирает первый существующий файл."""
+def _session_search_dirs() -> list[str]:
+    """Каталоги, где ищем *.session (Bothost: /app и /app/shared)."""
+    dirs = []
+    for path in (SHARED_DIR, "/app/shared", "/app", os.getcwd()):
+        if path and os.path.isdir(path) and path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
+def _pick_session_from_dir(directory: str) -> str | None:
+    try:
+        session_files = sorted(
+            f for f in os.listdir(directory)
+            if f.endswith(".session") and not f.endswith(".session-journal")
+        )
+    except OSError:
+        return None
+    if not session_files:
+        return None
+    if "user_session.session" in session_files:
+        return os.path.join(directory, "user_session")
+    fname = session_files[0]
+    return os.path.join(directory, fname[: -len(".session")])
+
+
+def get_telegram_session_name() -> str:
+    """Путь к сессии Telethon (без .session). Имя файла может быть любым — tmp*.session тоже."""
     explicit = os.getenv("TELEGRAM_SESSION_NAME", "").strip()
     if explicit:
         return explicit
 
-    candidates = []
-    if SHARED_DIR:
-        candidates.append(os.path.join(SHARED_DIR, "user_session"))
-    if os.path.isdir("/app/shared"):
-        candidates.append("/app/shared/user_session")
-    candidates.append("user_session")  # /app/user_session.session при cwd=/app
+    for directory in _session_search_dirs():
+        picked = _pick_session_from_dir(directory)
+        if picked:
+            return picked
 
-    for base in candidates:
-        if os.path.isfile(f"{base}.session"):
-            return base
-
-    # Bothost иногда сохраняет upload как tmpXXXX.session — берём единственный .session в shared
-    for shared_root in filter(None, [SHARED_DIR or None, "/app/shared" if os.path.isdir("/app/shared") else None]):
-        try:
-            session_files = sorted(
-                f for f in os.listdir(shared_root)
-                if f.endswith(".session") and not f.endswith(".session-journal")
-            )
-        except OSError:
-            continue
-        if len(session_files) == 1:
-            fname = session_files[0]
-            return os.path.join(shared_root, fname[: -len(".session")])
-
-    if SHARED_DIR:
-        return os.path.join(SHARED_DIR, "user_session")
-    if os.path.isdir("/app/shared"):
-        return "/app/shared/user_session"
     return "user_session"
 
 
-TELEGRAM_SESSION_NAME = _resolve_telegram_session_name()
+def describe_session_search() -> str:
+    """Диагностика для логов — куда смотрели и что нашли."""
+    lines = [f"cwd={os.getcwd()}"]
+    if SHARED_DIR:
+        lines.append(f"SHARED_DIR={SHARED_DIR}")
+    for directory in _session_search_dirs():
+        try:
+            sessions = sorted(
+                f for f in os.listdir(directory)
+                if f.endswith(".session") and not f.endswith(".session-journal")
+            )
+            lines.append(f"{directory}: {sessions or '(нет .session)'}")
+        except OSError as e:
+            lines.append(f"{directory}: ошибка ({e})")
+    return "; ".join(lines)
+
+
+# Обратная совместимость (не использовать для Telethon — только runtime get_telegram_session_name)
+TELEGRAM_SESSION_NAME = "user_session"
 
 # List of chats for monitoring
 TARGET_CHATS = [

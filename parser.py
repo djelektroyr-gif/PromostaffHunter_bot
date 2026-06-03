@@ -8,7 +8,8 @@ from telethon import errors
 import asyncio
 from datetime import datetime, timezone, timedelta
 from config import (
-    API_ID, API_HASH, TELEGRAM_SESSION_NAME, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES,
+    API_ID, API_HASH, get_telegram_session_name, describe_session_search,
+    HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES,
     HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS, VACANCY_MAX_AGE_HOURS,
 )
 from db import (
@@ -48,7 +49,7 @@ class SessionNotConfiguredError(Exception):
 
 
 def session_file_path() -> str:
-    return f"{TELEGRAM_SESSION_NAME}.session"
+    return f"{get_telegram_session_name()}.session"
 
 
 def is_session_file_present() -> bool:
@@ -57,16 +58,18 @@ def is_session_file_present() -> bool:
 
 async def create_authorized_client() -> TelegramClient:
     """Подключение без input() — только если .session уже авторизован."""
-    path = session_file_path()
-    if not is_session_file_present():
+    session_name = get_telegram_session_name()
+    path = f"{session_name}.session"
+    if not os.path.isfile(path):
         raise SessionNotConfiguredError(
-            f"Файл {path} не найден. Авторизуйте Telethon локально и загрузите на сервер "
-            f"(volume /app, не в git). Имя: TELEGRAM_SESSION_NAME={TELEGRAM_SESSION_NAME!r}."
+            f"Файл {path} не найден. {describe_session_search()}\n"
+            "Положите любой *.session в /app или /app/shared — переименовывать не нужно."
         )
     if not API_ID or not API_HASH:
         raise SessionNotConfiguredError("Задайте API_ID и API_HASH в переменных окружения.")
 
-    client = TelegramClient(TELEGRAM_SESSION_NAME, API_ID, API_HASH)
+    logger.info(f"Telethon session: {path}")
+    client = TelegramClient(session_name, API_ID, API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
