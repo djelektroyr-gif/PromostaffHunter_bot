@@ -7,6 +7,7 @@ from parser import (
     is_message_for_today,
     _extract_phone_digits,
     detect_duplicate_type,
+    detect_category,
 )
 
 
@@ -70,3 +71,41 @@ def test_fuzzy_duplicate_detects_same_phone_and_similar_text(monkeypatch):
         "new_key",
     )
     assert duplicate_type == "fuzzy"
+
+
+def test_detect_category_loader_not_parking_for_upakovshchik():
+    text = "Нужен упаковщик на склад, ставка 400 р/час"
+    assert detect_category(text) == "loader"
+
+
+def test_detect_category_parking_for_parkovshchik():
+    text = "Нужен парковщик на мероприятие, парковка VIP"
+    assert detect_category(text) == "parking"
+
+
+def test_detect_category_loader_for_gruzchik():
+    text = "Завтра к 7:00 нужны 3 грузчика в ТЦ Коламбус"
+    assert detect_category(text) == "loader"
+
+
+def test_detect_category_helper_for_helper_night():
+    text = "Хелперы в ночь, помогать на площадке, ставка 600 руб/час"
+    assert detect_category(text) == "helper"
+
+
+def test_format_parser_chats_report():
+    from parser import format_parser_chats_report
+
+    report = format_parser_chats_report([], "empty")
+    assert "Чаты парсинга" in report
+    assert "/addchat" in report
+
+
+def test_make_vacancy_id_same_for_parser_and_send():
+    from parser import make_vacancy_id
+
+    chat_id, message_id = "-100123456", "42"
+    dedupe_key = "phone:79161234567|hash:abc"
+    assert make_vacancy_id(chat_id, message_id, dedupe_key) == make_vacancy_id(chat_id, message_id, dedupe_key)
+    assert make_vacancy_id(chat_id, message_id, dedupe_key) != make_vacancy_id(chat_id, message_id, None)
+    assert len(make_vacancy_id(chat_id, message_id)) == 16

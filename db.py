@@ -1,13 +1,7 @@
 import sqlite3
 import time
-import os
 
-# Постоянный каталог для данных (можно переопределить через переменную окружения)
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-DB_NAME = os.path.join(DATA_DIR, "bot_database.db")
-
+DB_NAME = "bot_database.db"
 
 def _table_exists(table_name: str) -> bool:
     conn = sqlite3.connect(DB_NAME)
@@ -42,6 +36,10 @@ def init_db():
         cur.execute("ALTER TABLE subscribers ADD COLUMN photo_file_id TEXT DEFAULT NULL")
     if "questionnaire" not in cols:
         cur.execute("ALTER TABLE subscribers ADD COLUMN questionnaire TEXT DEFAULT NULL")
+    if "plan" not in cols:
+        cur.execute("ALTER TABLE subscribers ADD COLUMN plan TEXT DEFAULT 'free'")
+    if "paid_until" not in cols:
+        cur.execute("ALTER TABLE subscribers ADD COLUMN paid_until TIMESTAMP DEFAULT NULL")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
@@ -239,18 +237,6 @@ def update_subscriber_profile(user_id: int, full_name: str, age: int, phone: str
     conn.commit()
     conn.close()
 
-def save_subscriber_profile(user_id: int, full_name: str, birthdate: str, age: int, phone: str,
-                            username: str = None, first_name: str = None, photo_file_id: str = None):
-    conn = sqlite3.connect(DB_NAME, timeout=10.0)
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT OR REPLACE INTO subscribers
-        (user_id, full_name, age, phone, username, first_name, photo_file_id, registered_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (user_id, full_name, age, phone, username, first_name, photo_file_id))
-    conn.commit()
-    conn.close()
-
 def update_subscriber_photo(user_id: int, photo_file_id: str):
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
@@ -269,7 +255,8 @@ def get_subscriber_profile(user_id: int) -> dict:
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
     cur.execute("""
-        SELECT user_id, username, first_name, last_name, full_name, age, phone, photo_file_id, questionnaire, is_active
+        SELECT user_id, username, first_name, last_name, full_name, age, phone,
+               photo_file_id, questionnaire, is_active, plan, paid_until
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     row = cur.fetchone()
@@ -278,9 +265,59 @@ def get_subscriber_profile(user_id: int) -> dict:
         return {
             "user_id": row[0], "username": row[1], "first_name": row[2], "last_name": row[3],
             "full_name": row[4], "age": row[5], "phone": row[6], "photo_file_id": row[7],
-            "questionnaire": row[8], "is_active": row[9]
+            "questionnaire": row[8], "is_active": row[9], "plan": row[10] or "free",
+            "paid_until": row[11],
         }
     return None
+
+def is_user_premium(user_id: int) -> bool:
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1 FROM subscribers
+        WHERE user_id = ? AND plan = 'premium'
+          AND (paid_until IS NULL OR datetime(paid_until) > datetime('now'))
+        """,
+        (user_id,),
+    )
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+def set_user_plan(user_id: int, plan: str = "premium", days: int = 30):
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    if plan == "free":
+        cur.execute(
+            "UPDATE subscribers SET plan = 'free', paid_until = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE subscribers SET plan = 'premium',
+            paid_until = datetime('now', ?)
+            WHERE user_id = ?
+            """,
+            (f"+{days} days", user_id),
+        )
+    conn.commit()
+    conn.close()
+
+def count_premium_subscribers() -> int:
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM subscribers
+        WHERE is_active = 1 AND plan = 'premium'
+          AND (paid_until IS NULL OR datetime(paid_until) > datetime('now'))
+        """
+    )
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
 
 def is_profile_complete(user_id: int) -> bool:
     profile = get_subscriber_profile(user_id)
@@ -341,12 +378,78 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR IGNORE INTO vacancies 
-        (id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed, dedupe_key, published_at)
+        INSERT INTO vacancies
+        (id, source_chat, source_chat_title, category_code, message_text, message_link,
+         author_contact, address, is_closed, dedupe_key, published_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link, author_contact, address, is_closed, dedupe_key, published_at))
+        ON CONFLICT(id) DO UPDATE SET
+            source_chat_title = excluded.source_chat_title,
+            category_code = excluded.category_code,
+            message_text = excluded.message_text,
+            message_link = excluded.message_link,
+            author_contact = COALESCE(excluded.author_contact, author_contact),
+            address = COALESCE(excluded.address, address),
+            dedupe_key = COALESCE(excluded.dedupe_key, dedupe_key),
+            published_at = COALESCE(excluded.published_at, published_at)
+    """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
+          author_contact, address, is_closed, dedupe_key, published_at))
     conn.commit()
     conn.close()
+
+def get_vacancy_row(vacancy_id: str):
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT message_text, message_link, source_chat_title, author_contact, address FROM vacancies WHERE id = ?",
+        (vacancy_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def migrate_legacy_vacancy_ids() -> int:
+    """Переносит id вида {chat_id}_{message_id} на canonical md5 (16 символов)."""
+    from parser import make_vacancy_id
+
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute("SELECT id, source_chat, message_link, dedupe_key FROM vacancies WHERE length(id) > 16")
+    rows = cur.fetchall()
+    migrated = 0
+    ref_tables = ("sent_vacancies", "responses", "complaints")
+
+    for old_id, source_chat, message_link, dedupe_key in rows:
+        message_id = None
+        if message_link:
+            tail = message_link.rstrip("/").split("/")[-1]
+            if tail.isdigit():
+                message_id = tail
+        if not message_id and "_" in old_id:
+            message_id = old_id.rsplit("_", 1)[-1]
+        if not message_id or not source_chat:
+            continue
+        new_id = make_vacancy_id(source_chat, message_id, dedupe_key)
+        if new_id == old_id:
+            continue
+
+        cur.execute("SELECT 1 FROM vacancies WHERE id = ?", (new_id,))
+        if cur.fetchone():
+            for table in ref_tables:
+                cur.execute(
+                    f"UPDATE OR IGNORE {table} SET vacancy_id = ? WHERE vacancy_id = ?",
+                    (new_id, old_id),
+                )
+                cur.execute(f"DELETE FROM {table} WHERE vacancy_id = ?", (old_id,))
+            cur.execute("DELETE FROM vacancies WHERE id = ?", (old_id,))
+        else:
+            for table in ref_tables:
+                cur.execute(f"UPDATE {table} SET vacancy_id = ? WHERE vacancy_id = ?", (new_id, old_id))
+            cur.execute("UPDATE vacancies SET id = ? WHERE id = ?", (new_id, old_id))
+        migrated += 1
+
+    conn.commit()
+    conn.close()
+    return migrated
 
 def has_recent_duplicate_vacancy(dedupe_key: str, max_age_days: int = 1) -> bool:
     if not dedupe_key:
@@ -444,15 +547,30 @@ def get_users_who_received_vacancy(vacancy_id: str) -> list:
     return [row[0] for row in rows]
 
 def mark_vacancy_closed(message_id: str, chat_id: str):
+    """Помечает вакансию закрытой и возвращает (canonical_id, user_ids для уведомления)."""
     conn = sqlite3.connect(DB_NAME, timeout=10.0)
     cur = conn.cursor()
-    vacancy_id = f"{chat_id}_{message_id}"
+    legacy_id = f"{chat_id}_{message_id}"
+    cur.execute(
+        """
+        SELECT id FROM vacancies
+        WHERE id = ? OR (source_chat = ? AND message_link LIKE ?)
+        ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END
+        LIMIT 1
+        """,
+        (legacy_id, chat_id, f"%/{message_id}", legacy_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None, []
+    vacancy_id = row[0]
     cur.execute("SELECT user_id FROM sent_vacancies WHERE vacancy_id = ?", (vacancy_id,))
     users = [row[0] for row in cur.fetchall()]
-    cur.execute("UPDATE vacancies SET is_closed = 1 WHERE id = ?", (vacancy_id,))
+    cur.execute("UPDATE vacancies SET is_closed = 1 WHERE id = ? OR id = ?", (vacancy_id, legacy_id))
     conn.commit()
     conn.close()
-    return users
+    return vacancy_id, users
 
 # ========== ОТКЛИКИ ==========
 def add_response(user_id: int, vacancy_id: str, vacancy_text: str = None, vacancy_link: str = None, user_photo_file_id: str = None):
@@ -556,6 +674,19 @@ def get_target_chats() -> list:
     rows = cur.fetchall()
     conn.close()
     return [row[0] for row in rows]
+
+def list_target_chats() -> list:
+    """Все чаты парсинга (включая отключённые) для админки."""
+    if not _table_exists("target_chats"):
+        return []
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT chat_link, is_active, added_at FROM target_chats ORDER BY is_active DESC, added_at"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"chat_link": r[0], "is_active": bool(r[1]), "added_at": r[2]} for r in rows]
 
 def add_target_chat(chat_link: str) -> bool:
     if not _table_exists("target_chats"):
@@ -744,22 +875,3 @@ def update_last_processed_id(chat_id: str, message_id: int):
     """, (chat_id, message_id))
     conn.commit()
     conn.close()
-def get_unsent_count_by_category(user_id: int, category_code: str) -> int:
-    """Возвращает количество неотправленных вакансий для пользователя по категории"""
-    conn = sqlite3.connect(DB_NAME, timeout=10.0)
-    cur = conn.cursor()
-    # Получаем вакансии, которые не были отправлены этому пользователю
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM vacancies v
-        WHERE v.category_code = ?
-          AND v.is_sent = 0
-          AND v.is_closed = 0
-          AND NOT EXISTS (
-              SELECT 1 FROM sent_vacancies sv
-              WHERE sv.vacancy_id = v.id AND sv.user_id = ?
-          )
-    """, (category_code, user_id))
-    count = cur.fetchone()[0]
-    conn.close()
-    return count

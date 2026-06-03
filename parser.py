@@ -1,15 +1,11 @@
 import re
 import logging
 import hashlib
-import os
-import time
-os.environ['TZ'] = 'Europe/Moscow'
-time.tzset()
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon import errors
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from config import API_ID, API_HASH, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS
 from db import (
     get_target_chats, is_message_processed, mark_vacancy_closed,
@@ -18,22 +14,261 @@ from db import (
     get_recent_open_vacancies_for_dedupe
 )
 
-_client = None
-
-async def get_telethon_client() -> TelegramClient:
-    global _client
-    if _client is None:
-        _client = TelegramClient('user_session', API_ID, API_HASH)
-        await _client.start()
-    return _client
-
-async def close_telethon_client():
-    global _client
-    if _client:
-        await _client.disconnect()
-        _client = None
-
 logger = logging.getLogger(__name__)
+
+_realtime_client = None
+_monitored_chat_ids = set()
+_parser_lock = asyncio.Lock()
+PARSER_POLL_INTERVAL_SEC = 300
+PER_CHAT_SCAN_LIMIT = 120
+PARSER_LABEL = "Парсер групп (Telethon)"
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+def make_vacancy_id(chat_id: str, message_id: str, dedupe_key: str = None) -> str:
+    unique_str = dedupe_key or f"{chat_id}_{message_id}"
+    return hashlib.md5(unique_str.encode()).hexdigest()[:16]
+
+async def refresh_monitored_chat_ids(client) -> set:
+    """Резолвит ссылки из БД в numeric chat_id — без этого Telethon-парсер не видит группы."""
+    global _monitored_chat_ids
+    ids = set()
+    for link in get_target_chats():
+        try:
+            entity = await client.get_entity(link)
+            ids.add(str(entity.id))
+        except Exception as e:
+            logger.warning(f"Не удалось резолвить чат {link}: {e}")
+    _monitored_chat_ids = ids
+    logger.info(f"📡 Мониторинг {len(_monitored_chat_ids)} чатов по chat_id")
+    return ids
+
+def is_chat_monitored(chat_id) -> bool:
+    return str(chat_id) in _monitored_chat_ids
+
+async def _process_single_message(message, chat, chat_id: str, chat_title: str, stats: dict = None):
+    """Обрабатывает одно сообщение: фильтр, категория, дедуп. Возвращает order или None."""
+    if not message.text:
+        if stats is not None:
+            stats["no_text"] += 1
+        return None
+    message_id = str(message.id)
+    if is_message_processed(message_id, chat_id):
+        if stats is not None:
+            stats["already_sent"] += 1
+        return None
+    if not is_message_for_today(message.date):
+        if stats is not None:
+            stats["old_messages"] += 1
+        return None
+
+    if message.is_reply:
+        original_message = await message.get_reply_message()
+        if original_message and original_message.id:
+            close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
+            if any(marker in message.text.lower() for marker in close_markers):
+                original_id = str(original_message.id)
+                vacancy_id, users = mark_vacancy_closed(original_id, chat_id)
+                if stats is not None:
+                    stats["closed_vacancies"] += 1
+                return {"type": "closed", "vacancy_id": vacancy_id, "users": users}
+
+    is_relevant, reason, keywords = is_helper_message(message.text)
+    if stats is not None:
+        stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+    if not is_relevant:
+        if stats is not None:
+            stats["non_relevant"] += 1
+        return None
+
+    category = detect_category(message.text)
+    if stats is not None:
+        stats["categories"][category] = stats["categories"].get(category, 0) + 1
+    cleaned_text = clean_message_text(message.text)
+    message_link = get_message_link(chat.id, message.id)
+    author_contact = extract_contact_from_text(message.text)
+    address = extract_address_from_text(message.text)
+    dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
+
+    duplicate_type = detect_duplicate_type(message.text, author_contact, dedupe_key)
+    if duplicate_type:
+        if stats is not None:
+            if duplicate_type == "exact":
+                stats["duplicates_exact"] += 1
+            else:
+                stats["duplicates_fuzzy"] += 1
+        mark_message_processed(message_id, chat_id)
+        return None
+
+    vacancy_id = make_vacancy_id(chat_id, message_id, dedupe_key)
+    save_vacancy(
+        vacancy_id=vacancy_id,
+        source_chat=chat_id,
+        source_chat_title=chat_title,
+        category_code=category,
+        message_text=cleaned_text[:2000],
+        message_link=message_link,
+        author_contact=author_contact,
+        address=address,
+        is_closed=False,
+        dedupe_key=dedupe_key,
+        published_at=message.date.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+    mark_message_processed(message_id, chat_id)
+    update_last_processed_id(chat_id, message.id)
+    if stats is not None:
+        stats["matched"] += 1
+
+    return {
+        "vacancy_id": vacancy_id,
+        "chat_title": chat_title,
+        "message_text": cleaned_text,
+        "message_link": message_link,
+        "category": category,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "keywords": keywords[:5],
+        "reason": reason,
+        "author_contact": author_contact,
+        "address": address,
+        "dedupe_key": dedupe_key,
+        "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None):
+    all_results = []
+    closed_vacancies_users = []
+    target_chats = get_target_chats()
+    if not target_chats:
+        return [], []
+
+    await refresh_monitored_chat_ids(client)
+
+    for i, chat_link in enumerate(target_chats, 1):
+        entity = await safe_get_entity(client, chat_link)
+        if not entity:
+            if stats is not None:
+                stats["chats_failed"] += 1
+                stats["errors_by_chat"][chat_link] = stats["errors_by_chat"].get(chat_link, 0) + 1
+            continue
+
+        chat_title = getattr(entity, 'title', None) or 'Без названия'
+        chat_id = str(entity.id)
+        if stats is not None:
+            stats["chats_ok"] += 1
+
+        async for message in client.iter_messages(entity, limit=limit_per_chat):
+            if stats is not None:
+                stats["messages_scanned"] += 1
+            try:
+                result = await _process_single_message(message, entity, chat_id, chat_title, stats)
+                if result and result.get("type") == "closed":
+                    closed_vacancies_users.append((result["vacancy_id"], result["users"]))
+                elif result:
+                    all_results.append(result)
+                    await asyncio.sleep(0.05)
+            except Exception as e:
+                if stats is not None:
+                    stats["errors"] += 1
+                    stats["errors_by_chat"][chat_title] = stats["errors_by_chat"].get(chat_title, 0) + 1
+                logger.warning(f"⚠️ Пропущено сообщение chat={chat_title} id={getattr(message, 'id', '?')}: {e}")
+
+        await asyncio.sleep(0.3)
+
+    return all_results, closed_vacancies_users
+
+async def _periodic_scan_loop(bot_callback, closed_callback=None):
+    await asyncio.sleep(60)
+    while _realtime_client and _realtime_client.is_connected():
+        try:
+            async with _parser_lock:
+                logger.info("🔄 Плановая проверка новых вакансий...")
+                orders, closed_data = await _scan_all_chats(_realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT)
+            if closed_data and closed_callback:
+                await closed_callback(closed_data)
+            for order in orders:
+                await bot_callback(order)
+            if orders or closed_data:
+                logger.info(
+                    f"🔄 Плановая проверка: отправлено {len(orders)} вакансий, "
+                    f"закрыто {len(closed_data or [])}"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка плановой проверки: {e}", exc_info=True)
+        await asyncio.sleep(PARSER_POLL_INTERVAL_SEC)
+
+# ===================== ПАРСЕР ГРУПП (TELETHON) =====================
+
+async def start_realtime_listener(bot_callback, closed_callback=None):
+    global _realtime_client
+    _realtime_client = TelegramClient('user_session', API_ID, API_HASH)
+    await _realtime_client.start()
+    logger.info(f"✅ {PARSER_LABEL} подключён")
+
+    await refresh_monitored_chat_ids(_realtime_client)
+
+    async with _parser_lock:
+        logger.info("🔄 Стартовая синхронизация вакансий...")
+        startup_orders, startup_closed = await _scan_all_chats(_realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT)
+    if startup_closed and closed_callback:
+        await closed_callback(startup_closed)
+    for order in startup_orders:
+        await bot_callback(order)
+    logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
+
+    asyncio.create_task(_periodic_scan_loop(bot_callback, closed_callback))
+
+    @_realtime_client.on(events.NewMessage())
+    async def handler(event):
+        if not is_chat_monitored(event.chat_id):
+            return
+
+        logger.info(f"⚡ {PARSER_LABEL}: новое сообщение из чата {event.chat_id}")
+        message = event.message
+        chat = await event.get_chat()
+        chat_id = str(chat.id)
+        chat_title = chat.title or "Без названия"
+
+        try:
+            result = await _process_single_message(message, chat, chat_id, chat_title)
+            if result and result.get("type") == "closed":
+                if closed_callback and result.get("users"):
+                    await closed_callback([(result["vacancy_id"], result["users"])])
+            elif result:
+                await bot_callback(result)
+                logger.info(f"⚡ {PARSER_LABEL}: вакансия из {chat_title}")
+        except Exception as e:
+            logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
+
+    await _realtime_client.run_until_disconnected()
+
+async def stop_realtime_listener():
+    global _realtime_client
+    if _realtime_client and _realtime_client.is_connected():
+        await _realtime_client.disconnect()
+        logger.info(f"🛑 {PARSER_LABEL} остановлен")
+
+def get_parser_status_snapshot() -> dict:
+    """Быстрый снимок для админ-статистики без повторного resolve всех чатов."""
+    active = len(get_target_chats())
+    online = bool(_realtime_client and _realtime_client.is_connected())
+    monitored = len(_monitored_chat_ids) if online else 0
+    return {
+        "online": online,
+        "active_chats": active,
+        "monitored": monitored,
+    }
+
+def format_parser_status_line(snapshot: dict) -> str:
+    if snapshot["online"]:
+        line = f"✅ {PARSER_LABEL}: подключён"
+    else:
+        line = f"⏳ {PARSER_LABEL}: не подключён"
+    line += f"\n   Чатов в БД: {snapshot['active_chats']}"
+    if snapshot["online"]:
+        line += f" | в мониторинге: {snapshot['monitored']}"
+        if snapshot["monitored"] < snapshot["active_chats"]:
+            line += "\n   ⚠️ Не все чаты резолвятся — см. «Список чатов парсинга»"
+    return line
 
 # ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
 
@@ -98,7 +333,6 @@ def get_last_debug_report() -> str:
     return "\n".join(lines)
 
 def extract_contact_from_text(text: str) -> str:
-    # ... (без изменений, код тот же, что был)
     if not text:
         return None
     resolve_match = re.search(r'tg://resolve\?domain=([a-zA-Z0-9_]{5,32})', text, re.IGNORECASE)
@@ -119,7 +353,6 @@ def extract_contact_from_text(text: str) -> str:
     return None
 
 def extract_address_from_text(text: str) -> str:
-    # ... (без изменений)
     if not text:
         return None
     direct_match = re.search(r'(?:адрес|локация|место)\s*[:\-]\s*([^\n]{6,120})', text, re.IGNORECASE)
@@ -194,49 +427,136 @@ def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> st
 def is_message_for_today(message_dt: datetime) -> bool:
     if not message_dt:
         return False
-    now = datetime.now(message_dt.tzinfo)
-    return message_dt.date() == now.date()
+    if message_dt.tzinfo is None:
+        message_dt = message_dt.replace(tzinfo=timezone.utc)
+    msg_msk = message_dt.astimezone(MOSCOW_TZ)
+    now_msk = datetime.now(MOSCOW_TZ)
+    return msg_msk.date() == now_msk.date()
+
+async def inspect_parser_chats() -> tuple:
+    """Проверка доступа Telethon к чатам из БД. Возвращает (список, статус парсера)."""
+    from db import list_target_chats
+
+    chats_db = list_target_chats()
+    if not chats_db:
+        return [], "empty"
+
+    if not (_realtime_client and _realtime_client.is_connected()):
+        offline = []
+        for row in chats_db:
+            offline.append({
+                **row,
+                "status": "parser_offline",
+                "title": None,
+                "chat_id": None,
+                "monitored": False,
+            })
+        return offline, "offline"
+
+    await refresh_monitored_chat_ids(_realtime_client)
+    results = []
+    for row in chats_db:
+        link = row["chat_link"]
+        if not row["is_active"]:
+            results.append({**row, "status": "disabled", "title": None, "chat_id": None, "monitored": False})
+            continue
+        entity = await safe_get_entity(_realtime_client, link)
+        if entity:
+            chat_id = str(entity.id)
+            title = getattr(entity, "title", None) or getattr(entity, "username", None) or link
+            results.append({
+                **row,
+                "status": "ok",
+                "title": title,
+                "chat_id": chat_id,
+                "monitored": chat_id in _monitored_chat_ids,
+            })
+        else:
+            results.append({**row, "status": "no_access", "title": None, "chat_id": None, "monitored": False})
+    return results, "online"
+
+def format_parser_chats_report(chats: list, parser_status: str) -> str:
+    status_labels = {
+        "online": "✅ подключён",
+        "offline": "⏳ ещё не подключён (перезапустите или подождите)",
+        "empty": "📭 чатов нет",
+    }
+    lines = [
+        f"💬 *Чаты парсинга* ({PARSER_LABEL})",
+        f"Статус: {status_labels.get(parser_status, parser_status)}",
+        "",
+    ]
+    if not chats:
+        lines.append("Добавьте чат: `/addchat @channel`")
+        return "\n".join(lines)
+
+    ok = sum(1 for c in chats if c.get("status") == "ok")
+    bad = sum(1 for c in chats if c.get("status") in ("no_access", "parser_offline"))
+    lines.append(f"Всего: {len(chats)} | ✅ доступ: {ok} | ⚠️ проблемы: {bad}")
+    lines.append("")
+
+    icons = {"ok": "✅", "no_access": "❌", "parser_offline": "⏳", "disabled": "🚫"}
+    for i, chat in enumerate(chats, 1):
+        icon = icons.get(chat.get("status"), "❓")
+        title = chat.get("title") or "—"
+        link = chat["chat_link"]
+        cid = chat.get("chat_id") or "—"
+        monitored = "📡" if chat.get("monitored") else "—"
+        if chat.get("status") == "disabled":
+            lines.append(f"{i}. {icon} `{link}` (отключён)")
+        else:
+            lines.append(f"{i}. {icon} *{title}* {monitored}")
+            lines.append(f"   `{link}` → id `{cid}`")
+    lines.append("")
+    lines.append("Добавить: `/addchat @channel` · Удалить: `/removechat`")
+    return "\n".join(lines)
+
+def _keyword_in_text(keyword: str, text_lower: str) -> bool:
+    """Проверка ключевого слова с границами — чтобы «паковщик» не ловил «упаковщик»."""
+    kw = keyword.lower()
+    if len(kw) <= 5 or kw in ("промо", "склад", "сервис", "промо"):
+        pattern = rf'(?<![a-zа-яё0-9]){re.escape(kw)}(?![a-zа-яё0-9])'
+        return bool(re.search(pattern, text_lower, re.IGNORECASE))
+    return kw in text_lower
 
 def detect_category(text: str) -> str:
-    # ... (без изменений, код длинный, оставляем как есть)
     if not text:
         return "helper"
     text_lower = text.lower()
     category_map = {
-        "promoter": ["промоутер", "промо", "раздача листовок", "промоутеры", "промоутерша",
-                     "привлекать внимание", "приглашать клиентов", "распространение листовок",
-                     "промо-акция", "промоакция", "листовки", "промоутером"],
-        "hostess": ["хостес", "встреча гостей", "приветствие", "встреча guests",
-                    "встречать гостей", "администратор ресепшн"],
-        "wardrobe": ["гардеробщик", "гардероб", "гардеробщица", "раздевалка",
-                     "прием верхней одежды", "выдача номерков"],
-        "animator": ["аниматор", "анимация", "детский праздник", "аниматоры", "аниматорша",
-                     "проведение праздников", "клоун", "ростовые куклы", "активный"],
-        "helper": ["хелпер", "хэлпер", "помощник на мероприятие", "хелперы", "хэлперы",
-                   "helper", "helpers", "помощник организатора", "волонтер", "ассистент"],
-        "loader": ["грузчик", "погрузка", "разгрузка", "грузчики", "такелаж",
-                   "выгрузить", "загрузить", "разгрузить", "таскать", "переносить",
-                   "физическая работа", "тяжелая работа", "подъем", "спуск",
-                   "такелажник", "разнорабочий", "подсобный рабочий", "склад"],
-        "waiter": ["официант", "официантка", "сервис", "официанты", "бармен",
-                   "обслуживание гостей", "ресторан", "кафе", "банкет"],
-        "driver": ["водитель", "доставка", "водители", "курьер", "экспедитор",
-                   "на автомобиле", "категория", "водительские права"],
-        "security": ["охранник", "безопасность", "контролёр", "охрана", "секьюрити",
-                     "контроль доступа", "пропускной режим"],
-        "parking": ["парковщик", "парковка", "паркинг", "автомобиль",
-                    "парковочный", "паковщик"],
-        "supervisor": ["супервайзер", "координатор", "менеджер", "супервизор", "тимлид",
-                       "руководитель", "старший смены"]
+        "loader": [
+            "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
+            "погрузка", "разгрузка", "такелаж", "такелажник", "выгрузить", "загрузить", "разгрузить",
+            "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка",
+        ],
+        "promoter": [
+            "промоутер", "промоутеры", "промоутерша", "промоутером",
+            "раздача листовок", "промо-акция", "промоакция", "листовки",
+            "привлекать внимание", "приглашать клиентов", "распространение листовок",
+        ],
+        "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
+        "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
+        "animator": ["аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун", "ростовые куклы"],
+        "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
+        "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
+        "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
+        "parking": ["парковщик", "парковка", "паркинг", "парковочный"],
+        "supervisor": ["супервайзер", "супервизор", "координатор", "тимлид", "старший смены"],
+        "helper": [
+            "хелпер", "хэлпер", "хелперы", "хэлперы", "helper", "helpers",
+            "помощник на мероприятие", "помощник организатора", "волонтер", "ассистент",
+        ],
     }
+    best_category = "helper"
+    best_len = 0
     for category, keywords in category_map.items():
         for kw in keywords:
-            if kw in text_lower:
-                return category
-    return "helper"
+            if _keyword_in_text(kw, text_lower) and len(kw) > best_len:
+                best_len = len(kw)
+                best_category = category
+    return best_category
 
 def is_helper_message(text: str):
-    # ... (без изменений)
     if not text:
         return False, "empty", []
     text_lower = text.lower()
@@ -298,156 +618,38 @@ async def safe_get_entity(client, chat_link: str):
         logger.warning(f"⚠️ Ошибка доступа к {chat_link}: {type(e).__name__}")
         return None
 
-# ========== ОСНОВНАЯ ФУНКЦИЯ ПАРСИНГА (ПРИНИМАЕТ КЛИЕНТ) ==========
-async def get_new_messages(client: TelegramClient, limit_per_chat: int = 500):
+async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
     global LAST_DEBUG_STATS
     LAST_DEBUG_STATS = _new_stats()
-    all_results = []                     # <-- добавлено
-    closed_vacancies_users = []
-    target_chats = get_target_chats()
-    if not target_chats:
-        logger.warning("Нет чатов для парсинга. Добавьте чаты через /addchat")
-        return [], []
-
     try:
-        # Клиент уже запущен, не вызываем client.start()
-        logger.info("✅ Telethon client ready")
-        logger.info(f"🎯 ИЩЕМ ТОЛЬКО: {', '.join(HELPER_KEYWORDS[:10])}...")
-        logger.info(f"🚫 ИСКЛЮЧАЕМ: {', '.join(EXCLUDE_CATEGORIES[:10])}...")
-        logger.info(f"📋 Всего каналов для проверки: {len(target_chats)}")
-        logger.info("⏳ Пропускаем сообщения не за сегодня")
+        async with _parser_lock:
+            if _realtime_client and _realtime_client.is_connected():
+                logger.info("🔍 Ручная проверка через shared Telethon client")
+                return await _scan_all_chats(_realtime_client, limit_per_chat=limit_per_chat, stats=LAST_DEBUG_STATS)
 
-        for i, chat_link in enumerate(target_chats, 1):
-            logger.info(f"🔍 [{i}/{len(target_chats)}] Проверяю: {chat_link}")
-            entity = await safe_get_entity(client, chat_link)
-            if not entity:
-                LAST_DEBUG_STATS["chats_failed"] += 1
-                LAST_DEBUG_STATS["errors_by_chat"][chat_link] = LAST_DEBUG_STATS["errors_by_chat"].get(chat_link, 0) + 1
-                continue
-
-            chat_title = getattr(entity, 'title', None) or 'Без названия'
-            chat_id = str(entity.id)
-            LAST_DEBUG_STATS["chats_ok"] += 1
-            logger.info(f"✅ Успешно подключился к: {chat_title}")
-
-            message_count = 0
-            async for message in client.iter_messages(entity, limit=limit_per_chat):
-                try:
-                    LAST_DEBUG_STATS["messages_scanned"] += 1
-                    message_count += 1
-                    if not message.text:
-                        LAST_DEBUG_STATS["no_text"] += 1
-                        continue
-                    message_id = str(message.id)
-
-                    if is_message_processed(message_id, chat_id):
-                        LAST_DEBUG_STATS["already_sent"] += 1
-                        continue
-
-                    if not is_message_for_today(message.date):
-                        LAST_DEBUG_STATS["old_messages"] += 1
-                        continue
-
-                    if message.is_reply:
-                        original_message = await message.get_reply_message()
-                        if original_message and original_message.id:
-                            original_id = str(original_message.id)
-                            close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
-                            if any(marker in message.text.lower() for marker in close_markers):
-                                users = mark_vacancy_closed(original_id, chat_id)
-                                if users:
-                                    closed_vacancies_users.append((f"{chat_id}_{original_id}", users))
-                                LAST_DEBUG_STATS["closed_vacancies"] += 1
-                                logger.info(f"🔒 Вакансия {original_id} в {chat_title} помечена как закрытая, уведомлены {len(users)}")
-                                continue
-
-                    is_relevant, reason, keywords = is_helper_message(message.text)
-                    LAST_DEBUG_STATS["reasons"][reason] = LAST_DEBUG_STATS["reasons"].get(reason, 0) + 1
-                    if not is_relevant:
-                        LAST_DEBUG_STATS["non_relevant"] += 1
-                        continue
-
-                    category = detect_category(message.text)
-                    LAST_DEBUG_STATS["categories"][category] = LAST_DEBUG_STATS["categories"].get(category, 0) + 1
-                    cleaned_text = clean_message_text(message.text)
-                    message_link = get_message_link(entity.id, message.id)
-                    vacancy_id = f"{chat_id}_{message_id}"
-                    author_contact = extract_contact_from_text(message.text)
-                    address = extract_address_from_text(message.text)
-                    dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
-
-                    duplicate_type = detect_duplicate_type(message.text, author_contact, dedupe_key)
-                    if duplicate_type:
-                        if duplicate_type == "exact":
-                            LAST_DEBUG_STATS["duplicates_exact"] += 1
-                        else:
-                            LAST_DEBUG_STATS["duplicates_fuzzy"] += 1
-                        mark_message_processed(message_id, chat_id)
-                        continue
-
-                    save_vacancy(
-                        vacancy_id=vacancy_id,
-                        source_chat=chat_id,
-                        source_chat_title=chat_title,
-                        category_code=category,
-                        message_text=cleaned_text[:2000],
-                        message_link=message_link,
-                        author_contact=author_contact,
-                        address=address,
-                        is_closed=False,
-                        dedupe_key=dedupe_key,
-                        published_at=message.date.strftime("%Y-%m-%d %H:%M:%S")
-                    )
-
-                    result = {
-                        "chat_title": chat_title,
-                        "message_text": cleaned_text,
-                        "message_link": message_link,
-                        "category": category,
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "keywords": keywords[:5],
-                        "reason": reason,
-                        "author_contact": author_contact,
-                        "address": address,
-                        "dedupe_key": dedupe_key,
-                        "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                    all_results.append(result)
-                    LAST_DEBUG_STATS["matched"] += 1
-                    mark_message_processed(message_id, chat_id)
-                    logger.info(f"✅ {chat_title} [{category}]: {cleaned_text[:60]}... (причина: {reason})")
-                    await asyncio.sleep(0.2)
-
-                except Exception as e:
-                    LAST_DEBUG_STATS["errors"] += 1
-                    LAST_DEBUG_STATS["errors_by_chat"][chat_title] = LAST_DEBUG_STATS["errors_by_chat"].get(chat_title, 0) + 1
-                    logger.warning(f"⚠️ Пропущено сообщение chat={chat_title} id={getattr(message, 'id', '?')}: {e}")
-                    continue
-
-            logger.info(f"📊 В канале {chat_title} просмотрено {message_count} сообщений")
-            await asyncio.sleep(1)
-
-        logger.info(f"🏁 Парсинг завершён! Найдено вакансий: {len(all_results)}")
-        logger.info(f"📊 Статистика: успешно обработано {LAST_DEBUG_STATS['chats_ok']} из {LAST_DEBUG_STATS['chats_total']} каналов")
-        if LAST_DEBUG_STATS["categories"]:
-            logger.info(f"📊 Распределение по категориям: {LAST_DEBUG_STATS['categories']}")
-
+            logger.warning(
+                "⚠️ Парсер ещё не подключён — временный Telethon-клиент (может конфликтовать с user_session)"
+            )
+            client = TelegramClient('user_session', API_ID, API_HASH)
+            try:
+                await client.start()
+                logger.info("🔍 Ручная проверка (отдельный Telethon client)")
+                return await _scan_all_chats(client, limit_per_chat=limit_per_chat, stats=LAST_DEBUG_STATS)
+            finally:
+                if client.is_connected():
+                    await client.disconnect()
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
+        return [], []
     finally:
         LAST_DEBUG_STATS["finished_at"] = _iso_now()
-        # НЕ закрываем клиент здесь – он переиспользуется
 
-    return all_results, closed_vacancies_users
-
-async def run_parser(client: TelegramClient):
-    orders, closed_data = await get_new_messages(client)
+async def run_parser():
+    orders, closed_data = await get_new_messages()
     return orders, closed_data
 
 async def test_filter(chat_link: str, limit: int = 30):
-    # Для теста создаём отдельного клиента, чтобы не мешать основному
-    client = TelegramClient('test_session', API_ID, API_HASH)
+    client = TelegramClient('user_session', API_ID, API_HASH)
     try:
         await client.start()
         logger.info(f"\n{'='*60}")

@@ -5,6 +5,9 @@ load_dotenv()
 # Bot Settings
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUR_USER_ID = int(os.getenv("YOUR_USER_ID", "0"))
+# Ссылка на оплату подписки (Telegram Stars invoice URL, ЮKassa, T-Bank — по желанию)
+SUBSCRIPTION_PAY_URL = os.getenv("SUBSCRIPTION_PAY_URL", "").strip()
+SUBSCRIPTION_SUPPORT = os.getenv("SUBSCRIPTION_SUPPORT", "@promostaff_support").strip()
 
 # Telethon Settings
 API_ID = int(os.getenv("API_ID", "0"))
