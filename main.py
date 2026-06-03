@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -36,6 +36,8 @@ dp = Dispatcher(storage=storage)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 FREE_CATEGORY_LIMIT = 3
+RESPONSES_PAGE_SIZE = 5
+PREMIUM_RENEWAL_WARN_DAYS = 7
 _processing_finish: set[int] = set()
 
 
@@ -100,23 +102,45 @@ async def send_category_picker(chat_id: int, user_id: int, selected_codes: list 
     )
 
 
-def subscription_action_buttons(user_id: int) -> InlineKeyboardMarkup:
+def subscription_action_buttons(user_id: int) -> InlineKeyboardMarkup | None:
     buttons = []
-    if SUBSCRIPTION_PAY_URL and not is_user_premium(user_id):
-        buttons.append([InlineKeyboardButton(text="💳 Оплатить Premium", url=SUBSCRIPTION_PAY_URL)])
-    if not is_user_premium(user_id):
-        buttons.append([InlineKeyboardButton(text="📩 Запросить Premium (перевод)", callback_data="subscription_request")])
+    premium = is_user_premium(user_id)
+    if SUBSCRIPTION_PAY_URL:
+        label = "💳 Продлить Premium" if premium else "💳 Оплатить Premium"
+        buttons.append([InlineKeyboardButton(text=label, url=SUBSCRIPTION_PAY_URL)])
+    if premium:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📩 Запросить продление (перевод)",
+                callback_data="subscription_renew",
+            )
+        ])
+    else:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📩 Запросить Premium (перевод)",
+                callback_data="subscription_request",
+            )
+        ])
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
-async def notify_admin_premium_request(user_id: int, username: str, name: str, phone: str, categories: str):
+async def notify_admin_premium_request(
+    user_id: int,
+    username: str,
+    name: str,
+    phone: str,
+    categories: str,
+    is_renewal: bool = False,
+):
     if not YOUR_USER_ID:
         return
     pending = count_pending_premium_requests()
+    title = "💳 *Запрос продления Premium*" if is_renewal else "💳 *Запрос Premium*"
     try:
         await bot.send_message(
             YOUR_USER_ID,
-            f"💳 *Запрос Premium* (#{pending})\n\n"
+            f"{title} (#{pending})\n\n"
             f"👤 {name}\n"
             f"ID: `{user_id}`\n"
             f"Username: @{username or '—'}\n"
@@ -131,16 +155,19 @@ async def notify_admin_premium_request(user_id: int, username: str, name: str, p
 
 
 async def activate_premium_for_user(target_id: int, days: int) -> bool:
-    set_user_plan(target_id, plan="premium", days=days)
+    set_user_plan(target_id, plan="premium", days=days, extend=True)
     resolve_premium_requests(target_id)
+    profile = get_subscriber_profile(target_id)
+    paid_until = format_db_date_short(profile.get("paid_until")) if profile else ""
+    until_line = f"\nДействует до: *{paid_until}*" if paid_until else ""
     try:
         await bot.send_message(
             target_id,
-            f"💎 *Premium активирован* на {days} дн.\n\n"
+            f"💎 *Premium активирован* на {days} дн.{until_line}\n\n"
             "• моментальные push-уведомления\n"
             "• все категории без лимита\n"
             "• фильтр по метро (📍 Мои районы)\n\n"
-            "Можете добавить категории в ✏️ Изменить категории.",
+            "Категории — кнопка «📋 Категории».",
             parse_mode="Markdown",
         )
         return True
@@ -261,9 +288,15 @@ def format_subscription_screen(user_id: int) -> str:
     profile = get_subscriber_profile(user_id)
     paid_until = profile.get("paid_until") if profile else None
     trial_used = profile.get("trial_used") if profile else False
+    pay_heading = "*Продление:*" if premium else "*Оплата (вручную):*"
     if premium:
-        until_line = f"Действует до: *{paid_until[:10]}*" if paid_until else "Без ограничения по сроку"
+        until_line = f"Действует до: *{format_db_date_short(paid_until)}*" if paid_until else "Без ограничения по сроку"
         status = f"💎 *Premium активен*\n{until_line}"
+        until_dt = _coerce_db_datetime(paid_until)
+        if until_dt:
+            days_left = (until_dt - datetime.now(timezone.utc)).days
+            if days_left <= PREMIUM_RENEWAL_WARN_DAYS:
+                status += f"\n⏳ Осталось *{max(days_left, 0)}* дн. — продлите кнопками ниже."
     else:
         status = (
             "🆓 *Бесплатный доступ*\n"
@@ -277,7 +310,10 @@ def format_subscription_screen(user_id: int) -> str:
     if SUBSCRIPTION_PAY_URL:
         pay_lines.append(f"Или оплатите по ссылке: {SUBSCRIPTION_PAY_URL}")
     else:
-        pay_lines.append(f"После перевода напишите {SUBSCRIPTION_SUPPORT} или нажмите «Запросить Premium» ниже.")
+        action = "продления" if premium else "Premium"
+        pay_lines.append(
+            f"После перевода напишите {SUBSCRIPTION_SUPPORT} или нажмите «Запросить {action}» ниже."
+        )
     pay_block = "\n".join(pay_lines)
     trial_hint = ""
     if not trial_used and TRIAL_DAYS > 0 and not premium:
@@ -290,7 +326,7 @@ def format_subscription_screen(user_id: int) -> str:
         f"• все категории без лимита\n"
         f"• фильтр по метро/району (📍 Мои районы)\n\n"
         f"*Free:* до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
-        f"*Оплата (вручную):*\n{pay_block}{trial_hint}"
+        f"{pay_heading}\n{pay_block}{trial_hint}"
     )
 
 
@@ -316,6 +352,7 @@ def get_postvacancy_categories_keyboard():
 
 # Пагинация
 user_pages = {}
+user_response_pages = {}
 
 # Состояния FSM
 class RegistrationState(StatesGroup):
@@ -385,7 +422,7 @@ def format_user_card(card: dict, idx: int = None) -> str:
     cats = ", ".join(card.get("categories") or []) or "не выбраны"
     status = "активен" if card.get("is_active") else "неактивен"
     if card.get("is_premium"):
-        until = str(card.get("paid_until") or "")[:10]
+        until = format_db_date_short(card.get("paid_until"))
         plan_line = f"💎 Premium до {until}" if until else "💎 Premium"
     elif (card.get("plan") or "free") == "premium":
         plan_line = "💎 Premium (истёк)"
@@ -401,20 +438,54 @@ def format_user_card(card: dict, idx: int = None) -> str:
         f"Категории: {escape_markdown(cats)}"
     )
 
-def format_publication_time(raw_dt: str) -> str:
-    if not raw_dt:
-        return "сейчас"
-    try:
-        dt = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S")
-        return dt.strftime("%d.%m.%Y %H:%M")
-    except Exception:
-        return raw_dt
+def _coerce_db_datetime(raw_dt):
+    """SQLite отдаёт str, PostgreSQL — datetime; приводим к aware UTC."""
+    if raw_dt is None:
+        return None
+    if isinstance(raw_dt, datetime):
+        if raw_dt.tzinfo is None:
+            return raw_dt.replace(tzinfo=timezone.utc)
+        return raw_dt.astimezone(timezone.utc)
+    if isinstance(raw_dt, date):
+        return datetime.combine(raw_dt, datetime.min.time()).replace(tzinfo=timezone.utc)
+    if isinstance(raw_dt, str):
+        s = raw_dt.strip()
+        if not s:
+            return None
+        for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+            try:
+                return datetime.strptime(s[:size], fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
 
-def get_freshness_label(raw_dt: str) -> str:
-    if not raw_dt:
+
+def format_db_date_short(raw_dt) -> str:
+    dt = _coerce_db_datetime(raw_dt)
+    if dt is None:
+        return str(raw_dt)[:10] if raw_dt else ""
+    return dt.strftime("%Y-%m-%d")
+
+
+def format_db_datetime_short(raw_dt) -> str:
+    dt = _coerce_db_datetime(raw_dt)
+    if dt is None:
+        return str(raw_dt)[:16] if raw_dt else "—"
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def format_publication_time(raw_dt) -> str:
+    dt = _coerce_db_datetime(raw_dt)
+    if dt is None:
+        return "сейчас"
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def get_freshness_label(raw_dt) -> str:
+    published = _coerce_db_datetime(raw_dt)
+    if published is None:
         return "🟢 Актуальна"
     try:
-        published = datetime.strptime(raw_dt[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         delta_minutes = (datetime.now(timezone.utc) - published).total_seconds() / 60
         if delta_minutes <= 30:
             return "🟢 Актуальна: только что"
@@ -583,7 +654,7 @@ def get_main_keyboard(user_id: int):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Посмотреть новые вакансии")],
-            [KeyboardButton(text="📋 Мои категории"), KeyboardButton(text="✏️ Изменить категории")],
+            [KeyboardButton(text="📨 Мои отклики"), KeyboardButton(text="📋 Категории")],
             [KeyboardButton(text="📍 Мои районы"), KeyboardButton(text="💎 Подписка")],
             [KeyboardButton(text="📞 Мои контакты")],
             [KeyboardButton(text="❌ Отписаться"), KeyboardButton(text="❓ Поддержка")],
@@ -903,6 +974,96 @@ async def finish_categories(callback: types.CallbackQuery):
     finally:
         _processing_finish.discard(user_id)
 
+
+# ========== МОИ ОТКЛИКИ ==========
+
+def _response_status_label(is_closed: bool) -> str:
+    return "🔒 закрыта" if is_closed else "🟢 активна"
+
+
+async def send_responses_page(message: types.Message, user_id: int, page: int = 0):
+    total = count_user_responses(user_id)
+    if total == 0:
+        await message.answer(
+            "📨 *Мои отклики*\n\n"
+            "Пока нет откликов. Нажмите «✋ Откликнуться» под вакансией в ленте.",
+            parse_mode="Markdown",
+        )
+        return
+
+    start = page * RESPONSES_PAGE_SIZE
+    responses = get_user_responses(user_id, limit=RESPONSES_PAGE_SIZE, offset=start)
+    pages_total = (total - 1) // RESPONSES_PAGE_SIZE + 1
+    user_response_pages[user_id] = {"page": page, "total": total}
+
+    await message.answer(
+        f"📨 *Мои отклики* — страница {page + 1}/{pages_total} (всего {total})",
+        parse_mode="Markdown",
+    )
+
+    profile = get_subscriber_profile(user_id)
+    draft_text = build_candidate_profile_text(profile) if profile else ""
+
+    for i, resp in enumerate(responses, start=start + 1):
+        preview = (resp.get("vacancy_text") or "—").strip()
+        if len(preview) > 160:
+            preview = preview[:160] + "…"
+        source = resp.get("source_chat_title") or "—"
+        text = (
+            f"*{i}.* {format_db_datetime_short(resp.get('responded_at'))} · "
+            f"{_response_status_label(resp.get('is_closed'))}\n"
+            f"📢 {escape_markdown(source)}\n\n"
+            f"{escape_markdown(preview)}"
+        )
+        buttons = []
+        if resp.get("vacancy_link"):
+            buttons.append([InlineKeyboardButton(text="🔗 Вакансия", url=resp["vacancy_link"])])
+        contact = resp.get("author_contact")
+        if contact and draft_text:
+            contact_link = build_contact_link(contact, draft_text)
+            if contact_link:
+                buttons.append([InlineKeyboardButton(text="💬 Заказчик", url=contact_link)])
+        if resp.get("vacancy_id"):
+            buttons.append([
+                InlineKeyboardButton(
+                    text="⚠️ Пожаловаться",
+                    callback_data=f"complain_{resp['vacancy_id']}",
+                )
+            ])
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+        try:
+            await message.answer(text, parse_mode="MarkdownV2", reply_markup=markup)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logger.warning(f"send_responses_page item {i}: {e}")
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"resp_page_{page - 1}"))
+    if start + len(responses) < total:
+        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"resp_page_{page + 1}"))
+    if nav:
+        await message.answer(
+            "Навигация:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[nav]),
+        )
+
+
+@dp.message(lambda m: m.text == "📨 Мои отклики")
+async def show_my_responses(message: types.Message):
+    await send_responses_page(message, message.from_user.id, page=0)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("resp_page_"))
+async def responses_page_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    try:
+        page = int(callback.data.replace("resp_page_", ""))
+    except ValueError:
+        return
+    await send_responses_page(callback.message, callback.from_user.id, page=page)
+
+
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
 
 @dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
@@ -910,7 +1071,7 @@ async def show_new_vacancies(message: types.Message):
     user_id = message.from_user.id
     user_categories = get_user_categories(user_id)
     if not user_categories:
-        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «✏️ Изменить категории»")
+        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «📋 Категории»")
         return
 
     all_vacancies = []
@@ -1024,8 +1185,9 @@ async def subscription_menu(message: types.Message):
     )
 
 
-@dp.callback_query(lambda c: c.data == "subscription_request")
+@dp.callback_query(lambda c: c.data in ("subscription_request", "subscription_renew"))
 async def subscription_request_callback(callback: types.CallbackQuery):
+    is_renewal = callback.data == "subscription_renew"
     await safe_callback_answer(callback, "Запрос отправлен")
     user_id = callback.from_user.id
     profile = get_subscriber_profile(user_id)
@@ -1039,16 +1201,25 @@ async def subscription_request_callback(callback: types.CallbackQuery):
         phone,
         cats,
     )
-    await callback.message.answer(
-        f"✅ *Запрос на Premium принят*\n\n"
-        f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
-        f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
-        f"В комментарии укажите ID: `{user_id}`\n\n"
-        f"После проверки оплаты включим Premium — можно будет выбрать больше категорий.",
-        parse_mode="Markdown",
-    )
+    if is_renewal:
+        user_text = (
+            f"✅ *Запрос на продление Premium принят*\n\n"
+            f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
+            f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
+            f"В комментарии укажите ID: `{user_id}`\n\n"
+            f"После проверки оплаты срок Premium будет *продлён*."
+        )
+    else:
+        user_text = (
+            f"✅ *Запрос на Premium принят*\n\n"
+            f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
+            f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
+            f"В комментарии укажите ID: `{user_id}`\n\n"
+            f"После проверки оплаты включим Premium — можно будет выбрать больше категорий."
+        )
+    await callback.message.answer(user_text, parse_mode="Markdown")
     await notify_admin_premium_request(
-        user_id, callback.from_user.username, name, phone, cats
+        user_id, callback.from_user.username, name, phone, cats, is_renewal=is_renewal
     )
 
 
@@ -1116,25 +1287,19 @@ async def setplan_cmd(message: types.Message):
         await message.answer(f"✅ Пользователь {target_id} переведён на free.")
         return
     days = int(parts[3]) if len(parts) > 3 else 30
+    was_active = is_user_premium(target_id)
     notified = await activate_premium_for_user(target_id, days)
+    mode = "продлён" if was_active else "выдан"
     await message.answer(
-        f"✅ Premium для {target_id} на {days} дн."
+        f"✅ Premium для {target_id} {mode} на {days} дн."
         + ("" if notified else " (уведомление пользователю не доставлено)")
     )
 
+@dp.message(lambda m: m.text == "📋 Категории")
 @dp.message(lambda m: m.text == "📋 Мои категории")
-async def show_my_categories(message: types.Message):
-    categories = get_user_categories(message.from_user.id)
-    if categories:
-        text = "📌 *Ваши категории:*\n\n" + "\n".join([f"{c['emoji']} {c['name']}" for c in categories])
-    else:
-        text = "⚠️ Вы ещё не выбрали категории вакансий.\n\nИспользуйте кнопку «✏️ Изменить категории»"
-    await message.answer(text, parse_mode="Markdown")
-
 @dp.message(lambda m: m.text == "✏️ Изменить категории")
-async def edit_categories(message: types.Message):
-    user_id = message.from_user.id
-    await send_category_picker(message.chat.id, user_id)
+async def open_categories_menu(message: types.Message):
+    await send_category_picker(message.chat.id, message.from_user.id)
 
 @dp.message(lambda m: m.text == "📞 Мои контакты")
 async def show_my_contacts(message: types.Message):
@@ -1282,6 +1447,9 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
     add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, profile.get('photo_file_id'))
     await callback.message.answer(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.message.answer(
+        "📨 Отклик сохранён — смотрите в «📨 Мои отклики».",
+    )
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_vacancy")
@@ -1759,7 +1927,7 @@ async def admin_responses_button(message: types.Message):
         return
     text = "📋 *Последние отклики:*\n\n"
     for resp in recent:
-        time = escape_markdown(resp[0][:16] if resp[0] else "—")
+        time = escape_markdown(format_db_datetime_short(resp[0]))
         name = resp[3] or resp[2] or "Пользователь"
         preview = (resp[1][:50] + "...") if resp[1] and len(resp[1]) > 50 else (resp[1] or "—")
         text += f"• {time} — {escape_markdown(name)}: {escape_markdown(preview)}\n"

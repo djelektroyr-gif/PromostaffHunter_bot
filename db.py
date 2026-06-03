@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+from datetime import datetime, timedelta, timezone
 
 from config import get_database_path
 from db_backend import (
@@ -363,11 +364,45 @@ def is_user_premium(user_id: int) -> bool:
     ) is not None
 
 
-def set_user_plan(user_id: int, plan: str = "premium", days: int = 30):
+def _parse_paid_until(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt, size in (("%Y-%m-%d %H:%M:%S", 19), ("%Y-%m-%d", 10)):
+            try:
+                return datetime.strptime(s[:size], fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def set_user_plan(user_id: int, plan: str = "premium", days: int = 30, extend: bool = False):
     if plan == "free":
         execute(
             "UPDATE subscribers SET plan = 'free', paid_until = NULL WHERE user_id = ?",
             (user_id,),
+        )
+    elif extend:
+        row = fetchone(
+            "SELECT paid_until, plan FROM subscribers WHERE user_id = ?",
+            (user_id,),
+        )
+        base = datetime.now(timezone.utc)
+        if row and row[1] == "premium" and row[0]:
+            existing = _parse_paid_until(row[0])
+            if existing and existing > base:
+                base = existing
+        new_until = base + timedelta(days=int(days))
+        execute(
+            "UPDATE subscribers SET plan = 'premium', paid_until = ? WHERE user_id = ?",
+            (new_until, user_id),
         )
     else:
         execute(
@@ -786,6 +821,44 @@ def get_recent_responses(limit: int = 10) -> list:
         ORDER BY r.responded_at DESC
         LIMIT ?
     """, (limit,))
+
+
+def count_user_responses(user_id: int) -> int:
+    return fetchval(
+        "SELECT COUNT(*) FROM responses WHERE user_id = ?",
+        (user_id,),
+        default=0,
+    )
+
+
+def get_user_responses(user_id: int, limit: int = 5, offset: int = 0) -> list:
+    rows = fetchall(
+        """
+        SELECT r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link, r.status,
+               v.is_closed, v.source_chat_title, v.author_contact, v.message_link
+        FROM responses r
+        LEFT JOIN vacancies v ON r.vacancy_id = v.id
+        WHERE r.user_id = ?
+        ORDER BY r.responded_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (user_id, limit, offset),
+    )
+    result = []
+    for row in rows:
+        is_closed = bool(row[5]) if row[5] is not None else False
+        link = row[3] or row[8]
+        result.append({
+            "responded_at": row[0],
+            "vacancy_id": row[1],
+            "vacancy_text": row[2] or "",
+            "vacancy_link": link,
+            "status": row[4] or "pending",
+            "is_closed": is_closed,
+            "source_chat_title": row[6],
+            "author_contact": row[7],
+        })
+    return result
 
 
 def get_subscriber_by_id(user_id: int) -> dict:
