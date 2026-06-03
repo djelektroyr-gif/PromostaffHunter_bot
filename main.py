@@ -24,7 +24,7 @@ from parser import (
     get_telethon_client, close_telethon_client   
 )
 from config import BOT_TOKEN, YOUR_USER_ID
-from telethon import errors
+from telethon import errors, TelegramClient
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
