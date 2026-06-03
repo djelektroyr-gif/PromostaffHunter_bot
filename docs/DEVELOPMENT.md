@@ -108,13 +108,23 @@ SQLite bot_database.db
 - `is_helper_message()` — релевантность (глаголы найма, оплата, стоп-фразы).
 - `detect_category()` — longest keyword match, границы слов (упаковщик ≠ parking).
 - Dedupe: exact по `dedupe_key`, fuzzy ~82% + телефон.
-- **Только «сегодня»** по календарю **МСК** (`is_message_for_today`).
+- **Окно свежести** — `is_message_recent()` (по умолчанию **36 ч**, env `VACANCY_MAX_AGE_HOURS`), не «только сегодня» МСК.
+
+### Устойчивость парсера
+
+- **Reconnect:** при обрыве Telethon переподключается каждые 30 с.
+- **Health loop:** каждые 10 мин — проверка online и `monitored vs active_chats`; алерт админу не чаще 1 раз/час; авто-`refresh_monitored_chat_ids`.
+- **Session lock:** `session_lock.py` — второй процесс на `user_session` не стартует.
+- **check_now / get_new_messages:** только shared client, без временного второго Telethon.
+
+### Фильтр метро (Premium)
+
+- Поле `subscribers.metro_zones` (через запятую).
+- Кнопка **📍 Мои районы** — push и лента фильтруются по станциям; если в вакансии метро не указано — не отсекаем.
 
 ### Известные ограничения парсера
 
-- [ ] Нет фильтра по метро/району пользователя.
-- [ ] Окно «сегодня» отсекает вакансии вечером/ночью по UTC-краям.
-- [ ] Категории только по ключевым словам — возможны ошибки.
+- [ ] Категории по ключевым словам — scoring, но без ML.
 - [ ] Закрытие вакансии — только reply с маркерами «закрыт/❌» на исходное сообщение.
 
 ---
@@ -123,7 +133,8 @@ SQLite bot_database.db
 
 | Кнопка | Действие |
 |--------|----------|
-| 🔍 Посмотреть новые вакансии | Лента из БД с пагинацией |
+| 🔍 Посмотреть новые вакансии | Лента из БД (Free + Premium) |
+| 📍 Мои районы | Фильтр метро (Premium) |
 | 📋 / ✏️ Категории | Выбор категорий (inline) |
 | 💎 Подписка | Тариф, условия, контакт для оплаты |
 | 📞 Мои контакты | Профиль |
@@ -142,10 +153,12 @@ SQLite bot_database.db
 | `is_user_premium()` | ✅ plan=premium и paid_until не истёк |
 | Free: лимит **3 категории** | ✅ |
 | Premium: без лимита категорий | ✅ |
-| Экран «💎 Подписка» | ✅ |
+| Экран «💎 Подписка» | ✅ реквизиты, «Запросить Premium» |
 | Админ `/setplan` | ✅ ручная выдача |
-| Автооплата / webhook | ❌ нет |
-| **Пробный период** | ❌ **ещё не кодили** (см. ниже) |
+| Push только Premium | ✅ Free — лента без push |
+| **Пробный период** | ✅ `TRIAL_DAYS` (default 7), `trial_used` |
+| Фильтр метро | ✅ Premium, `metro_zones` |
+| Автооплата / webhook | ❌ нет (ручная карта) |
 
 ### Решение владельца (2026-06-03)
 
@@ -171,26 +184,24 @@ SQLite bot_database.db
 
 | Тариф | Цена | Что входит |
 |-------|------|------------|
-| **Free** | 0 ₽ | До 3 категорий, push-вакансии по категориям |
-| **Trial** | 0 ₽ | 7 дней Premium (один раз на user_id) — **TODO** |
-| **Premium** | _указать сумму_/мес | Все категории; позже: фильтр метро, приоритет |
+| **Free** | 0 ₽ | До 3 категорий, лента «🔍 Посмотреть новые», **без push** |
+| **Trial** | 0 ₽ | `TRIAL_DAYS` дней Premium (один раз на user_id) при завершении выбора категорий |
+| **Premium** | env `SUBSCRIPTION_PRICE_RUB`/мес | Push, все категории, фильтр метро |
 
-### TODO по подписке (когда будете кодить)
+### TODO по подписке (осталось)
 
-- [ ] Поле `trial_used` / `trial_until` в `subscribers` или отдельная таблица.
-- [ ] При завершении регистрации: `set_user_plan(user_id, 'premium', days=TRIAL_DAYS)` + `trial_used=1`.
-- [ ] Cron/проверка при `/start`: если trial истёк → `plan=free`, уведомление «Premium закончился».
-- [ ] Текст на экране 💎: реквизиты карты, сумма, «укажите ID в комментарии к переводу».
-- [ ] Админ: кнопка «Запросы на Premium» (опционально) — список обращений с ключевым словом «подписка».
-- [ ] Не обещать в UI то, что ещё не включено (фильтр метро — помечать «скоро»).
+- [ ] Cron массовой проверки истёкших Premium (сейчас — при `/start`).
+- [ ] Telegram Stars / webhook — когда появится инструмент.
 
 ### Env для ручной оплаты
 
 ```env
 SUBSCRIPTION_SUPPORT=@your_support_or_link
-# SUBSCRIPTION_PAY_URL=   # пока пусто
-# SUBSCRIPTION_PRICE_RUB=299
-# SUBSCRIPTION_CARD_HINT=Сбер •••• 1234, получатель Иван И.
+SUBSCRIPTION_PRICE_RUB=299
+SUBSCRIPTION_CARD_HINT=Сбер •••• 1234, получатель Иван И.
+TRIAL_DAYS=7
+VACANCY_MAX_AGE_HOURS=36
+# SUBSCRIPTION_PAY_URL=   # опционально
 ```
 
 ---
@@ -206,8 +217,7 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 
 ### Telethon
 
-- **Один** процесс на `user_session`.
-- Не запускать второй Telethon-клиент параллельно (check_now использует shared client).
+- **Один** процесс на `user_session` — `session_lock.py`, алерт при втором инстансе.
 - Аккаунт парсера — член групп, без спама.
 
 ---
@@ -220,7 +230,13 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 | Разные ID вакансии в БД и кнопках | `make_vacancy_id()` везде + миграция legacy ID при старте |
 | `respond_add_` ломался | Фильтр callback exclude `respond_add_` |
 | Закрытие вакансий не уведомляло | `mark_vacancy_closed` по message_link + notify в realtime/scan |
-| Категория упаковщик → parking | Переписан `detect_category` |
+| Категория упаковщик → parking | Переписан `detect_category` (scoring + tie-break) |
+| Free получал push как Premium | Push только `is_user_premium()` |
+| Второй процесс ломал Telethon | `session_lock.py` |
+| Парсер offline без алертов | Health loop + auto-reconnect |
+| «Только сегодня» отсекало вечер | `is_message_recent` 36 ч |
+| Нет фильтра метро | `metro_zones` + 📍 Мои районы |
+| Telethon EOF на сервере | `create_authorized_client()` — connect без input(); алерт если нет `.session` |
 | Конфликт `cat_` postvacancy vs регистрация | Префикс `postcat_` для админ-публикации |
 
 ---
@@ -229,15 +245,15 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 
 ### Высокий — без этого бот «слабый»
 
-- [ ] **Пробный период** (см. §7).
-- [ ] **Реквизиты и текст оплаты** на экране подписки.
-- [ ] Фильтр **метро/район** в профиле → не слать чужие локации.
-- [ ] Уведомление при **истечении Premium** / trial.
-- [ ] Алерт админу если `monitored < active_chats` (парсер не видит группы).
+- [x] **Пробный период** (§7).
+- [x] **Реквизиты и текст оплаты** на экране подписки + «Запросить Premium».
+- [x] Фильтр **метро/район** (Premium).
+- [x] Уведомление при **истечении Premium** (при `/start`).
+- [x] Алерт админу если парсер offline / `monitored < active_chats`.
 
 ### Средний
 
-- [ ] Окно вакансий **24–36 ч** вместо «только сегодня».
+- [x] Окно вакансий **36 ч** (`VACANCY_MAX_AGE_HOURS`).
 - [ ] Scoring вакансий вместо бинарного фильтра.
 - [ ] Кнопка «Не интересно» → обучение/статистика.
 - [ ] Telegram Stars или webhook оплаты (когда решите инструмент).
@@ -254,10 +270,17 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 ## 11. Деплой и проверки
 
 1. Локально: `python -m pytest tests/ -q`
-2. На сервере: один процесс бота, `user_session.session` на месте.
-3. После выката: `/start` → **📊 Статистика** (парсер online, чаты в мониторинге).
-4. **📋 Список чатов парсинга** — все активные группы ✅.
-5. Тестовая вакансия: push → «Откликнуться» → deeplink.
+2. **Telethon-сессия (обязательно на проде):**
+   - Локально один раз: запустить бота → создаётся `user_session.session`
+   - Аккаунт парсера — **участник** всех групп
+   - **Bothost ([bothost.ru](https://bothost.ru/)):** включить «Общее хранилище» у бота → редеплой → загрузить `user_session.session` в «Общие файлы» → путь `/app/shared/user_session.session` (авто, см. `SHARED_DIR`)
+   - **Timeweb / свой VPS:** volume или `/app/user_session.session`
+   - Env: `API_ID`, `API_HASH`; при нестандартном пути: `TELEGRAM_SESSION_NAME=/app/shared/user_session`
+   - Без `.session` парсер не стартует (бот для пользователей работает)
+3. На сервере: **один** процесс бота, `user_session.session` на месте
+4. После выката: `/start` → **📊 Статистика** — строка парсера ✅, не «нет файла session»
+5. **📋 Список чатов парсинга** — все активные группы ✅
+6. Тестовая вакансия: push → «Откликнуться» → deeplink
 
 ---
 
@@ -275,6 +298,7 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 
 | Дата | Что добавлено |
 |------|----------------|
+| 2026-06-03 | Закрыты слабые места: health/reconnect, session lock, 36h window, metro, premium push, trial |
 | 2026-06-03 | Первая версия: архитектура, админка, парсер, подписка (trial + ручная карта), бэклог |
 
 ---

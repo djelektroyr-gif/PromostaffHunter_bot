@@ -8,10 +8,48 @@ YOUR_USER_ID = int(os.getenv("YOUR_USER_ID", "0"))
 # Ссылка на оплату подписки (Telegram Stars invoice URL, ЮKassa, T-Bank — по желанию)
 SUBSCRIPTION_PAY_URL = os.getenv("SUBSCRIPTION_PAY_URL", "").strip()
 SUBSCRIPTION_SUPPORT = os.getenv("SUBSCRIPTION_SUPPORT", "@promostaff_support").strip()
+SUBSCRIPTION_PRICE_RUB = os.getenv("SUBSCRIPTION_PRICE_RUB", "299").strip()
+SUBSCRIPTION_CARD_HINT = os.getenv("SUBSCRIPTION_CARD_HINT", "").strip()
+
+# Окно свежести вакансий (часы) — вместо «только сегодня» по МСК
+VACANCY_MAX_AGE_HOURS = int(os.getenv("VACANCY_MAX_AGE_HOURS", "36"))
+
+# Пробный Premium при первой регистрации (дней, 0 = отключить)
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 
 # Telethon Settings
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
+# Bothost / shared volume: $SHARED_DIR → /app/shared/user_session.session
+SHARED_DIR = os.getenv("SHARED_DIR", "").strip()
+
+
+def _resolve_telegram_session_name() -> str:
+    """Путь к сессии Telethon (без .session). Выбирает первый существующий файл."""
+    explicit = os.getenv("TELEGRAM_SESSION_NAME", "").strip()
+    if explicit:
+        return explicit
+
+    candidates = []
+    if SHARED_DIR:
+        candidates.append(os.path.join(SHARED_DIR, "user_session"))
+    if os.path.isdir("/app/shared"):
+        candidates.append("/app/shared/user_session")
+    candidates.append("user_session")  # /app/user_session.session при cwd=/app
+
+    for base in candidates:
+        if os.path.isfile(f"{base}.session"):
+            return base
+
+    # Для сообщения об ошибке — куда класть файл в первую очередь
+    if SHARED_DIR:
+        return os.path.join(SHARED_DIR, "user_session")
+    if os.path.isdir("/app/shared"):
+        return "/app/shared/user_session"
+    return "user_session"
+
+
+TELEGRAM_SESSION_NAME = _resolve_telegram_session_name()
 
 # List of chats for monitoring
 TARGET_CHATS = [

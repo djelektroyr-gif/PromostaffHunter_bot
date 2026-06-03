@@ -40,6 +40,10 @@ def init_db():
         cur.execute("ALTER TABLE subscribers ADD COLUMN plan TEXT DEFAULT 'free'")
     if "paid_until" not in cols:
         cur.execute("ALTER TABLE subscribers ADD COLUMN paid_until TIMESTAMP DEFAULT NULL")
+    if "metro_zones" not in cols:
+        cur.execute("ALTER TABLE subscribers ADD COLUMN metro_zones TEXT DEFAULT NULL")
+    if "trial_used" not in cols:
+        cur.execute("ALTER TABLE subscribers ADD COLUMN trial_used BOOLEAN DEFAULT 0")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
@@ -256,7 +260,7 @@ def get_subscriber_profile(user_id: int) -> dict:
     cur = conn.cursor()
     cur.execute("""
         SELECT user_id, username, first_name, last_name, full_name, age, phone,
-               photo_file_id, questionnaire, is_active, plan, paid_until
+               photo_file_id, questionnaire, is_active, plan, paid_until, metro_zones, trial_used
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     row = cur.fetchone()
@@ -266,7 +270,7 @@ def get_subscriber_profile(user_id: int) -> dict:
             "user_id": row[0], "username": row[1], "first_name": row[2], "last_name": row[3],
             "full_name": row[4], "age": row[5], "phone": row[6], "photo_file_id": row[7],
             "questionnaire": row[8], "is_active": row[9], "plan": row[10] or "free",
-            "paid_until": row[11],
+            "paid_until": row[11], "metro_zones": row[12], "trial_used": bool(row[13]),
         }
     return None
 
@@ -319,6 +323,63 @@ def count_premium_subscribers() -> int:
     conn.close()
     return n
 
+
+def set_user_metro_zones(user_id: int, metro_zones: str | None):
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute("UPDATE subscribers SET metro_zones = ? WHERE user_id = ?", (metro_zones, user_id))
+    conn.commit()
+    conn.close()
+
+
+def grant_trial_if_eligible(user_id: int, trial_days: int) -> bool:
+    """Выдаёт пробный Premium один раз на user_id. Возвращает True если выдан."""
+    if trial_days <= 0:
+        return False
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute("SELECT trial_used FROM subscribers WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row or row[0]:
+        conn.close()
+        return False
+    cur.execute(
+        """
+        UPDATE subscribers
+        SET plan = 'premium', paid_until = datetime('now', ?), trial_used = 1
+        WHERE user_id = ?
+        """,
+        (f"+{trial_days} days", user_id),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def downgrade_expired_premium(user_id: int) -> str | None:
+    """Сбрасывает истёкший Premium на free. Возвращает текст уведомления или None."""
+    conn = sqlite3.connect(DB_NAME, timeout=10.0)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT plan, paid_until FROM subscribers
+        WHERE user_id = ? AND plan = 'premium' AND paid_until IS NOT NULL
+          AND datetime(paid_until) <= datetime('now')
+        """,
+        (user_id,),
+    )
+    if not cur.fetchone():
+        conn.close()
+        return None
+    cur.execute("UPDATE subscribers SET plan = 'free' WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return (
+        "⏳ *Premium закончился.*\n\n"
+        "Моментальные push отключены — новые вакансии в ленте «🔍 Посмотреть новые вакансии».\n"
+        "Оформить снова: 💎 Подписка"
+    )
+
 def is_profile_complete(user_id: int) -> bool:
     profile = get_subscriber_profile(user_id)
     if not profile:
@@ -361,14 +422,17 @@ def get_subscribers_by_category(category_code: str) -> list:
     cur = conn.cursor()
     # Убираем условие full_name IS NOT NULL, чтобы вакансии приходили сразу после регистрации
     cur.execute("""
-        SELECT s.user_id, s.full_name, s.phone, s.username
+        SELECT s.user_id, s.full_name, s.phone, s.username, s.metro_zones
         FROM subscribers s
         JOIN user_categories uc ON s.user_id = uc.user_id
         WHERE uc.category_code = ? AND s.is_active = 1
     """, (category_code,))
     rows = cur.fetchall()
     conn.close()
-    return [{"user_id": r[0], "full_name": r[1], "phone": r[2], "username": r[3]} for r in rows]
+    return [
+        {"user_id": r[0], "full_name": r[1], "phone": r[2], "username": r[3], "metro_zones": r[4]}
+        for r in rows
+    ]
 
 # ========== ВАКАНСИИ ==========
 def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,

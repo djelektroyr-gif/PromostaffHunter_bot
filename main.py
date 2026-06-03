@@ -16,9 +16,12 @@ from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
     make_vacancy_id, PARSER_LABEL, inspect_parser_chats, format_parser_chats_report,
-    get_parser_status_snapshot, format_parser_status_line,
+    get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
 )
-from config import BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT
+from config import (
+    BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
+    SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, VACANCY_MAX_AGE_HOURS,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -118,26 +121,47 @@ def format_subscription_screen(user_id: int) -> str:
     premium = is_user_premium(user_id)
     profile = get_subscriber_profile(user_id)
     paid_until = profile.get("paid_until") if profile else None
+    trial_used = profile.get("trial_used") if profile else False
     if premium:
         until_line = f"Действует до: *{paid_until[:10]}*" if paid_until else "Без ограничения по сроку"
         status = f"💎 *Premium активен*\n{until_line}"
     else:
-        status = "🆓 *Бесплатный доступ*\nВакансии по выбранным категориям"
-    pay_hint = ""
+        status = (
+            "🆓 *Бесплатный доступ*\n"
+            "Лента «🔍 Посмотреть новые вакансии» — без моментальных push"
+        )
+    pay_lines = []
+    if SUBSCRIPTION_CARD_HINT:
+        pay_lines.append(f"💳 *Реквизиты:* {SUBSCRIPTION_CARD_HINT}")
+    pay_lines.append(f"💰 *Сумма:* {SUBSCRIPTION_PRICE_RUB} ₽/мес")
+    pay_lines.append(f"В комментарии к переводу укажите ваш Telegram ID: `{user_id}`")
     if SUBSCRIPTION_PAY_URL:
-        pay_hint = f"\n\n💳 Оплата: {SUBSCRIPTION_PAY_URL}"
+        pay_lines.append(f"Или оплатите по ссылке: {SUBSCRIPTION_PAY_URL}")
     else:
-        pay_hint = f"\n\n💬 Для оплаты напишите: {SUBSCRIPTION_SUPPORT}"
+        pay_lines.append(f"После перевода напишите {SUBSCRIPTION_SUPPORT} или нажмите «Запросить Premium» ниже.")
+    pay_block = "\n".join(pay_lines)
+    trial_hint = ""
+    if not trial_used and TRIAL_DAYS > 0 and not premium:
+        trial_hint = f"\n\n🎁 Новым пользователям — пробный Premium *{TRIAL_DAYS} дн.* после выбора категорий."
     return (
         f"💎 *Подписка Promostaff Hunter*\n\n"
         f"{status}\n\n"
         f"*Premium даёт:*\n"
         f"• моментальные push-уведомления\n"
         f"• все категории без лимита\n"
-        f"• приоритет при отклике (скоро)\n"
-        f"• фильтр по району/метро (скоро)\n\n"
-        f"*Free:* базовая лента по 1–3 категориям{pay_hint}"
+        f"• фильтр по метро/району (📍 Мои районы)\n\n"
+        f"*Free:* до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
+        f"*Оплата (вручную):*\n{pay_block}{trial_hint}"
     )
+
+
+async def notify_admin_parser_issue(text: str):
+    if not YOUR_USER_ID:
+        return
+    try:
+        await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить алерт админу: {e}")
 
 def get_postvacancy_categories_keyboard():
     categories = get_all_categories()
@@ -177,6 +201,9 @@ class AddChatState(StatesGroup):
 class PostVacancyState(StatesGroup):
     waiting_for_category = State()
     waiting_for_text = State()
+
+class MetroState(StatesGroup):
+    waiting_for_zones = State()
     waiting_for_photo = State()
 
 class RespondWithPhotoState(StatesGroup):
@@ -348,8 +375,20 @@ async def send_vacancy_to_subscribers(order: dict):
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     sent_count = 0
+    skipped_free = 0
+    skipped_metro = 0
     for subscriber in subscribers:
+        if not is_user_premium(subscriber['user_id']):
+            skipped_free += 1
+            continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
+            continue
+        if not vacancy_matches_user_metro(
+            order.get('message_text', ''),
+            address,
+            subscriber.get('metro_zones'),
+        ):
+            skipped_metro += 1
             continue
         try:
             await send_message_with_retry(
@@ -368,7 +407,10 @@ async def send_vacancy_to_subscribers(order: dict):
             else:
                 logger.error(f"Ошибка отправки {subscriber['user_id']}: {e}")
 
-    logger.info(f"Вакансия {vacancy_id} (категория {category_code}) отправлена {sent_count} подписчикам")
+    logger.info(
+        f"Вакансия {vacancy_id} (категория {category_code}): push {sent_count}, "
+        f"free skip {skipped_free}, metro skip {skipped_metro}"
+    )
     mark_vacancy_sent(vacancy_id)
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
@@ -407,7 +449,8 @@ def get_main_keyboard(user_id: int):
         keyboard=[
             [KeyboardButton(text="🔍 Посмотреть новые вакансии")],
             [KeyboardButton(text="📋 Мои категории"), KeyboardButton(text="✏️ Изменить категории")],
-            [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="📞 Мои контакты")],
+            [KeyboardButton(text="📍 Мои районы"), KeyboardButton(text="💎 Подписка")],
+            [KeyboardButton(text="📞 Мои контакты")],
             [KeyboardButton(text="❌ Отписаться"), KeyboardButton(text="❓ Поддержка")],
         ],
         resize_keyboard=True
@@ -456,6 +499,9 @@ async def start_cmd(message: types.Message, state: FSMContext):
         return
 
     add_subscriber(user_id, username, first_name, last_name)
+    expired_msg = downgrade_expired_premium(user_id)
+    if expired_msg:
+        await message.answer(expired_msg, parse_mode="Markdown")
     profile = get_subscriber_profile(user_id)
     if profile and profile.get("full_name") and profile.get("phone"):
         categories = get_user_categories(user_id)
@@ -695,11 +741,16 @@ async def finish_categories(callback: types.CallbackQuery):
         return
     categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
     keyboard, status_text = get_main_keyboard(user_id)
+    trial_granted = grant_trial_if_eligible(user_id, TRIAL_DAYS)
+    trial_line = ""
+    if trial_granted:
+        trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро включены!"
     await callback.message.delete()
     await callback.message.answer(
         f"✅ *Вы подписались на вакансии!*\n\n"
         f"📌 Ваши категории:\n{categories_text}\n\n"
-        f"Теперь я буду присылать вам новые вакансии по мере их появления.\n\n"
+        f"{'💎 Новые вакансии приходят моментально в чат.' if is_user_premium(user_id) else '🔍 Free: смотрите новые вакансии кнопкой «Посмотреть новые» — push только в Premium.'}"
+        f"{trial_line}\n\n"
         f"Используйте кнопки для управления:",
         parse_mode="Markdown",
         reply_markup=keyboard
@@ -717,14 +768,27 @@ async def show_new_vacancies(message: types.Message):
         return
 
     all_vacancies = []
+    profile = get_subscriber_profile(user_id)
+    metro_zones = profile.get("metro_zones") if profile else None
+    apply_metro = is_user_premium(user_id) and metro_zones
     for cat in user_categories:
         vacancies = get_unsent_vacancies_by_category(cat['code'])
         for vac in vacancies:
+            if apply_metro and not vacancy_matches_user_metro(
+                vac.get('text', ''), vac.get('address'), metro_zones
+            ):
+                continue
             vac['category'] = cat
             all_vacancies.append(vac)
 
     if not all_vacancies:
-        await message.answer("🔍 Новых вакансий по вашим категориям пока нет.\n\nЯ продолжаю мониторинг и сообщу, когда появятся!")
+        hint = ""
+        if apply_metro:
+            hint = "\n\nПопробуйте расширить список в «📍 Мои районы» или сбросить фильтр («-»)."
+        await message.answer(
+            f"🔍 Новых вакансий по вашим категориям пока нет.{hint}\n\n"
+            f"Я продолжаю мониторинг — Premium получает push сразу.",
+        )
         return
 
     user_pages[user_id] = {
@@ -806,11 +870,81 @@ async def subscription_menu(message: types.Message):
     buttons = []
     if SUBSCRIPTION_PAY_URL and not is_user_premium(user_id):
         buttons.append([InlineKeyboardButton(text="💳 Оформить Premium", url=SUBSCRIPTION_PAY_URL)])
+    elif not is_user_premium(user_id):
+        buttons.append([InlineKeyboardButton(text="💳 Запросить Premium", callback_data="subscription_request")])
     await message.answer(
         format_subscription_screen(user_id),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None,
     )
+
+
+@dp.callback_query(lambda c: c.data == "subscription_request")
+async def subscription_request_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    profile = get_subscriber_profile(user_id)
+    name = profile.get("full_name") if profile else callback.from_user.first_name
+    await callback.answer("Запрос отправлен — мы свяжемся после проверки перевода.", show_alert=False)
+    await callback.message.answer(
+        f"✅ Запрос на Premium принят.\n\n"
+        f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* и пришлите скрин {SUBSCRIPTION_SUPPORT}.\n"
+        f"В комментарии к переводу укажите ID: `{user_id}`",
+        parse_mode="Markdown",
+    )
+    if YOUR_USER_ID:
+        try:
+            await bot.send_message(
+                YOUR_USER_ID,
+                f"💳 *Запрос Premium*\n\n"
+                f"Пользователь: {name}\n"
+                f"ID: `{user_id}`\n"
+                f"Username: @{callback.from_user.username or '—'}\n\n"
+                f"Выдать: `/setplan {user_id} premium 30`",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning(f"subscription_request notify admin: {e}")
+
+
+@dp.message(lambda m: m.text == "📍 Мои районы")
+async def metro_zones_menu(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not is_user_premium(user_id):
+        await message.answer(
+            "📍 Фильтр по метро — функция *Premium*.\n\n"
+            "Оформите подписку в 💎 Подписка или дождитесь окончания пробного периода.",
+            parse_mode="Markdown",
+        )
+        return
+    profile = get_subscriber_profile(user_id)
+    current = profile.get("metro_zones") if profile else None
+    current_line = current if current else "не заданы (приходят все локации)"
+    await message.answer(
+        f"📍 *Мои станции метро*\n\n"
+        f"Сейчас: {current_line}\n\n"
+        f"Введите станции через запятую, например:\n"
+        f"`Таганская, Беляево, Сокол`\n\n"
+        f"Отправьте `-` чтобы сбросить фильтр.",
+        parse_mode="Markdown",
+    )
+    await state.set_state(MetroState.waiting_for_zones)
+
+
+@dp.message(MetroState.waiting_for_zones)
+async def metro_zones_save(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    if text == "-":
+        set_user_metro_zones(user_id, None)
+        await message.answer("✅ Фильтр по метро сброшен — снова все локации.")
+    else:
+        zones = ", ".join(z.strip() for z in text.split(",") if z.strip())
+        if not zones:
+            await message.answer("❌ Укажите хотя бы одну станцию или `-` для сброса.")
+            return
+        set_user_metro_zones(user_id, zones)
+        await message.answer(f"✅ Сохранено: *{zones}*\n\nPush и лента — только вакансии с этими станциями.", parse_mode="Markdown")
+    await state.clear()
 
 @dp.message(Command("setplan"))
 async def setplan_cmd(message: types.Message):
@@ -1652,8 +1786,14 @@ async def on_startup():
         logger.info(f"🔄 Миграция ID вакансий: обновлено {migrated} записей")
     logger.info("📁 База данных инициализирована")
 
-    # Парсер групп (Telethon) делает стартовую синхронизацию и плановый опрос каждые 5 мин
-    asyncio.create_task(start_realtime_listener(send_vacancy_to_subscribers, notify_closed_vacancies))
+    # Парсер групп (Telethon) — reconnect, health alerts, session lock
+    asyncio.create_task(
+        start_realtime_listener(
+            send_vacancy_to_subscribers,
+            notify_closed_vacancies,
+            health_notify_callback=notify_admin_parser_issue,
+        )
+    )
     logger.info(f"📡 {PARSER_LABEL} запущен (резервный опрос каждые 5 мин)")
 
     logger.info("📡 Запуск polling...")
@@ -1662,6 +1802,8 @@ async def on_startup():
 async def on_shutdown():
     logger.info("🛑 Остановка бота...")
     await stop_realtime_listener()
+    from session_lock import release_session_lock
+    release_session_lock()
     await bot.session.close()
     logger.info("👋 Бот остановлен")
 

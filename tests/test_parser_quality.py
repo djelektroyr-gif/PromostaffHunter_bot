@@ -4,7 +4,10 @@ from parser import (
     build_vacancy_dedupe_key,
     extract_contact_from_text,
     extract_address_from_text,
+    is_message_recent,
     is_message_for_today,
+    extract_metro_tokens,
+    vacancy_matches_user_metro,
     _extract_phone_digits,
     detect_duplicate_type,
     detect_category,
@@ -29,10 +32,16 @@ def test_extract_contact_from_tg_resolve_link():
     assert extract_contact_from_text(text) == "@GuseynzadeGF"
 
 
-def test_is_message_for_today():
+def test_is_message_recent_within_window():
+    now = datetime.now(timezone.utc)
+    assert is_message_recent(now) is True
+    assert is_message_recent(now - timedelta(hours=30)) is True
+    assert is_message_recent(now - timedelta(hours=40)) is False
+
+
+def test_is_message_for_today_alias():
     now = datetime.now(timezone.utc)
     assert is_message_for_today(now) is True
-    assert is_message_for_today(now - timedelta(days=1)) is False
 
 
 def test_dedupe_key_same_for_cross_posted_messages():
@@ -93,12 +102,30 @@ def test_detect_category_helper_for_helper_night():
     assert detect_category(text) == "helper"
 
 
+def test_detect_category_promoter_not_helper():
+    text = "Нужны промоутеры на раздачу листовок, метро Таганская"
+    assert detect_category(text) == "promoter"
+
+
+def test_metro_filter_matches_station():
+    text = "Срочно нужен промоутер, метро Таганская, ставка 3500"
+    assert extract_metro_tokens(text) == ["таганская"]
+    assert vacancy_matches_user_metro(text, None, "Таганская, Сокол") is True
+    assert vacancy_matches_user_metro(text, None, "Беляево") is False
+    assert vacancy_matches_user_metro(text, None, "") is True
+
+
 def test_format_parser_chats_report():
     from parser import format_parser_chats_report
 
     report = format_parser_chats_report([], "empty")
     assert "Чаты парсинга" in report
     assert "/addchat" in report
+
+
+def test_session_file_path_default():
+    from parser import session_file_path
+    assert session_file_path().endswith(".session")
 
 
 def test_make_vacancy_id_same_for_parser_and_send():

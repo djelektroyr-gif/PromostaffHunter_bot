@@ -1,4 +1,5 @@
 import re
+import os
 import logging
 import hashlib
 from difflib import SequenceMatcher
@@ -6,7 +7,10 @@ from telethon import TelegramClient, events
 from telethon import errors
 import asyncio
 from datetime import datetime, timezone, timedelta
-from config import API_ID, API_HASH, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES, HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS
+from config import (
+    API_ID, API_HASH, TELEGRAM_SESSION_NAME, HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES,
+    HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS, VACANCY_MAX_AGE_HOURS,
+)
 from db import (
     get_target_chats, is_message_processed, mark_vacancy_closed,
     get_last_processed_id, update_last_processed_id,
@@ -19,10 +23,49 @@ logger = logging.getLogger(__name__)
 _realtime_client = None
 _monitored_chat_ids = set()
 _parser_lock = asyncio.Lock()
+_last_health_alert = {}
 PARSER_POLL_INTERVAL_SEC = 300
+PARSER_HEALTH_INTERVAL_SEC = 600
+PARSER_RECONNECT_DELAY_SEC = 30
+PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
 PARSER_LABEL = "Парсер групп (Telethon)"
 MOSCOW_TZ = timezone(timedelta(hours=3))
+_session_config_alert_sent = False
+
+
+class SessionNotConfiguredError(Exception):
+    """Сессия Telethon отсутствует или не авторизована — на сервере нельзя вводить телефон интерактивно."""
+
+
+def session_file_path() -> str:
+    return f"{TELEGRAM_SESSION_NAME}.session"
+
+
+def is_session_file_present() -> bool:
+    return os.path.isfile(session_file_path())
+
+
+async def create_authorized_client() -> TelegramClient:
+    """Подключение без input() — только если .session уже авторизован."""
+    path = session_file_path()
+    if not is_session_file_present():
+        raise SessionNotConfiguredError(
+            f"Файл {path} не найден. Авторизуйте Telethon локально и загрузите на сервер "
+            f"(volume /app, не в git). Имя: TELEGRAM_SESSION_NAME={TELEGRAM_SESSION_NAME!r}."
+        )
+    if not API_ID or not API_HASH:
+        raise SessionNotConfiguredError("Задайте API_ID и API_HASH в переменных окружения.")
+
+    client = TelegramClient(TELEGRAM_SESSION_NAME, API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise SessionNotConfiguredError(
+            f"Файл {path} есть, но сессия не авторизована. "
+            "Пересоздайте локально (интерактивный вход) и снова загрузите на сервер."
+        )
+    return client
 
 def make_vacancy_id(chat_id: str, message_id: str, dedupe_key: str = None) -> str:
     unique_str = dedupe_key or f"{chat_id}_{message_id}"
@@ -56,7 +99,7 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
         if stats is not None:
             stats["already_sent"] += 1
         return None
-    if not is_message_for_today(message.date):
+    if not is_message_recent(message.date):
         if stats is not None:
             stats["old_messages"] += 1
         return None
@@ -196,50 +239,157 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
             logger.error(f"Ошибка плановой проверки: {e}", exc_info=True)
         await asyncio.sleep(PARSER_POLL_INTERVAL_SEC)
 
+
+async def _parser_health_loop(health_notify_callback=None):
+    """Следит за online/offline и резолвом чатов; алерт админу не чаще раза в час."""
+    await asyncio.sleep(180)
+    while True:
+        try:
+            snap = get_parser_status_snapshot()
+            issues = []
+            if not snap["online"]:
+                issues.append("offline")
+            elif snap["active_chats"] and snap["monitored"] < snap["active_chats"]:
+                issues.append(f"unresolved:{snap['active_chats'] - snap['monitored']}")
+
+            if issues and _realtime_client and _realtime_client.is_connected():
+                if snap["monitored"] < snap["active_chats"]:
+                    try:
+                        async with _parser_lock:
+                            await refresh_monitored_chat_ids(_realtime_client)
+                    except Exception as e:
+                        logger.warning(f"Health: не удалось обновить chat_id: {e}")
+
+            if issues and health_notify_callback:
+                key = ",".join(issues)
+                now = datetime.now(timezone.utc)
+                last = _last_health_alert.get(key)
+                if not last or (now - last).total_seconds() > 3600:
+                    if "offline" in key:
+                        text = (
+                            f"⚠️ *{PARSER_LABEL} offline*\n\n"
+                            f"Бот переподключается автоматически. "
+                            f"Если алерт повторяется — проверьте `user_session` и логи."
+                        )
+                    else:
+                        unresolved = snap["active_chats"] - snap["monitored"]
+                        text = (
+                            f"⚠️ *Парсер не видит {unresolved} чат(ов)*\n\n"
+                            f"В БД: {snap['active_chats']}, в мониторинге: {snap['monitored']}.\n"
+                            f"Откройте «📋 Список чатов парсинга» или `/listchats`."
+                        )
+                    try:
+                        await health_notify_callback(text)
+                    except Exception as e:
+                        logger.warning(f"Health notify failed: {e}")
+                    _last_health_alert[key] = now
+        except Exception as e:
+            logger.error(f"Health loop error: {e}", exc_info=True)
+        await asyncio.sleep(PARSER_HEALTH_INTERVAL_SEC)
+
 # ===================== ПАРСЕР ГРУПП (TELETHON) =====================
 
-async def start_realtime_listener(bot_callback, closed_callback=None):
-    global _realtime_client
-    _realtime_client = TelegramClient('user_session', API_ID, API_HASH)
-    await _realtime_client.start()
-    logger.info(f"✅ {PARSER_LABEL} подключён")
+async def start_realtime_listener(bot_callback, closed_callback=None, health_notify_callback=None):
+    global _realtime_client, _session_config_alert_sent
+    from session_lock import acquire_session_lock, SessionLockError
 
-    await refresh_monitored_chat_ids(_realtime_client)
+    try:
+        acquire_session_lock()
+    except SessionLockError as e:
+        logger.error(str(e))
+        if health_notify_callback:
+            try:
+                await health_notify_callback(f"❌ *Не запущен {PARSER_LABEL}*\n\n{e}")
+            except Exception:
+                pass
+        return
 
-    async with _parser_lock:
-        logger.info("🔄 Стартовая синхронизация вакансий...")
-        startup_orders, startup_closed = await _scan_all_chats(_realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT)
-    if startup_closed and closed_callback:
-        await closed_callback(startup_closed)
-    for order in startup_orders:
-        await bot_callback(order)
-    logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
+    asyncio.create_task(_parser_health_loop(health_notify_callback))
+    reconnect_delay = PARSER_RECONNECT_DELAY_SEC
 
-    asyncio.create_task(_periodic_scan_loop(bot_callback, closed_callback))
-
-    @_realtime_client.on(events.NewMessage())
-    async def handler(event):
-        if not is_chat_monitored(event.chat_id):
-            return
-
-        logger.info(f"⚡ {PARSER_LABEL}: новое сообщение из чата {event.chat_id}")
-        message = event.message
-        chat = await event.get_chat()
-        chat_id = str(chat.id)
-        chat_title = chat.title or "Без названия"
-
+    while True:
         try:
-            result = await _process_single_message(message, chat, chat_id, chat_title)
-            if result and result.get("type") == "closed":
-                if closed_callback and result.get("users"):
-                    await closed_callback([(result["vacancy_id"], result["users"])])
-            elif result:
-                await bot_callback(result)
-                logger.info(f"⚡ {PARSER_LABEL}: вакансия из {chat_title}")
-        except Exception as e:
-            logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
+            _realtime_client = await create_authorized_client()
+            reconnect_delay = PARSER_RECONNECT_DELAY_SEC
+            logger.info(f"✅ {PARSER_LABEL} подключён")
 
-    await _realtime_client.run_until_disconnected()
+            await refresh_monitored_chat_ids(_realtime_client)
+
+            async with _parser_lock:
+                logger.info("🔄 Стартовая синхронизация вакансий...")
+                startup_orders, startup_closed = await _scan_all_chats(
+                    _realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT
+                )
+            if startup_closed and closed_callback:
+                await closed_callback(startup_closed)
+            for order in startup_orders:
+                await bot_callback(order)
+            logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
+
+            asyncio.create_task(_periodic_scan_loop(bot_callback, closed_callback))
+
+            @_realtime_client.on(events.NewMessage())
+            async def handler(event):
+                if not is_chat_monitored(event.chat_id):
+                    return
+
+                logger.info(f"⚡ {PARSER_LABEL}: новое сообщение из чата {event.chat_id}")
+                message = event.message
+                chat = await event.get_chat()
+                chat_id = str(chat.id)
+                chat_title = chat.title or "Без названия"
+
+                try:
+                    result = await _process_single_message(message, chat, chat_id, chat_title)
+                    if result and result.get("type") == "closed":
+                        if closed_callback and result.get("users"):
+                            await closed_callback([(result["vacancy_id"], result["users"])])
+                    elif result:
+                        await bot_callback(result)
+                        logger.info(f"⚡ {PARSER_LABEL}: вакансия из {chat_title}")
+                except Exception as e:
+                    logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
+
+            await _realtime_client.run_until_disconnected()
+        except SessionNotConfiguredError as e:
+            logger.error(f"{PARSER_LABEL}: {e}")
+            reconnect_delay = PARSER_SESSION_MISSING_BACKOFF_SEC
+            if health_notify_callback and not _session_config_alert_sent:
+                _session_config_alert_sent = True
+                try:
+                    await health_notify_callback(
+                        f"❌ *{PARSER_LABEL} не запущен*\n\n{e}\n\n"
+                        f"Бот (aiogram) работает, вакансии не парсятся.\n"
+                        f"Повторная попытка через {PARSER_SESSION_MISSING_BACKOFF_SEC // 60} мин."
+                    )
+                except Exception:
+                    pass
+        except EOFError:
+            msg = (
+                "Telethon запросил телефон интерактивно (EOF) — на сервере нет TTY. "
+                f"Загрузите авторизованный `{session_file_path()}`."
+            )
+            logger.error(f"{PARSER_LABEL}: {msg}")
+            reconnect_delay = PARSER_SESSION_MISSING_BACKOFF_SEC
+            if health_notify_callback and not _session_config_alert_sent:
+                _session_config_alert_sent = True
+                try:
+                    await health_notify_callback(f"❌ *{PARSER_LABEL}*\n\n{msg}")
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Парсер отключился: {e}", exc_info=True)
+        finally:
+            if _realtime_client and _realtime_client.is_connected():
+                try:
+                    await _realtime_client.disconnect()
+                except Exception:
+                    pass
+            _realtime_client = None
+            _monitored_chat_ids.clear()
+
+        logger.warning(f"Переподключение {PARSER_LABEL} через {reconnect_delay} с...")
+        await asyncio.sleep(reconnect_delay)
 
 async def stop_realtime_listener():
     global _realtime_client
@@ -256,9 +406,16 @@ def get_parser_status_snapshot() -> dict:
         "online": online,
         "active_chats": active,
         "monitored": monitored,
+        "session_file": is_session_file_present(),
     }
 
+
 def format_parser_status_line(snapshot: dict) -> str:
+    if not snapshot.get("session_file"):
+        return (
+            f"❌ {PARSER_LABEL}: нет файла `{session_file_path()}`\n"
+            f"   Загрузите авторизованную сессию на сервер (см. docs/DEVELOPMENT.md §11)"
+        )
     if snapshot["online"]:
         line = f"✅ {PARSER_LABEL}: подключён"
     else:
@@ -424,14 +581,70 @@ def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> st
             return "fuzzy"
     return None
 
-def is_message_for_today(message_dt: datetime) -> bool:
+def is_message_recent(message_dt: datetime, max_age_hours: int = None) -> bool:
+    """Вакансия не старше max_age_hours (по умолчанию VACANCY_MAX_AGE_HOURS)."""
     if not message_dt:
         return False
+    hours = max_age_hours if max_age_hours is not None else VACANCY_MAX_AGE_HOURS
     if message_dt.tzinfo is None:
         message_dt = message_dt.replace(tzinfo=timezone.utc)
-    msg_msk = message_dt.astimezone(MOSCOW_TZ)
-    now_msk = datetime.now(MOSCOW_TZ)
-    return msg_msk.date() == now_msk.date()
+    age = datetime.now(timezone.utc) - message_dt.astimezone(timezone.utc)
+    return age <= timedelta(hours=hours)
+
+
+def is_message_for_today(message_dt: datetime) -> bool:
+    """Обратная совместимость — делегирует в is_message_recent."""
+    return is_message_recent(message_dt)
+
+def _normalize_metro_token(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = re.sub(r"[^\w\s\-]", "", value.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    for prefix in ("станция ", "м ", "м."):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    return cleaned
+
+
+def extract_metro_tokens(text: str) -> list:
+    """Станции метро из текста вакансии (нормализованные)."""
+    if not text:
+        return []
+    tokens = set()
+    addr = extract_address_from_text(text)
+    if addr:
+        metro_in_addr = re.search(r"метро\s+([^\n,]{2,50})", addr, re.IGNORECASE)
+        if metro_in_addr:
+            tokens.add(_normalize_metro_token(metro_in_addr.group(1)))
+    for match in re.finditer(
+        r"(?:м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁ\-A-Za-z\s]{2,40})",
+        text,
+        re.IGNORECASE,
+    ):
+        token = _normalize_metro_token(match.group(1))
+        if token and len(token) >= 3:
+            tokens.add(token)
+    return sorted(tokens)
+
+
+def vacancy_matches_user_metro(vacancy_text: str, address: str, user_metro_csv: str) -> bool:
+    """True если у пользователя нет фильтра, в вакансии нет метро, или есть пересечение."""
+    if not user_metro_csv or not user_metro_csv.strip():
+        return True
+    user_zones = [_normalize_metro_token(z) for z in user_metro_csv.split(",") if z.strip()]
+    if not user_zones:
+        return True
+    combined = f"{vacancy_text or ''} {address or ''}"
+    vac_tokens = extract_metro_tokens(combined)
+    if not vac_tokens:
+        return True
+    for vt in vac_tokens:
+        for uz in user_zones:
+            if uz in vt or vt in uz:
+                return True
+    return False
+
 
 async def inspect_parser_chats() -> tuple:
     """Проверка доступа Telethon к чатам из БД. Возвращает (список, статус парсера)."""
@@ -519,6 +732,12 @@ def _keyword_in_text(keyword: str, text_lower: str) -> bool:
         return bool(re.search(pattern, text_lower, re.IGNORECASE))
     return kw in text_lower
 
+_CATEGORY_TIEBREAK = (
+    "loader", "promoter", "hostess", "waiter", "animator", "wardrobe",
+    "driver", "security", "parking", "supervisor", "helper",
+)
+
+
 def detect_category(text: str) -> str:
     if not text:
         return "helper"
@@ -527,12 +746,14 @@ def detect_category(text: str) -> str:
         "loader": [
             "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
             "погрузка", "разгрузка", "такелаж", "такелажник", "выгрузить", "загрузить", "разгрузить",
-            "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка",
+            "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
+            "складской работник", "на склад",
         ],
         "promoter": [
-            "промоутер", "промоутеры", "промоутерша", "промоутером",
+            "промоутер", "промоутеры", "промоутерша", "промоутером", "промо персонал",
             "раздача листовок", "промо-акция", "промоакция", "листовки",
             "привлекать внимание", "приглашать клиентов", "распространение листовок",
+            "промо на", "промо в",
         ],
         "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
         "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
@@ -540,21 +761,40 @@ def detect_category(text: str) -> str:
         "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
         "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
         "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
-        "parking": ["парковщик", "парковка", "паркинг", "парковочный"],
+        "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
         "supervisor": ["супервайзер", "супервизор", "координатор", "тимлид", "старший смены"],
         "helper": [
             "хелпер", "хэлпер", "хелперы", "хэлперы", "helper", "helpers",
             "помощник на мероприятие", "помощник организатора", "волонтер", "ассистент",
+            "помощь на площадке", "помощники на площадке",
         ],
     }
-    best_category = "helper"
-    best_len = 0
+    scores = {}
     for category, keywords in category_map.items():
         for kw in keywords:
-            if _keyword_in_text(kw, text_lower) and len(kw) > best_len:
-                best_len = len(kw)
-                best_category = category
-    return best_category
+            if _keyword_in_text(kw, text_lower):
+                scores[category] = scores.get(category, 0) + len(kw)
+
+    if not scores:
+        return "helper"
+
+    labor_words = ["грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "склад"]
+    promo_words = ["промоутер", "листовок", "промо-акция", "раздача листовок", "промо персонал"]
+    if scores.get("loader") and scores.get("helper") and any(w in text_lower for w in labor_words):
+        return "loader"
+    if scores.get("promoter") and scores.get("helper") and any(w in text_lower for w in promo_words):
+        return "promoter"
+    if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in labor_words):
+        return "loader"
+
+    max_score = max(scores.values())
+    winners = [cat for cat, score in scores.items() if score == max_score]
+    if len(winners) == 1:
+        return winners[0]
+    for preferred in _CATEGORY_TIEBREAK:
+        if preferred in winners:
+            return preferred
+    return winners[0]
 
 def is_helper_message(text: str):
     if not text:
@@ -627,17 +867,10 @@ async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
                 logger.info("🔍 Ручная проверка через shared Telethon client")
                 return await _scan_all_chats(_realtime_client, limit_per_chat=limit_per_chat, stats=LAST_DEBUG_STATS)
 
-            logger.warning(
-                "⚠️ Парсер ещё не подключён — временный Telethon-клиент (может конфликтовать с user_session)"
+            logger.error(
+                f"❌ {PARSER_LABEL} offline — ручная проверка пропущена (не создаём второй user_session)"
             )
-            client = TelegramClient('user_session', API_ID, API_HASH)
-            try:
-                await client.start()
-                logger.info("🔍 Ручная проверка (отдельный Telethon client)")
-                return await _scan_all_chats(client, limit_per_chat=limit_per_chat, stats=LAST_DEBUG_STATS)
-            finally:
-                if client.is_connected():
-                    await client.disconnect()
+            return [], []
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
         return [], []
@@ -649,9 +882,12 @@ async def run_parser():
     return orders, closed_data
 
 async def test_filter(chat_link: str, limit: int = 30):
-    client = TelegramClient('user_session', API_ID, API_HASH)
     try:
-        await client.start()
+        client = await create_authorized_client()
+    except SessionNotConfiguredError as e:
+        logger.error(str(e))
+        return
+    try:
         logger.info(f"\n{'='*60}")
         logger.info(f"🧪 ТЕСТ ФИЛЬТРА: {chat_link}")
         logger.info(f"{'='*60}\n")
