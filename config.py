@@ -41,7 +41,19 @@ def _resolve_telegram_session_name() -> str:
         if os.path.isfile(f"{base}.session"):
             return base
 
-    # Для сообщения об ошибке — куда класть файл в первую очередь
+    # Bothost иногда сохраняет upload как tmpXXXX.session — берём единственный .session в shared
+    for shared_root in filter(None, [SHARED_DIR or None, "/app/shared" if os.path.isdir("/app/shared") else None]):
+        try:
+            session_files = sorted(
+                f for f in os.listdir(shared_root)
+                if f.endswith(".session") and not f.endswith(".session-journal")
+            )
+        except OSError:
+            continue
+        if len(session_files) == 1:
+            fname = session_files[0]
+            return os.path.join(shared_root, fname[: -len(".session")])
+
     if SHARED_DIR:
         return os.path.join(SHARED_DIR, "user_session")
     if os.path.isdir("/app/shared"):

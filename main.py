@@ -201,10 +201,10 @@ class AddChatState(StatesGroup):
 class PostVacancyState(StatesGroup):
     waiting_for_category = State()
     waiting_for_text = State()
+    waiting_for_photo = State()
 
 class MetroState(StatesGroup):
     waiting_for_zones = State()
-    waiting_for_photo = State()
 
 class RespondWithPhotoState(StatesGroup):
     waiting_for_photo = State()
