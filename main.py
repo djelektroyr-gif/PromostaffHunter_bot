@@ -1,11 +1,12 @@
 import asyncio
+import os
 import re
 import logging
 from datetime import datetime, timezone
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -35,6 +36,31 @@ dp = Dispatcher(storage=storage)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 FREE_CATEGORY_LIMIT = 3
+
+
+async def safe_callback_answer(
+    callback: types.CallbackQuery,
+    text: str | None = None,
+    show_alert: bool = False,
+) -> bool:
+    """answer_callback_query; не падаем на просроченной кнопке (старая клавиатура после деплоя)."""
+    try:
+        await callback.answer(text=text, show_alert=show_alert)
+        return True
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if any(
+            x in err
+            for x in ("query is too old", "query id is invalid", "response timeout expired")
+        ):
+            logger.debug(
+                "Просроченный callback %r от user %s",
+                callback.data,
+                callback.from_user.id,
+            )
+            return False
+        raise
+
 
 async def send_message_with_retry(user_id: int, **kwargs):
     """Отправка с одним повтором при FloodWait."""
@@ -689,16 +715,17 @@ async def select_category(callback: types.CallbackQuery):
     current_codes = [c['code'] for c in get_user_categories(user_id)]
     if category_code in current_codes:
         current_codes.remove(category_code)
-        await callback.answer(f"❌ Категория удалена", show_alert=False)
+        await safe_callback_answer(callback, "❌ Категория удалена")
     else:
         if not is_user_premium(user_id) and len(current_codes) >= FREE_CATEGORY_LIMIT:
-            await callback.answer(
+            await safe_callback_answer(
+                callback,
                 f"🆓 Бесплатно — до {FREE_CATEGORY_LIMIT} категорий. Premium — без лимита (💎 Подписка).",
                 show_alert=True,
             )
             return
         current_codes.append(category_code)
-        await callback.answer(f"✅ Категория добавлена", show_alert=False)
+        await safe_callback_answer(callback, "✅ Категория добавлена")
     set_user_categories(user_id, current_codes)
 
     updated_codes = [c['code'] for c in get_user_categories(user_id)]
@@ -732,21 +759,26 @@ async def finish_categories(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     categories = get_user_categories(user_id)
     if not categories:
-        await callback.answer("⚠️ Вы не выбрали ни одной категории!", show_alert=True)
+        await safe_callback_answer(callback, "⚠️ Вы не выбрали ни одной категории!", show_alert=True)
         return
     if not is_user_premium(user_id) and len(categories) > FREE_CATEGORY_LIMIT:
-        await callback.answer(
+        await safe_callback_answer(
+            callback,
             f"🆓 На бесплатном тарифе — до {FREE_CATEGORY_LIMIT} категорий.",
             show_alert=True,
         )
         return
+    await safe_callback_answer(callback)
     categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
     keyboard, status_text = get_main_keyboard(user_id)
     trial_granted = grant_trial_if_eligible(user_id, TRIAL_DAYS)
     trial_line = ""
     if trial_granted:
         trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро включены!"
-    await callback.message.delete()
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
     await callback.message.answer(
         f"✅ *Вы подписались на вакансии!*\n\n"
         f"📌 Ваши категории:\n{categories_text}\n\n"
@@ -756,7 +788,6 @@ async def finish_categories(callback: types.CallbackQuery):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-    await callback.answer()
 
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
 
@@ -1782,6 +1813,22 @@ async def on_startup():
     if migrated:
         logger.info(f"🔄 Миграция ID вакансий: обновлено {migrated} записей")
     logger.info("📁 База данных инициализирована")
+
+    from config import get_shared_dir
+    from parser import session_file_path
+
+    shared = get_shared_dir()
+    if shared:
+        logger.info(f"📂 Shared volume: {shared}")
+    session_path = session_file_path()
+    logger.info(f"📎 Telethon session: {session_path}")
+    if shared and session_path.startswith(shared) and os.path.isfile(session_path):
+        logger.info("✅ Сессия в shared — переживёт git-deploy")
+    elif not os.path.isfile(session_path):
+        logger.warning(
+            "⚠️ Файл сессии не найден — парсер не стартует. "
+            "Загрузите user_session.session в /app/shared на Bothost."
+        )
 
     # Парсер групп (Telethon) — reconnect, health alerts, session lock
     spawn_background_task(

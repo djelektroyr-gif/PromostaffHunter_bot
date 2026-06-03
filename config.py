@@ -1,6 +1,10 @@
 import os
+import shutil
+import logging
 from dotenv import load_dotenv
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # PostgreSQL (прод Bothost): если задан — вместо SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -25,6 +29,50 @@ API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH")
 # Bothost / shared volume: $SHARED_DIR → /app/shared/user_session.session
 SHARED_DIR = os.getenv("SHARED_DIR", "").strip()
+_session_migrate_done = False
+
+
+def get_shared_dir() -> str | None:
+    """Bothost «Общее хранилище» — переживает git-deploy."""
+    for path in (SHARED_DIR, "/app/shared"):
+        if path and os.path.isdir(path):
+            return path
+    return None
+
+
+def get_default_session_name() -> str:
+    shared = get_shared_dir()
+    if shared:
+        return os.path.join(shared, "user_session")
+    return "user_session"
+
+
+def migrate_legacy_session_to_shared() -> str | None:
+    """Копирует user_session.session из /app в shared, если в shared ещё нет."""
+    shared = get_shared_dir()
+    if not shared:
+        return None
+    target_base = os.path.join(shared, "user_session")
+    target_file = f"{target_base}.session"
+    if os.path.isfile(target_file) and os.path.getsize(target_file) > 64:
+        return target_base
+
+    legacy_candidates = [
+        "/app/user_session.session",
+        os.path.join(os.getcwd(), "user_session.session"),
+        "user_session.session",
+    ]
+    for legacy in legacy_candidates:
+        if not os.path.isfile(legacy) or os.path.getsize(legacy) <= 64:
+            continue
+        os.makedirs(shared, exist_ok=True)
+        shutil.copy2(legacy, target_file)
+        journal = f"{legacy}-journal"
+        if os.path.isfile(journal):
+            shutil.copy2(journal, f"{target_file}-journal")
+        logger.info("Telethon session перенесена: %s → %s", legacy, target_file)
+        return target_base
+    return None
 
 
 def _session_search_dirs() -> list[str]:
@@ -53,17 +101,22 @@ def _pick_session_from_dir(directory: str) -> str | None:
 
 
 def get_telegram_session_name() -> str:
-    """Путь к сессии Telethon (без .session). Имя файла может быть любым — tmp*.session тоже."""
+    """Путь к сессии Telethon (без .session). Bothost: предпочитаем /app/shared."""
+    global _session_migrate_done
     explicit = os.getenv("TELEGRAM_SESSION_NAME", "").strip()
     if explicit:
         return explicit
+
+    if not _session_migrate_done:
+        migrate_legacy_session_to_shared()
+        _session_migrate_done = True
 
     for directory in _session_search_dirs():
         picked = _pick_session_from_dir(directory)
         if picked:
             return picked
 
-    return "user_session"
+    return get_default_session_name()
 
 
 def describe_session_search() -> str:

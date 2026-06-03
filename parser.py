@@ -63,7 +63,8 @@ async def create_authorized_client() -> TelegramClient:
     if not os.path.isfile(path):
         raise SessionNotConfiguredError(
             f"Файл {path} не найден. {describe_session_search()}\n"
-            "Положите любой *.session в /app или /app/shared — переименовывать не нужно."
+            "Bothost: включите «Общее хранилище» и положите *.session в /app/shared "
+            "(или один раз в /app — перенесётся автоматически)."
         )
     if not API_ID or not API_HASH:
         raise SessionNotConfiguredError("Задайте API_ID и API_HASH в переменных окружения.")
