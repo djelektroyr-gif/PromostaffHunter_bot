@@ -68,11 +68,13 @@ class CategorySelectionState(StatesGroup):
 
 # ========== ПЕРИОДИЧЕСКИЙ ПОЛЛИНГ ==========
 async def periodic_polling():
-    await asyncio.sleep(2)  # Даём время завершиться стартовому парсингу
+    logger.info("📡 Периодическая задача запущена, ожидание 2 секунды...")
+    await asyncio.sleep(2)
+    logger.info("📡 Начинаю бесконечный цикл проверки")
     while True:
         try:
             logger.info("🔍 Периодическая проверка новых сообщений...")
-            orders, closed_data = await get_new_messages(limit_per_chat=100)
+            orders, closed_data = await get_new_messages(limit_per_chat=300)   # <-- увеличено с 100 до 300
             if closed_data:
                 await notify_closed_vacancies(closed_data)
             for order in orders:
@@ -860,6 +862,17 @@ async def already_responded(callback: types.CallbackQuery):
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    
+    # Администратор – сразу показываем админ-меню
+    if user_id == YOUR_USER_ID:
+        keyboard = get_admin_keyboard()
+        await message.answer(
+            "👑 *Панель администратора*\n\nИспользуйте кнопки меню для управления.",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
+        return
+    
     profile = get_subscriber_profile(user_id)
     
     if profile and profile.get("full_name"):
@@ -1398,7 +1411,7 @@ async def on_startup():
     logger.info("📁 База данных инициализирована")
 
     logger.info("🔄 Однократная проверка новых сообщений...")
-    orders, closed = await get_new_messages(limit_per_chat=200)
+    orders, closed = await get_new_messages(limit_per_chat=300)
     if closed:
         await notify_closed_vacancies(closed)
     for order in orders:
@@ -1407,11 +1420,9 @@ async def on_startup():
     logger.info("✅ Однократная проверка завершена")
     await asyncio.sleep(2)   # даём время на освобождение ресурсов Telethon
 
-    asyncio.create_task(periodic_polling())   # используем глобальную функцию
+    asyncio.create_task(periodic_polling())
+    logger.info("📡 Задача periodic_polling создана")
     logger.info("📡 Периодический поллинг запущен (интервал 60 секунд)")
-
-    logger.info("📡 Запуск polling...")
-    await dp.start_polling(bot)
 
 async def on_shutdown():
     logger.info("🛑 Остановка бота...")
