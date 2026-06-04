@@ -6,6 +6,8 @@ Telegram-бот для парсинга вакансий (хелперы, гру
 
 **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** — живой конспект для разработки: архитектура, админка, парсер, подписка (trial + ручная оплата), бэклог, деплой.
 
+**[docs/SUBSCRIPTION.md](docs/SUBSCRIPTION.md)** — полная логика подписки: тарифы, статусы `premium_requests`, сценарий оплаты с чеком, инструменты админа.
+
 ## Быстрый старт
 
 1. Скопировать `.env` (см. `config.example.py` / переменные в DEVELOPMENT.md).

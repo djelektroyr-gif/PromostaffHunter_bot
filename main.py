@@ -2,7 +2,8 @@ import asyncio
 import os
 import re
 import logging
-from datetime import datetime, timezone, date
+from html import escape as escape_html
+from datetime import datetime, timezone, date, timedelta
 from urllib.parse import quote
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -34,11 +35,21 @@ dp = Dispatcher(storage=storage)
 
 # Flood control для рассылки (пауза между отправками)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
+MSK_TZ = timezone(timedelta(hours=3))
+_vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллельных push-рассылок
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 FREE_CATEGORY_LIMIT = 3
 RESPONSES_PAGE_SIZE = 5
 PREMIUM_RENEWAL_WARN_DAYS = 7
+PREMIUM_DEFAULT_DAYS = 30
 _processing_finish: set[int] = set()
+
+
+def escape_markdown(text: str) -> str:
+    if not text:
+        return ""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 
 def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> str:
@@ -125,31 +136,60 @@ def subscription_action_buttons(user_id: int) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
-async def notify_admin_premium_request(
-    user_id: int,
-    username: str,
-    name: str,
-    phone: str,
-    categories: str,
-    is_renewal: bool = False,
-):
+def premium_request_admin_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"✅ Активировать {PREMIUM_DEFAULT_DAYS} дн.",
+                callback_data=f"pr_a_{request_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"pr_r_{request_id}",
+            ),
+        ],
+    ])
+
+
+def format_premium_request_admin_caption(req: dict) -> str:
+    title = "💳 *Запрос продления Premium*" if req.get("is_renewal") else "💳 *Запрос Premium*"
+    pending = count_pending_premium_requests()
+    return (
+        f"{title} #{req['id']} (в очереди: {pending})\n\n"
+        f"👤 {escape_markdown(req.get('full_name') or '—')}\n"
+        f"ID: `{req['user_id']}`\n"
+        f"Username: @{req.get('username') or '—'}\n"
+        f"📞 {escape_markdown(str(req.get('phone') or '—'))}\n"
+        f"📋 {escape_markdown(str(req.get('category_codes') or '—'))}\n"
+        f"🕐 {req.get('created_at') or '—'}"
+    )
+
+
+async def send_admin_premium_request_alert(request_id: int):
     if not YOUR_USER_ID:
         return
-    pending = count_pending_premium_requests()
-    title = "💳 *Запрос продления Premium*" if is_renewal else "💳 *Запрос Premium*"
+    req = get_premium_request(request_id)
+    if not req or req.get("status") != "pending":
+        return
+    caption = format_premium_request_admin_caption(req)
+    markup = premium_request_admin_keyboard(request_id)
+    file_id = req.get("receipt_file_id")
+    kind = req.get("receipt_kind")
     try:
-        await bot.send_message(
-            YOUR_USER_ID,
-            f"{title} (#{pending})\n\n"
-            f"👤 {name}\n"
-            f"ID: `{user_id}`\n"
-            f"Username: @{username or '—'}\n"
-            f"📞 {phone or '—'}\n"
-            f"📋 Категории: {categories or '—'}\n\n"
-            f"После оплаты:\n"
-            f"`/setplan {user_id} premium 30`",
-            parse_mode="Markdown",
-        )
+        if file_id and kind == "photo":
+            await bot.send_photo(
+                YOUR_USER_ID, file_id, caption=caption,
+                parse_mode="Markdown", reply_markup=markup,
+            )
+        elif file_id and kind == "document":
+            await bot.send_document(
+                YOUR_USER_ID, file_id, caption=caption,
+                parse_mode="Markdown", reply_markup=markup,
+            )
+        else:
+            await bot.send_message(
+                YOUR_USER_ID, caption, parse_mode="Markdown", reply_markup=markup,
+            )
     except Exception as e:
         logger.warning(f"premium_request notify admin: {e}")
 
@@ -288,46 +328,80 @@ def format_subscription_screen(user_id: int) -> str:
     profile = get_subscriber_profile(user_id)
     paid_until = profile.get("paid_until") if profile else None
     trial_used = profile.get("trial_used") if profile else False
-    pay_heading = "*Продление:*" if premium else "*Оплата (вручную):*"
+    pay_heading = "<b>Продление:</b>" if premium else "<b>Оплата (вручную):</b>"
     if premium:
-        until_line = f"Действует до: *{format_db_date_short(paid_until)}*" if paid_until else "Без ограничения по сроку"
-        status = f"💎 *Premium активен*\n{until_line}"
+        until_str = escape_html(format_db_date_short(paid_until))
+        until_line = f"Действует до: <b>{until_str}</b>" if paid_until else "Без ограничения по сроку"
+        status = f"💎 <b>Premium активен</b>\n{until_line}"
         until_dt = _coerce_db_datetime(paid_until)
         if until_dt:
             days_left = (until_dt - datetime.now(timezone.utc)).days
             if days_left <= PREMIUM_RENEWAL_WARN_DAYS:
-                status += f"\n⏳ Осталось *{max(days_left, 0)}* дн. — продлите кнопками ниже."
+                status += f"\n⏳ Осталось <b>{max(days_left, 0)}</b> дн. — продлите кнопками ниже."
     else:
         status = (
-            "🆓 *Бесплатный доступ*\n"
+            "🆓 <b>Бесплатный доступ</b>\n"
             "Лента «🔍 Посмотреть новые вакансии» — без моментальных push"
         )
     pay_lines = []
     if SUBSCRIPTION_CARD_HINT:
-        pay_lines.append(f"💳 *Реквизиты:* {SUBSCRIPTION_CARD_HINT}")
-    pay_lines.append(f"💰 *Сумма:* {SUBSCRIPTION_PRICE_RUB} ₽/мес")
-    pay_lines.append(f"В комментарии к переводу укажите ваш Telegram ID: `{user_id}`")
+        pay_lines.append(f"💳 <b>Реквизиты:</b> {escape_html(SUBSCRIPTION_CARD_HINT)}")
+    pay_lines.append(f"💰 <b>Сумма:</b> {escape_html(SUBSCRIPTION_PRICE_RUB)} ₽/мес")
+    pay_lines.append(f"В комментарии к переводу укажите ваш Telegram ID: <code>{user_id}</code>")
     if SUBSCRIPTION_PAY_URL:
-        pay_lines.append(f"Или оплатите по ссылке: {SUBSCRIPTION_PAY_URL}")
+        pay_lines.append(f"Или оплатите по ссылке:\n{escape_html(SUBSCRIPTION_PAY_URL)}")
     else:
-        action = "продления" if premium else "Premium"
+        action = escape_html("продления" if premium else "Premium")
         pay_lines.append(
-            f"После перевода напишите {SUBSCRIPTION_SUPPORT} или нажмите «Запросить {action}» ниже."
+            f"После перевода напишите {escape_html(SUBSCRIPTION_SUPPORT)} "
+            f"или нажмите «Запросить {action}» ниже."
         )
     pay_block = "\n".join(pay_lines)
     trial_hint = ""
     if not trial_used and TRIAL_DAYS > 0 and not premium:
-        trial_hint = f"\n\n🎁 Новым пользователям — пробный Premium *{TRIAL_DAYS} дн.* после выбора категорий."
+        trial_hint = (
+            f"\n\n🎁 Новым пользователям — пробный Premium "
+            f"<b>{TRIAL_DAYS} дн.</b> после выбора категорий."
+        )
     return (
-        f"💎 *Подписка Promostaff Hunter*\n\n"
+        f"💎 <b>Подписка Promostaff Hunter</b>\n\n"
         f"{status}\n\n"
-        f"*Premium даёт:*\n"
+        f"<b>Premium даёт:</b>\n"
         f"• моментальные push-уведомления\n"
         f"• все категории без лимита\n"
         f"• фильтр по метро/району (📍 Мои районы)\n\n"
-        f"*Free:* до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
+        f"<b>Free:</b> до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
         f"{pay_heading}\n{pay_block}{trial_hint}"
     )
+
+
+async def send_subscription_screen(
+    message: types.Message,
+    user_id: int,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    edit: bool = False,
+):
+    """Экран подписки: HTML + fallback без разметки (env с _, &, < не ломают Telegram)."""
+    text = format_subscription_screen(user_id)
+    try:
+        if edit:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if edit and "message is not modified" in err:
+            return
+        if "parse" in err and "entit" in err:
+            logger.warning("subscription screen HTML rejected, plain fallback: %s", e)
+            plain = re.sub(r"<[^>]*>", "", text)
+            if edit:
+                await message.edit_text(plain, reply_markup=reply_markup)
+            else:
+                await message.answer(plain, reply_markup=reply_markup)
+            return
+        raise
 
 
 async def notify_admin_parser_issue(text: str):
@@ -388,13 +462,10 @@ class RespondWithPhotoState(StatesGroup):
 class ResponseDraftState(StatesGroup):
     waiting_for_comment = State()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+class PremiumPaymentState(StatesGroup):
+    waiting_for_receipt = State()
 
-def escape_markdown(text: str) -> str:
-    if not text:
-        return ""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
     emojis = {
@@ -475,10 +546,11 @@ def format_db_datetime_short(raw_dt) -> str:
 
 
 def format_publication_time(raw_dt) -> str:
+    """Время поста в канале (Telethon UTC) → отображение в МСК."""
     dt = _coerce_db_datetime(raw_dt)
     if dt is None:
         return "сейчас"
-    return dt.strftime("%d.%m.%Y %H:%M")
+    return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M МСК")
 
 
 def get_freshness_label(raw_dt) -> str:
@@ -561,6 +633,16 @@ def build_contact_link(contact: str, text: str) -> str:
 
 # ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
 
+async def dispatch_vacancy_push(order: dict):
+    """Очередь push: не блокирует Telethon-парсер на время рассылки."""
+    async with _vacancy_push_sem:
+        await send_vacancy_to_subscribers(order)
+
+
+def schedule_vacancy_push(order: dict):
+    spawn_background_task(dispatch_vacancy_push(order))
+
+
 async def send_vacancy_to_subscribers(order: dict):
     category_code = order.get('category', detect_category(order['message_text']))
     dedupe_key = order.get("dedupe_key")
@@ -628,7 +710,8 @@ async def send_vacancy_to_subscribers(order: dict):
         f"Вакансия {vacancy_id} (категория {category_code}): push {sent_count}, "
         f"free skip {skipped_free}, metro skip {skipped_metro}"
     )
-    mark_vacancy_sent(vacancy_id)
+    if sent_count > 0:
+        mark_vacancy_sent(vacancy_id)
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
@@ -917,10 +1000,8 @@ async def subscription_from_categories(callback: types.CallbackQuery):
         inline_keyboard=(buttons.inline_keyboard if buttons else []) + nav
     )
     try:
-        await callback.message.edit_text(
-            format_subscription_screen(user_id),
-            parse_mode="Markdown",
-            reply_markup=markup,
+        await send_subscription_screen(
+            callback.message, user_id, reply_markup=markup, edit=True,
         )
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -1066,44 +1147,125 @@ async def responses_page_callback(callback: types.CallbackQuery):
 
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
 
-@dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
-async def show_new_vacancies(message: types.Message):
-    user_id = message.from_user.id
+def _feed_metro_context(user_id: int) -> tuple[bool, str | None]:
+    profile = get_subscriber_profile(user_id)
+    metro_zones = profile.get("metro_zones") if profile else None
+    apply_metro = bool(is_user_premium(user_id) and metro_zones)
+    return apply_metro, metro_zones
+
+
+def _feed_vacancies_for_category(user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None) -> list:
+    vacancies = get_feed_vacancies_for_user(user_id, cat["code"])
+    result = []
+    for vac in vacancies:
+        if apply_metro and not vacancy_matches_user_metro(
+            vac.get("text", ""), vac.get("address"), metro_zones
+        ):
+            continue
+        vac["category"] = cat
+        result.append(vac)
+    return result
+
+
+def _collect_feed_vacancies(user_id: int, category_codes: list[str] | None = None) -> list:
+    apply_metro, metro_zones = _feed_metro_context(user_id)
+    user_categories = get_user_categories(user_id)
+    if category_codes is not None:
+        codes = set(category_codes)
+        user_categories = [c for c in user_categories if c["code"] in codes]
+    all_vacancies = []
+    for cat in user_categories:
+        all_vacancies.extend(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones))
+    all_vacancies.sort(key=lambda v: v.get("found_at") or "", reverse=True)
+    return all_vacancies
+
+
+def _feed_count_for_category(user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None) -> int:
+    return len(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones))
+
+
+def build_feed_category_keyboard(user_id: int) -> tuple[InlineKeyboardMarkup, int]:
+    user_categories = get_user_categories(user_id)
+    apply_metro, metro_zones = _feed_metro_context(user_id)
+    buttons, row = [], []
+    total = 0
+    for i, cat in enumerate(user_categories):
+        count = _feed_count_for_category(user_id, cat, apply_metro, metro_zones)
+        total += count
+        row.append(InlineKeyboardButton(
+            text=f"{cat['emoji']} {cat['name']} ({count})",
+            callback_data=f"feed_cat_{cat['code']}",
+        ))
+        if len(row) == 2 or i == len(user_categories) - 1:
+            buttons.append(row)
+            row = []
+    if total > 0:
+        buttons.append([InlineKeyboardButton(text=f"📋 Все категории ({total})", callback_data="feed_all")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons), total
+
+
+async def show_feed_category_menu(message: types.Message, user_id: int):
     user_categories = get_user_categories(user_id)
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «📋 Категории»")
         return
-
-    all_vacancies = []
-    profile = get_subscriber_profile(user_id)
-    metro_zones = profile.get("metro_zones") if profile else None
-    apply_metro = is_user_premium(user_id) and metro_zones
-    for cat in user_categories:
-        vacancies = get_unsent_vacancies_by_category(cat['code'])
-        for vac in vacancies:
-            if apply_metro and not vacancy_matches_user_metro(
-                vac.get('text', ''), vac.get('address'), metro_zones
-            ):
-                continue
-            vac['category'] = cat
-            all_vacancies.append(vac)
-
-    if not all_vacancies:
-        hint = ""
-        if apply_metro:
-            hint = "\n\nПопробуйте расширить список в «📍 Мои районы» или сбросить фильтр («-»)."
+    markup, total = build_feed_category_keyboard(user_id)
+    apply_metro, _ = _feed_metro_context(user_id)
+    hint = ""
+    if apply_metro:
+        hint = "\n\n📍 Учитывается фильтр «Мои районы»."
+    if total == 0:
         await message.answer(
-            f"🔍 Новых вакансий по вашим категориям пока нет.{hint}\n\n"
-            f"Я продолжаю мониторинг — Premium получает push сразу.",
+            f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
+            f"{'💎 Premium — push сразу в чат.' if is_user_premium(user_id) else 'Я продолжаю мониторинг.'}",
+            parse_mode="Markdown",
         )
         return
+    await message.answer(
+        f"🔍 *Лента вакансий* — выберите категорию ({total} новых):{hint}",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
 
+
+async def open_feed_vacancies(message: types.Message, user_id: int, category_codes: list[str] | None = None):
+    all_vacancies = _collect_feed_vacancies(user_id, category_codes)
+    if not all_vacancies:
+        apply_metro, _ = _feed_metro_context(user_id)
+        hint = "\n\nПопробуйте расширить «📍 Мои районы»." if apply_metro else ""
+        await message.answer(f"🔍 В этой категории новых вакансий нет.{hint}", parse_mode="Markdown")
+        return
     user_pages[user_id] = {
         "vacancies": all_vacancies,
         "page": 0,
-        "total": len(all_vacancies)
+        "total": len(all_vacancies),
+        "feed_filter": category_codes,
     }
     await send_vacancy_page(message, user_id, 0)
+
+
+@dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
+async def show_new_vacancies(message: types.Message):
+    await show_feed_category_menu(message, message.from_user.id)
+
+
+@dp.callback_query(lambda c: c.data == "feed_all")
+async def feed_all_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    await open_feed_vacancies(callback.message, callback.from_user.id, category_codes=None)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("feed_cat_"))
+async def feed_category_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    code = callback.data.replace("feed_cat_", "", 1)
+    await open_feed_vacancies(callback.message, callback.from_user.id, category_codes=[code])
+
+
+@dp.callback_query(lambda c: c.data == "feed_menu")
+async def feed_menu_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    await show_feed_category_menu(callback.message, callback.from_user.id)
 
 
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
@@ -1147,6 +1309,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"vac_page_{page-1}"))
     if end < total:
         nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"vac_page_{page+1}"))
+    nav_buttons.append(InlineKeyboardButton(text="📋 К категориям", callback_data="feed_menu"))
     if nav_buttons:
         nav_markup = InlineKeyboardMarkup(inline_keyboard=[nav_buttons])
         await message.answer("📄 *Навигация*", parse_mode="Markdown", reply_markup=nav_markup)
@@ -1178,49 +1341,172 @@ async def subscription_menu(message: types.Message):
         )
         return
     buttons = subscription_action_buttons(user_id)
-    await message.answer(
-        format_subscription_screen(user_id),
-        parse_mode="Markdown",
-        reply_markup=buttons,
-    )
+    await send_subscription_screen(message, user_id, reply_markup=buttons)
 
 
 @dp.callback_query(lambda c: c.data in ("subscription_request", "subscription_renew"))
-async def subscription_request_callback(callback: types.CallbackQuery):
+async def subscription_request_callback(callback: types.CallbackQuery, state: FSMContext):
     is_renewal = callback.data == "subscription_renew"
-    await safe_callback_answer(callback, "Запрос отправлен")
+    await safe_callback_answer(callback, "Дальше — чек об оплате")
     user_id = callback.from_user.id
     profile = get_subscriber_profile(user_id)
     name = profile.get("full_name") if profile else callback.from_user.first_name
     phone = profile.get("phone") if profile else None
     cats = ", ".join(c["name"] for c in get_user_categories(user_id)) or "—"
-    add_premium_request(
+    request_id = add_premium_request(
         user_id,
         callback.from_user.username,
         name,
         phone,
         cats,
+        is_renewal=is_renewal,
+    )
+    await state.set_state(PremiumPaymentState.waiting_for_receipt)
+    await state.update_data(premium_request_id=request_id, premium_is_renewal=is_renewal)
+    pay_hint = (
+        f"Переведите <b>{escape_html(SUBSCRIPTION_PRICE_RUB)} ₽</b> "
+        f"по реквизитам из раздела 💎 Подписка.\n"
+        f"В комментарии укажите ID: <code>{user_id}</code>\n\n"
     )
     if is_renewal:
-        user_text = (
-            f"✅ *Запрос на продление Premium принят*\n\n"
-            f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
-            f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
-            f"В комментарии укажите ID: `{user_id}`\n\n"
-            f"После проверки оплаты срок Premium будет *продлён*."
+        intro = "✅ <b>Запрос на продление Premium</b>\n\n"
+        tail = "После проверки срок Premium будет <b>продлён</b>."
+    else:
+        intro = "✅ <b>Запрос на Premium</b>\n\n"
+        tail = "После проверки включим Premium — можно будет выбрать больше категорий."
+    await callback.message.answer(
+        f"{intro}{pay_hint}"
+        f"📎 <b>Пришлите скрин чека</b> — фото или PDF-документ.\n\n"
+        f"{tail}\n\n"
+        f"Отмена — напишите «Отмена».",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(PremiumPaymentState.waiting_for_receipt)
+async def premium_payment_receipt(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    request_id = data.get("premium_request_id")
+    if not request_id:
+        await state.clear()
+        await message.answer("❌ Сессия запроса истекла. Начните снова: 💎 Подписка.")
+        return
+    if message.text and message.text.strip().lower() in ("отмена", "cancel", "/cancel"):
+        cancel_premium_request_awaiting(user_id, request_id)
+        await state.clear()
+        await message.answer("❌ Запрос отменён. Когда будете готовы — снова 💎 Подписка.")
+        return
+    file_id = None
+    kind = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        kind = "photo"
+    elif message.document:
+        file_id = message.document.file_id
+        kind = "document"
+    if not file_id:
+        await message.answer(
+            "📎 Нужен скрин перевода — отправьте <b>фото</b> или <b>файл</b> (PDF).\n"
+            "Отмена — «Отмена».",
+            parse_mode="HTML",
+        )
+        return
+    if not attach_premium_request_receipt(request_id, user_id, file_id, kind):
+        await state.clear()
+        await message.answer("❌ Запрос не найден или уже обработан. Начните снова: 💎 Подписка.")
+        return
+    await state.clear()
+    is_renewal = data.get("premium_is_renewal")
+    if is_renewal:
+        confirm = (
+            "✅ <b>Чек получен</b>\n\n"
+            "Администратор проверит оплату и продлит Premium. "
+            "Подтверждение придёт сюда."
         )
     else:
-        user_text = (
-            f"✅ *Запрос на Premium принят*\n\n"
-            f"Переведите *{SUBSCRIPTION_PRICE_RUB} ₽* "
-            f"{'и пришлите скрин ' + SUBSCRIPTION_SUPPORT if not SUBSCRIPTION_PAY_URL else ''}\n"
-            f"В комментарии укажите ID: `{user_id}`\n\n"
-            f"После проверки оплаты включим Premium — можно будет выбрать больше категорий."
+        confirm = (
+            "✅ <b>Чек получен</b>\n\n"
+            "Администратор проверит оплату и активирует Premium. "
+            "Подтверждение придёт сюда."
         )
-    await callback.message.answer(user_text, parse_mode="Markdown")
-    await notify_admin_premium_request(
-        user_id, callback.from_user.username, name, phone, cats, is_renewal=is_renewal
-    )
+    await message.answer(confirm, parse_mode="HTML")
+    await send_admin_premium_request_alert(request_id)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("pr_a_"))
+async def premium_request_approve_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback, "Нет доступа", show_alert=True)
+        return
+    try:
+        request_id = int(callback.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
+        return
+    req = get_premium_request(request_id)
+    if not req or req.get("status") != "pending":
+        await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
+        return
+    target_id = req["user_id"]
+    was_active = is_user_premium(target_id)
+    notified = await activate_premium_for_user(target_id, PREMIUM_DEFAULT_DAYS)
+    mode = "продлён" if was_active else "активирован"
+    await safe_callback_answer(callback, f"Premium {mode}")
+    try:
+        suffix = f"\n\n✅ Premium {mode} на {PREMIUM_DEFAULT_DAYS} дн."
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + suffix,
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + suffix,
+                reply_markup=None,
+            )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("pr_r_"))
+async def premium_request_reject_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback, "Нет доступа", show_alert=True)
+        return
+    try:
+        request_id = int(callback.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
+        return
+    target_id = reject_premium_request(request_id)
+    if not target_id:
+        await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
+        return
+    await safe_callback_answer(callback, "Отклонено")
+    try:
+        await bot.send_message(
+            target_id,
+            "❌ *Запрос Premium отклонён.*\n\n"
+            "Если это ошибка или нужна помощь — ❓ Поддержка.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить {target_id} об отклонении Premium: {e}")
+    try:
+        suffix = "\n\n❌ Отклонено"
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + suffix,
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + suffix,
+                reply_markup=None,
+            )
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(lambda m: m.text == "📍 Мои районы")
@@ -2008,17 +2294,27 @@ async def admin_premium_requests_button(message: types.Message):
     if not requests:
         await message.answer("📭 Нет ожидающих запросов Premium.")
         return
-    lines = [f"💳 *Запросы Premium* ({len(requests)}):\n"]
+    await message.answer(f"💳 *Запросы Premium* — {len(requests)} в очереди:", parse_mode="Markdown")
     for req in requests:
-        lines.append(
-            f"\n#{req['id']} · `{req['user_id']}`\n"
-            f"👤 {req['full_name'] or '—'}\n"
-            f"@{req['username'] or '—'} · 📞 {req['phone'] or '—'}\n"
-            f"📋 {req['category_codes'] or '—'}\n"
-            f"🕐 {req['created_at']}\n"
-            f"→ `/setplan {req['user_id']} premium 30`"
-        )
-    await send_long_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
+        caption = format_premium_request_admin_caption(req)
+        markup = premium_request_admin_keyboard(req["id"])
+        file_id = req.get("receipt_file_id")
+        kind = req.get("receipt_kind")
+        try:
+            if file_id and kind == "photo":
+                await bot.send_photo(
+                    message.chat.id, file_id, caption=caption,
+                    parse_mode="Markdown", reply_markup=markup,
+                )
+            elif file_id and kind == "document":
+                await bot.send_document(
+                    message.chat.id, file_id, caption=caption,
+                    parse_mode="Markdown", reply_markup=markup,
+                )
+            else:
+                await message.answer(caption, parse_mode="Markdown", reply_markup=markup)
+        except Exception as e:
+            logger.warning(f"admin premium request card #{req['id']}: {e}")
 
 
 @dp.message(lambda m: m.text == "🗂️ Карточки пользователей")
@@ -2143,7 +2439,7 @@ async def on_startup():
     # Парсер групп (Telethon) — reconnect, health alerts, session lock
     spawn_background_task(
         start_realtime_listener(
-            send_vacancy_to_subscribers,
+            schedule_vacancy_push,
             notify_closed_vacancies,
             health_notify_callback=notify_admin_parser_issue,
         )

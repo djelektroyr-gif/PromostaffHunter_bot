@@ -247,7 +247,7 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
             if closed_data and closed_callback:
                 await closed_callback(closed_data)
             for order in orders:
-                await bot_callback(order)
+                bot_callback(order)
             if orders or closed_data:
                 logger.info(
                     f"🔄 Плановая проверка: отправлено {len(orders)} вакансий, "
@@ -341,7 +341,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
             if startup_closed and closed_callback:
                 await closed_callback(startup_closed)
             for order in startup_orders:
-                await bot_callback(order)
+                bot_callback(order)
             logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
 
             spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
@@ -363,7 +363,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                         if closed_callback and result.get("users"):
                             await closed_callback([(result["vacancy_id"], result["users"])])
                     elif result:
-                        await bot_callback(result)
+                        bot_callback(result)
                         logger.info(f"⚡ {PARSER_LABEL}: вакансия из {chat_title}")
                 except Exception as e:
                     logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
