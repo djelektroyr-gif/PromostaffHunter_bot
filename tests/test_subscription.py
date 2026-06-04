@@ -16,6 +16,22 @@ from db import (
 from db_backend import fetchone, execute
 
 
+def test_format_subscription_screen_escapes_special_env(monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_CARD_HINT", "Сбер •••• 1234, t.me/card_holder_name")
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_SUPPORT", "@promo_staff_bot")
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_PAY_URL", "")
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_PRICE_RUB", "299")
+    monkeypatch.setattr(main_module, "TRIAL_DAYS", 7)
+
+    text = main_module.format_subscription_screen(999888777)
+    assert "t.me/card_holder_name" in text
+    assert "@promo_staff_bot" in text
+    assert "<999888777>" not in text
+    assert "<code>999888777</code>" in text
+
+
 def test_parse_paid_until_datetime():
     dt = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
     assert _parse_paid_until(dt) == dt

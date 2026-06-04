@@ -351,7 +351,7 @@ def format_subscription_screen(user_id: int) -> str:
     if SUBSCRIPTION_PAY_URL:
         pay_lines.append(f"Или оплатите по ссылке:\n{escape_html(SUBSCRIPTION_PAY_URL)}")
     else:
-        action = "продления" if premium else "Premium"
+        action = escape_html("продления" if premium else "Premium")
         pay_lines.append(
             f"После перевода напишите {escape_html(SUBSCRIPTION_SUPPORT)} "
             f"или нажмите «Запросить {action}» ниже."
@@ -373,6 +373,35 @@ def format_subscription_screen(user_id: int) -> str:
         f"<b>Free:</b> до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
         f"{pay_heading}\n{pay_block}{trial_hint}"
     )
+
+
+async def send_subscription_screen(
+    message: types.Message,
+    user_id: int,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    edit: bool = False,
+):
+    """Экран подписки: HTML + fallback без разметки (env с _, &, < не ломают Telegram)."""
+    text = format_subscription_screen(user_id)
+    try:
+        if edit:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await message.answer(text, parse_mode="HTML", reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if edit and "message is not modified" in err:
+            return
+        if "parse" in err and "entit" in err:
+            logger.warning("subscription screen HTML rejected, plain fallback: %s", e)
+            plain = re.sub(r"<[^>]*>", "", text)
+            if edit:
+                await message.edit_text(plain, reply_markup=reply_markup)
+            else:
+                await message.answer(plain, reply_markup=reply_markup)
+            return
+        raise
 
 
 async def notify_admin_parser_issue(text: str):
@@ -971,10 +1000,8 @@ async def subscription_from_categories(callback: types.CallbackQuery):
         inline_keyboard=(buttons.inline_keyboard if buttons else []) + nav
     )
     try:
-        await callback.message.edit_text(
-            format_subscription_screen(user_id),
-            parse_mode="HTML",
-            reply_markup=markup,
+        await send_subscription_screen(
+            callback.message, user_id, reply_markup=markup, edit=True,
         )
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
@@ -1314,11 +1341,7 @@ async def subscription_menu(message: types.Message):
         )
         return
     buttons = subscription_action_buttons(user_id)
-    await message.answer(
-        format_subscription_screen(user_id),
-        parse_mode="HTML",
-        reply_markup=buttons,
-    )
+    await send_subscription_screen(message, user_id, reply_markup=buttons)
 
 
 @dp.callback_query(lambda c: c.data in ("subscription_request", "subscription_renew"))
