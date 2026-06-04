@@ -298,6 +298,22 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        add_column_if_missing(
+            "premium_requests", "is_renewal",
+            "ALTER TABLE premium_requests ADD COLUMN is_renewal BOOLEAN DEFAULT 0",
+            "ALTER TABLE premium_requests ADD COLUMN is_renewal BOOLEAN DEFAULT FALSE",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "premium_requests", "receipt_file_id",
+            "ALTER TABLE premium_requests ADD COLUMN receipt_file_id TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "premium_requests", "receipt_kind",
+            "ALTER TABLE premium_requests ADD COLUMN receipt_kind TEXT DEFAULT NULL",
+            cur=cur,
+        )
 
     logger.info(db_info_label())
 
@@ -636,7 +652,48 @@ def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200
     ]
 
 
+def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
+    """Открытые вакансии категории, которые пользователь ещё не получал (push/лента)."""
+    rows = fetchall(
+        f"""
+        SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
+               v.author_contact, v.address, v.found_at, v.published_at
+        FROM vacancies v
+        WHERE v.category_code = ? AND v.is_closed = {bool_false()}
+          AND NOT EXISTS (
+            SELECT 1 FROM sent_vacancies sv
+            WHERE sv.user_id = ? AND sv.vacancy_id = v.id
+          )
+        ORDER BY v.found_at DESC
+        """,
+        (category_code, user_id),
+    )
+    return [
+        {
+            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
+            "found_at": r[6], "published_at": r[7],
+        }
+        for r in rows
+    ]
+
+
+def count_feed_vacancies_for_user(user_id: int, category_code: str) -> int:
+    return fetchval(
+        f"""
+        SELECT COUNT(*) FROM vacancies v
+        WHERE v.category_code = ? AND v.is_closed = {bool_false()}
+          AND NOT EXISTS (
+            SELECT 1 FROM sent_vacancies sv
+            WHERE sv.user_id = ? AND sv.vacancy_id = v.id
+          )
+        """,
+        (category_code, user_id),
+        default=0,
+    )
+
+
 def get_unsent_vacancies_by_category(category_code: str) -> list:
+    """Legacy: глобальный is_sent. Для ленты используйте get_feed_vacancies_for_user."""
     rows = fetchall(f"""
         SELECT id, source_chat_title, message_text, message_link, author_contact, address, found_at, published_at
         FROM vacancies
@@ -899,7 +956,7 @@ def get_admin_stats() -> dict:
         cur.execute("SELECT COUNT(*) FROM responses")
         total_responses = cur.fetchone()[0]
         cur.execute(
-            f"SELECT COUNT(*) FROM vacancies WHERE is_sent = {bool_false()} AND is_closed = {bool_false()}"
+            f"SELECT COUNT(*) FROM vacancies WHERE is_closed = {bool_false()}"
         )
         pending_vacancies = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM vacancies")
@@ -1016,60 +1073,148 @@ def update_last_processed_id(chat_id: str, message_id: int):
 
 
 # ========== ЗАПРОСЫ PREMIUM ==========
+def _premium_request_row(row) -> dict:
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "username": row[2],
+        "full_name": row[3],
+        "phone": row[4],
+        "category_codes": row[5],
+        "created_at": row[6],
+        "is_renewal": bool(row[7]) if len(row) > 7 else False,
+        "receipt_file_id": row[8] if len(row) > 8 else None,
+        "receipt_kind": row[9] if len(row) > 9 else None,
+        "status": row[10] if len(row) > 10 else "pending",
+    }
+
+
+_PREMIUM_REQUEST_SELECT = """
+    SELECT id, user_id, username, full_name, phone, category_codes, created_at,
+           is_renewal, receipt_file_id, receipt_kind, status
+    FROM premium_requests
+"""
+
+
 def add_premium_request(
     user_id: int,
     username: str = None,
     full_name: str = None,
     phone: str = None,
     category_codes: str = None,
-):
-    execute(
-        f"UPDATE premium_requests SET status = 'cancelled' WHERE user_id = ? AND status = 'pending'",
-        (user_id,),
+    is_renewal: bool = False,
+) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE premium_requests SET status = 'cancelled' "
+                "WHERE user_id = ? AND status IN ('pending', 'awaiting_receipt')"
+            ),
+            (user_id,),
+        )
+        renewal_val = bool_true() if is_renewal else bool_false()
+        if IS_POSTGRES:
+            cur.execute(
+                q(f"""
+                    INSERT INTO premium_requests
+                    (user_id, username, full_name, phone, category_codes, is_renewal, status)
+                    VALUES (?, ?, ?, ?, ?, {renewal_val}, 'awaiting_receipt')
+                    RETURNING id
+                """),
+                (user_id, username, full_name, phone, category_codes),
+            )
+            return int(cur.fetchone()[0])
+        cur.execute(
+            q(f"""
+                INSERT INTO premium_requests
+                (user_id, username, full_name, phone, category_codes, is_renewal, status)
+                VALUES (?, ?, ?, ?, ?, {renewal_val}, 'awaiting_receipt')
+            """),
+            (user_id, username, full_name, phone, category_codes),
+        )
+        return int(cur.lastrowid)
+
+
+def get_premium_request(request_id: int) -> dict | None:
+    row = fetchone(f"{_PREMIUM_REQUEST_SELECT} WHERE id = ?", (request_id,))
+    return _premium_request_row(row) if row else None
+
+
+def attach_premium_request_receipt(
+    request_id: int,
+    user_id: int,
+    file_id: str,
+    kind: str,
+) -> bool:
+    row = fetchone(
+        f"{_PREMIUM_REQUEST_SELECT} WHERE id = ? AND user_id = ? AND status = 'awaiting_receipt'",
+        (request_id, user_id),
     )
+    if not row:
+        return False
     execute(
         """
-        INSERT INTO premium_requests (user_id, username, full_name, phone, category_codes, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
+        UPDATE premium_requests
+        SET receipt_file_id = ?, receipt_kind = ?, status = 'pending'
+        WHERE id = ?
         """,
-        (user_id, username, full_name, phone, category_codes),
+        (file_id, kind, request_id),
     )
+    return True
+
+
+def cancel_premium_request_awaiting(user_id: int, request_id: int | None = None) -> None:
+    if request_id:
+        execute(
+            "UPDATE premium_requests SET status = 'cancelled' "
+            "WHERE id = ? AND user_id = ? AND status = 'awaiting_receipt'",
+            (request_id, user_id),
+        )
+    else:
+        execute(
+            "UPDATE premium_requests SET status = 'cancelled' "
+            "WHERE user_id = ? AND status = 'awaiting_receipt'",
+            (user_id,),
+        )
 
 
 def get_pending_premium_requests(limit: int = 20) -> list:
     rows = fetchall(
         f"""
-        SELECT id, user_id, username, full_name, phone, category_codes, created_at
-        FROM premium_requests
+        {_PREMIUM_REQUEST_SELECT}
         WHERE status = 'pending'
         ORDER BY created_at ASC
         LIMIT ?
         """,
         (limit,),
     )
-    return [
-        {
-            "id": r[0],
-            "user_id": r[1],
-            "username": r[2],
-            "full_name": r[3],
-            "phone": r[4],
-            "category_codes": r[5],
-            "created_at": r[6],
-        }
-        for r in rows
-    ]
+    return [_premium_request_row(r) for r in rows]
 
 
 def count_pending_premium_requests() -> int:
     return fetchval(
-        f"SELECT COUNT(*) FROM premium_requests WHERE status = 'pending'",
+        "SELECT COUNT(*) FROM premium_requests WHERE status = 'pending'",
         default=0,
     )
 
 
 def resolve_premium_requests(user_id: int):
     execute(
-        f"UPDATE premium_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'",
+        "UPDATE premium_requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'",
         (user_id,),
     )
+
+
+def reject_premium_request(request_id: int) -> int | None:
+    row = fetchone(
+        f"{_PREMIUM_REQUEST_SELECT} WHERE id = ? AND status = 'pending'",
+        (request_id,),
+    )
+    if not row:
+        return None
+    execute(
+        "UPDATE premium_requests SET status = 'rejected' WHERE id = ?",
+        (request_id,),
+    )
+    return row[1]
