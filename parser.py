@@ -85,6 +85,18 @@ def make_vacancy_id(chat_id: str, message_id: str, dedupe_key: str = None) -> st
     unique_str = dedupe_key or f"{chat_id}_{message_id}"
     return hashlib.md5(unique_str.encode()).hexdigest()[:16]
 
+
+def chat_id_aliases(chat_id) -> set:
+    """Telethon отдаёт -100…, в difference иногда голый id канала — храним все формы."""
+    raw = str(chat_id).strip()
+    aliases = {raw}
+    if raw.startswith("-100") and len(raw) > 4:
+        aliases.add(raw[4:])
+    elif raw.isdigit():
+        aliases.add(f"-100{raw}")
+    return aliases
+
+
 async def refresh_monitored_chat_ids(client) -> set:
     """Резолвит ссылки из БД в numeric chat_id — без этого Telethon-парсер не видит группы."""
     global _monitored_chat_ids
@@ -92,16 +104,19 @@ async def refresh_monitored_chat_ids(client) -> set:
     for link in await run_db(get_target_chats):
         try:
             entity = await client.get_entity(link)
-            ids.add(str(entity.id))
+            ids.update(chat_id_aliases(entity.id))
             await asyncio.sleep(1.2)
         except Exception as e:
             logger.warning(f"Не удалось резолвить чат {link}: {e}")
     _monitored_chat_ids = ids
-    logger.info(f"📡 Мониторинг {len(_monitored_chat_ids)} чатов по chat_id")
+    logger.info(f"📡 Мониторинг {len(await run_db(get_target_chats))} чатов ({len(_monitored_chat_ids)} id-алиасов)")
     return ids
 
+
 def is_chat_monitored(chat_id) -> bool:
-    return str(chat_id) in _monitored_chat_ids
+    if not _monitored_chat_ids:
+        return False
+    return bool(chat_id_aliases(chat_id) & _monitored_chat_ids)
 
 async def _process_single_message(message, chat, chat_id: str, chat_title: str, stats: dict = None):
     """Обрабатывает одно сообщение: фильтр, категория, дедуп. Возвращает order или None."""
@@ -193,7 +208,7 @@ async def _process_single_message(message, chat, chat_id: str, chat_title: str, 
         "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
-async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None):
+async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None, *, incremental: bool = False):
     all_results = []
     closed_vacancies_users = []
     target_chats = await run_db(get_target_chats)
@@ -215,7 +230,13 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
         if stats is not None:
             stats["chats_ok"] += 1
 
-        async for message in client.iter_messages(entity, limit=limit_per_chat):
+        iter_kwargs = {"limit": limit_per_chat}
+        if incremental:
+            last_id = await run_db(get_last_processed_id, chat_id)
+            if last_id:
+                iter_kwargs["min_id"] = last_id
+
+        async for message in client.iter_messages(entity, **iter_kwargs):
             if stats is not None:
                 stats["messages_scanned"] += 1
                 if stats["messages_scanned"] % 25 == 0:
@@ -238,21 +259,32 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
     return all_results, closed_vacancies_users
 
 async def _periodic_scan_loop(bot_callback, closed_callback=None):
-    await asyncio.sleep(60)
+    await asyncio.sleep(90)
     while _realtime_client and _realtime_client.is_connected():
+        stats = _new_stats("periodic")
         try:
             async with _parser_lock:
-                logger.info("🔄 Плановая проверка новых вакансий...")
-                orders, closed_data = await _scan_all_chats(_realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT)
+                logger.info("🔄 Плановая проверка новых вакансий (incremental)...")
+                orders, closed_data = await _scan_all_chats(
+                    _realtime_client,
+                    limit_per_chat=PER_CHAT_SCAN_LIMIT,
+                    stats=stats,
+                    incremental=True,
+                )
+            stats["finished_at"] = _iso_now()
+            global LAST_DEBUG_STATS
+            LAST_DEBUG_STATS = stats
             if closed_data and closed_callback:
                 await closed_callback(closed_data)
             for order in orders:
                 bot_callback(order)
-            if orders or closed_data:
-                logger.info(
-                    f"🔄 Плановая проверка: отправлено {len(orders)} вакансий, "
-                    f"закрыто {len(closed_data or [])}"
-                )
+            logger.info(
+                f"🔄 Плановая проверка: новых вакансий {len(orders)}, "
+                f"просмотрено сообщений {stats['messages_scanned']}, "
+                f"отсеяно {stats['non_relevant']}, дубли exact/fuzzy "
+                f"{stats['duplicates_exact']}/{stats['duplicates_fuzzy']}, "
+                f"закрыто {len(closed_data or [])}"
+            )
         except Exception as e:
             logger.error(f"Ошибка плановой проверки: {e}", exc_info=True)
         await asyncio.sleep(PARSER_POLL_INTERVAL_SEC)
@@ -335,23 +367,35 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
 
             async with _parser_lock:
                 logger.info("🔄 Стартовая синхронизация вакансий...")
+                startup_stats = _new_stats("startup")
                 startup_orders, startup_closed = await _scan_all_chats(
-                    _realtime_client, limit_per_chat=PER_CHAT_SCAN_LIMIT
+                    _realtime_client,
+                    limit_per_chat=PER_CHAT_SCAN_LIMIT,
+                    stats=startup_stats,
+                    incremental=False,
                 )
+                startup_stats["finished_at"] = _iso_now()
+                global LAST_DEBUG_STATS
+                LAST_DEBUG_STATS = startup_stats
             if startup_closed and closed_callback:
                 await closed_callback(startup_closed)
             for order in startup_orders:
                 bot_callback(order)
-            logger.info(f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий")
+            logger.info(
+                f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий, "
+                f"просмотрено {startup_stats['messages_scanned']}, "
+                f"отсеяно {startup_stats['non_relevant']}, "
+                f"уже в БД {startup_stats['already_sent']}"
+            )
 
-            spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
-
-            @_realtime_client.on(events.NewMessage())
-            async def handler(event):
+            async def on_new_message(event):
                 if not is_chat_monitored(event.chat_id):
+                    logger.debug(
+                        f"{PARSER_LABEL}: сообщение chat_id={event.chat_id} вне мониторинга"
+                    )
                     return
 
-                logger.info(f"⚡ {PARSER_LABEL}: новое сообщение из чата {event.chat_id}")
+                logger.info(f"⚡ {PARSER_LABEL}: новое сообщение chat_id={event.chat_id}")
                 message = event.message
                 chat = await event.get_chat()
                 chat_id = str(chat.id)
@@ -364,10 +408,14 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                             await closed_callback([(result["vacancy_id"], result["users"])])
                     elif result:
                         bot_callback(result)
-                        logger.info(f"⚡ {PARSER_LABEL}: вакансия из {chat_title}")
+                        logger.info(
+                            f"⚡ {PARSER_LABEL}: вакансия [{result.get('category')}] из «{chat_title}»"
+                        )
                 except Exception as e:
                     logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
 
+            _realtime_client.add_event_handler(on_new_message, events.NewMessage())
+            spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
             await _realtime_client.run_until_disconnected()
         except SessionNotConfiguredError as e:
             logger.error(f"{PARSER_LABEL}: {e}")
@@ -455,11 +503,11 @@ def format_parser_status_line(snapshot: dict) -> str:
 def _iso_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _new_stats() -> dict:
+def _empty_debug_stats() -> dict:
     return {
-        "started_at": _iso_now(),
+        "started_at": None,
         "finished_at": None,
-        "chats_total": len(get_target_chats()),
+        "chats_total": 0,
         "chats_ok": 0,
         "chats_failed": 0,
         "messages_scanned": 0,
@@ -475,25 +523,62 @@ def _new_stats() -> dict:
         "closed_vacancies": 0,
         "duplicates_exact": 0,
         "duplicates_fuzzy": 0,
+        "run_kind": None,
     }
 
-LAST_DEBUG_STATS = _new_stats()
+
+def _new_stats(run_kind: str = "scan") -> dict:
+    stats = _empty_debug_stats()
+    stats["started_at"] = _iso_now()
+    stats["run_kind"] = run_kind
+    stats["chats_total"] = len(get_target_chats())
+    return stats
+
+
+LAST_DEBUG_STATS = _empty_debug_stats()
+
 
 def get_last_debug_report() -> str:
     s = LAST_DEBUG_STATS
+    snap = get_parser_status_snapshot()
+    parser_line = format_parser_status_line(snap)
+
     if not s.get("started_at"):
-        return "ℹ️ Отладочных данных пока нет. Запустите /check_now или дождитесь авто-проверки."
+        return (
+            "🧪 *Последний прогон парсера*\n\n"
+            "Ещё не было завершённого прогона после перезапуска.\n"
+            f"{parser_line}\n\n"
+            "Запустите `/check_now` или дождитесь плановой проверки (~5 мин)."
+        )
+
     lines = [
-        "🧪 Последний прогон парсера:",
+        "🧪 *Последний прогон парсера*",
+        f"Тип: {s.get('run_kind') or '—'}",
         f"Старт: {s.get('started_at')}",
-        f"Финиш: {s.get('finished_at') or 'в процессе'}",
+        f"Финиш: {s.get('finished_at') or '⏳ в процессе…'}",
+        parser_line,
         f"Чатов: {s.get('chats_ok', 0)}/{s.get('chats_total', 0)} успешно, ошибок: {s.get('chats_failed', 0)}",
         f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
         f"Совпадений найдено: {s.get('matched', 0)}",
-        f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | уже обработано: {s.get('already_sent', 0)} | старых: {s.get('old_messages', 0)} | закрыто: {s.get('closed_vacancies', 0)}",
+        f"Отсеяно: {s.get('non_relevant', 0)} | без текста: {s.get('no_text', 0)} | "
+        f"уже обработано: {s.get('already_sent', 0)} | старых: {s.get('old_messages', 0)} | "
+        f"закрыто: {s.get('closed_vacancies', 0)}",
         f"Дубли: exact={s.get('duplicates_exact', 0)} | fuzzy={s.get('duplicates_fuzzy', 0)}",
         f"Локальных ошибок: {s.get('errors', 0)}",
     ]
+
+    if not s.get("finished_at"):
+        try:
+            started = datetime.strptime(s["started_at"], "%Y-%m-%d %H:%M:%S")
+            age_min = (datetime.now() - started).total_seconds() / 60
+            if age_min > 15:
+                lines.append(
+                    f"\n⚠️ *Прогон «в процессе» уже {int(age_min)} мин* — "
+                    "скорее всего отчёт устарел (перезапуск или зависание lock). "
+                    "Нажмите `/check_now`."
+                )
+        except ValueError:
+            pass
     categories = s.get("categories") or {}
     if categories:
         lines.append("\n📊 *Распределение по категориям:*")
@@ -565,6 +650,28 @@ def _normalize_for_dedupe(text: str) -> str:
     normalized = re.sub(r'[\W_]+', ' ', normalized, flags=re.UNICODE)
     return re.sub(r'\s+', ' ', normalized).strip()
 
+
+def _normalize_for_fuzzy_dedupe(text: str) -> str:
+    """Убирает дату/адрес — ловит повторы одной кампании с разными локациями."""
+    normalized = _normalize_for_dedupe(text)
+    normalized = re.sub(
+        r"\b\d{1,2}[\.\-/]\d{1,2}(?:[\.\-/]\d{2,4})?\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b(завтра|сегодня|послезавтра|метро|м\.|ул\.|улица|проспект|пр\.)\b",
+        " ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b(москва|мо|подмосков|лобня|немчиновка|калужская|русаковская|победы)\b",
+        " ",
+        normalized,
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def build_vacancy_dedupe_key(text: str, author_contact: str) -> str:
     normalized_text = _normalize_for_dedupe(text)[:280]
     normalized_contact = (author_contact or "").strip().lower()
@@ -586,6 +693,7 @@ def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> st
     if has_recent_duplicate_vacancy(dedupe_key, max_age_days=1):
         return "exact"
     normalized_text = _normalize_for_dedupe(text)
+    fuzzy_text = _normalize_for_fuzzy_dedupe(text)
     if not normalized_text:
         return None
     phone_digits = _extract_phone_digits(text)
@@ -600,7 +708,10 @@ def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> st
         if not (same_contact or same_phone):
             continue
         similarity = SequenceMatcher(None, normalized_text, candidate_text).ratio()
-        if similarity >= 0.82:
+        fuzzy_similarity = SequenceMatcher(
+            None, fuzzy_text, _normalize_for_fuzzy_dedupe(row.get("message_text", ""))
+        ).ratio()
+        if similarity >= 0.82 or fuzzy_similarity >= 0.78:
             return "fuzzy"
     return None
 
@@ -760,55 +871,87 @@ _CATEGORY_TIEBREAK = (
     "driver", "security", "parking", "supervisor", "helper",
 )
 
+_CATEGORY_KEYWORDS = {
+    "loader": [
+        "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
+        "погрузка", "разгрузка", "выгрузка", "выгрузк", "такелаж", "такелажник",
+        "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
+        "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
+        "складской работник", "на склад", "рохл", "паллет", "складирован",
+        "производств", "фасовоч",
+    ],
+    "promoter": [
+        "промоутер", "промоутеры", "промоутерша", "промоутером", "промо персонал", "промо",
+        "раздача листовок", "промо-акция", "промоакция", "листовки", "анкетирован",
+        "опрос людей", "опрос на улице",
+        "привлекать внимание", "приглашать клиентов", "распространение листовок",
+        "промо на", "промо в", "позиция: промо", "позиция промо",
+    ],
+    "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
+    "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
+    "animator": [
+        "аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун",
+        "ростовые куклы", "массовк", "массовка",
+    ],
+    "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
+    "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
+    "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
+    "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
+    "supervisor": [
+        "супервайзер", "супервизор", "тимлид", "старший смены",
+        "координатор промо", "координатор проекта", "координатор мероприят",
+        "контроль промо-персонала", "контроль промо персонала",
+    ],
+    "helper": [
+        "хелпер", "хэлпер", "хелперы", "хэлперы", "helper", "helpers",
+        "помощник на мероприятие", "помощник организатора", "волонтер",
+        "помощь на площадке", "помощники на площадке", "бекфотограф", "бэкстейдж",
+        "ассистент по акт",
+    ],
+}
 
-def detect_category(text: str) -> str:
+_LABOR_HINTS = (
+    "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
+    "склад", "рохл", "паллет", "фасовоч", "конвейер", "производств", "50 кг",
+)
+_PROMO_HINTS = ("промоутер", "листовок", "промо-акция", "раздача листовок", "промо персонал", "промо", "анкетирован")
+_NON_SUPERVISOR_COORDINATOR = (
+    "организатор", "координатор свад", "свадеб", "#организатора", "координатора",
+    "event hunter", "ведущий", "фотограф", "видеограф",
+)
+
+
+def split_vacancy_blocks(text: str) -> list:
+    """Digest-посты «1. … 2. …» — категория по первому блоку с явной ролью."""
     if not text:
-        return "helper"
-    text_lower = text.lower()
-    category_map = {
-        "loader": [
-            "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
-            "погрузка", "разгрузка", "такелаж", "такелажник", "выгрузить", "загрузить", "разгрузить",
-            "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
-            "складской работник", "на склад",
-        ],
-        "promoter": [
-            "промоутер", "промоутеры", "промоутерша", "промоутером", "промо персонал",
-            "раздача листовок", "промо-акция", "промоакция", "листовки",
-            "привлекать внимание", "приглашать клиентов", "распространение листовок",
-            "промо на", "промо в",
-        ],
-        "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
-        "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
-        "animator": ["аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун", "ростовые куклы"],
-        "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
-        "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
-        "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
-        "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
-        "supervisor": ["супервайзер", "супервизор", "координатор", "тимлид", "старший смены"],
-        "helper": [
-            "хелпер", "хэлпер", "хелперы", "хэлперы", "helper", "helpers",
-            "помощник на мероприятие", "помощник организатора", "волонтер", "ассистент",
-            "помощь на площадке", "помощники на площадке",
-        ],
-    }
+        return []
+    parts = re.split(r"(?=\n\s*\d+[\.\)]\s)", text)
+    blocks = [p.strip() for p in parts if p.strip()]
+    return blocks if len(blocks) > 1 else [text]
+
+
+def _score_categories(text_lower: str) -> dict:
     scores = {}
-    for category, keywords in category_map.items():
+    for category, keywords in _CATEGORY_KEYWORDS.items():
         for kw in keywords:
             if _keyword_in_text(kw, text_lower):
                 scores[category] = scores.get(category, 0) + len(kw)
+    if any(marker in text_lower for marker in _NON_SUPERVISOR_COORDINATOR):
+        scores.pop("supervisor", None)
+    return scores
 
+
+def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if not scores:
-        return "helper"
-
-    labor_words = ["грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "склад"]
-    promo_words = ["промоутер", "листовок", "промо-акция", "раздача листовок", "промо персонал"]
-    if scores.get("loader") and scores.get("helper") and any(w in text_lower for w in labor_words):
+        return None
+    if scores.get("loader") and scores.get("helper") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
-    if scores.get("promoter") and scores.get("helper") and any(w in text_lower for w in promo_words):
+    if scores.get("promoter") and scores.get("helper") and any(w in text_lower for w in _PROMO_HINTS):
         return "promoter"
-    if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in labor_words):
+    if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
+    if scores.get("driver") and scores.get("helper") and "водител" in text_lower:
+        return "driver"
 
     max_score = max(scores.values())
     winners = [cat for cat, score in scores.items() if score == max_score]
@@ -819,10 +962,62 @@ def detect_category(text: str) -> str:
             return preferred
     return winners[0]
 
+
+def _fallback_category(text_lower: str) -> str:
+    if any(w in text_lower for w in ("хелпер", "хэлпер", "helper", "бекфотограф", "бэкстейдж")):
+        return "helper"
+    if any(w in text_lower for w in _LABOR_HINTS):
+        return "loader"
+    if any(w in text_lower for w in _PROMO_HINTS):
+        return "promoter"
+    if "массовк" in text_lower:
+        return "animator"
+    if "аниматор" in text_lower:
+        return "animator"
+    if "водител" in text_lower:
+        return "driver"
+    if "супервайзер" in text_lower or "супервизор" in text_lower:
+        return "supervisor"
+    return "helper"
+
+
+def detect_category(text: str) -> str:
+    """Категория только по тексту поста; название группы/канала не учитывается."""
+    if not text:
+        return "helper"
+    blocks = split_vacancy_blocks(text)
+    for block in blocks:
+        text_lower = block.lower()
+        cat = _pick_category_from_scores(_score_categories(text_lower), text_lower)
+        if cat:
+            return cat
+    text_lower = text.lower()
+    cat = _pick_category_from_scores(_score_categories(text_lower), text_lower)
+    return cat if cat else _fallback_category(text_lower)
+
+
+def is_unpaid_vacancy(text: str) -> bool:
+    if not text:
+        return False
+    text_lower = text.lower()
+    if re.search(r"оплат\w*\s*[💵:]?\s*нет\b", text_lower):
+        return True
+    if re.search(r"💵\s*нет\b", text_lower):
+        return True
+    if any(p in text_lower for p in ("безмерную благодарность", "без оплаты", "бесплатно", "волонтер")):
+        return True
+    return False
+
+
 def is_helper_message(text: str):
     if not text:
         return False, "empty", []
     text_lower = text.lower()
+    if is_unpaid_vacancy(text):
+        return False, "unpaid", []
+    if any(p in text_lower for p in ("организатор", "координатор свад", "свадеб")) and "супервайзер" not in text_lower:
+        if not any(w in text_lower for w in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "промо")):
+            return False, "excluded_organizer", []
     for phrase in STOP_PHRASES:
         if phrase.lower() in text_lower:
             return False, f"stop_phrase: {phrase}", []
@@ -883,22 +1078,28 @@ async def safe_get_entity(client, chat_link: str):
 
 async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
     global LAST_DEBUG_STATS
-    LAST_DEBUG_STATS = _new_stats()
     try:
         async with _parser_lock:
+            stats = _new_stats("manual")
+            LAST_DEBUG_STATS = stats
             if _realtime_client and _realtime_client.is_connected():
                 logger.info("🔍 Ручная проверка через shared Telethon client")
-                return await _scan_all_chats(_realtime_client, limit_per_chat=limit_per_chat, stats=LAST_DEBUG_STATS)
+                result = await _scan_all_chats(
+                    _realtime_client, limit_per_chat=limit_per_chat, stats=stats,
+                )
+                stats["finished_at"] = _iso_now()
+                return result
 
             logger.error(
                 f"❌ {PARSER_LABEL} offline — ручная проверка пропущена (не создаём второй user_session)"
             )
+            stats["finished_at"] = _iso_now()
             return [], []
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
+        if LAST_DEBUG_STATS.get("started_at"):
+            LAST_DEBUG_STATS["finished_at"] = _iso_now()
         return [], []
-    finally:
-        LAST_DEBUG_STATS["finished_at"] = _iso_now()
 
 async def run_parser():
     orders, closed_data = await get_new_messages()
