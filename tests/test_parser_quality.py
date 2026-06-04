@@ -11,6 +11,8 @@ from parser import (
     _extract_phone_digits,
     detect_duplicate_type,
     detect_category,
+    chat_id_aliases,
+    is_chat_monitored,
 )
 
 
@@ -107,6 +109,86 @@ def test_detect_category_promoter_not_helper():
     assert detect_category(text) == "promoter"
 
 
+def test_detect_category_promo_position_caps():
+    text = (
+        "На мероприятие требуются сотрудники: ПРОМО(ДЕВУШКИ И МОЛОДЫЕ ЛЮДИ)\n"
+        "Позиция: ПРОМО\n"
+        "Помощь на площадке"
+    )
+    assert detect_category(text) == "promoter"
+
+
+def test_detect_category_loader_factory_not_helper():
+    text = (
+        "Работа на производстве крупы на фасовочном конвейере. "
+        "Выгрузка и перемещение фур, складирование и укладка готовой продукции. "
+        "Работа с тележкой и рохлей."
+    )
+    assert detect_category(text) == "loader"
+
+
+def test_detect_category_supervisor_not_wedding_coordinator():
+    text = (
+        "1. Ищем #организатора-#координатора Свадеб, с опытом работы заграницей\n"
+        "2.06.06. 16:30-18:30 #аниматор CHALLENGE PARTY"
+    )
+    assert detect_category(text) == "animator"
+
+
+def test_detect_category_supervisor_real():
+    text = "ТРЕБУЕТСЯ СУПЕРВАЙЗЕР С АВТО. Контроль промо-персонала."
+    assert detect_category(text) == "supervisor"
+
+
+def test_detect_category_anketirovanie_promoter():
+    text = (
+        "3 июня АНКЕТИРОВАНИЕ (несложная анкета от продуктового бренда)\n"
+        "550 р/час с 11 до 19.00\n"
+        "Нужны супер активные промо"
+    )
+    assert detect_category(text) == "promoter"
+
+
+def test_is_helper_message_rejects_unpaid_massovka():
+    from parser import is_helper_message
+
+    text = (
+        "Требуется Массовка\n"
+        "О вакансии: Ищем массовку для курсовой работы\n"
+        "Оплата 💵 Нет"
+    )
+    ok, reason, _ = is_helper_message(text)
+    assert ok is False
+    assert reason == "unpaid"
+
+
+def test_fuzzy_duplicate_anketirovanie_same_author(monkeypatch):
+    base = (
+        "3 июня АНКЕТИРОВАНИЕ (несложная анкета от продуктового бренда)\n"
+        "550 р/час с 11 до 19.00\n"
+        "Проспект победы 114\n"
+        "Для отклика @Fd4Daria"
+    )
+    variant = (
+        "ЗАВТРА! 3 июня АНКЕТИРОВАНИЕ (несложная анкета от продуктового бренда)\n"
+        "550 р/час с 11 до 19.00\n"
+        "Русаковская 31\n"
+        "Для отклика @Fd4Daria"
+    )
+
+    def fake_exact_duplicate(*args, **kwargs):
+        return False
+
+    def fake_recent(*args, **kwargs):
+        return [{"id": "old", "message_text": base, "author_contact": "@Fd4Daria", "dedupe_key": "x"}]
+
+    monkeypatch.setattr("parser.has_recent_duplicate_vacancy", fake_exact_duplicate)
+    monkeypatch.setattr("parser.get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    duplicate_type = detect_duplicate_type(variant, "@Fd4Daria", "new_key")
+    assert duplicate_type == "fuzzy"
+
+
 def test_metro_filter_matches_station():
     text = "Срочно нужен промоутер, метро Таганская, ставка 3500"
     assert extract_metro_tokens(text) == ["таганская"]
@@ -136,3 +218,16 @@ def test_make_vacancy_id_same_for_parser_and_send():
     assert make_vacancy_id(chat_id, message_id, dedupe_key) == make_vacancy_id(chat_id, message_id, dedupe_key)
     assert make_vacancy_id(chat_id, message_id, dedupe_key) != make_vacancy_id(chat_id, message_id, None)
     assert len(make_vacancy_id(chat_id, message_id)) == 16
+
+
+def test_chat_id_aliases_and_monitored():
+    import parser as parser_module
+
+    aliases = chat_id_aliases("-1002130334767")
+    assert "-1002130334767" in aliases
+    assert "2130334767" in aliases
+
+    parser_module._monitored_chat_ids = aliases
+    assert is_chat_monitored("2130334767") is True
+    assert is_chat_monitored(-1002130334767) is True
+    parser_module._monitored_chat_ids = set()

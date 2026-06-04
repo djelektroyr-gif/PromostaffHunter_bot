@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
 from db import *
 from db_backend import db_conn, fetchone, now_minus_days, bool_false, run_db
 from parser import (
@@ -50,6 +50,74 @@ def escape_markdown(text: str) -> str:
         return ""
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+
+def build_maps_url(address: str) -> str | None:
+    if not address or not address.strip():
+        return None
+    url = f"https://yandex.ru/maps/?text={quote(address.strip())}"
+    if len(url) > 2048 or not url.startswith("https://"):
+        return None
+    return url
+
+
+def build_vacancy_keyboard(vacancy_id: str, address: str | None = None) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}")]]
+    maps_url = build_maps_url(address) if address else None
+    if maps_url:
+        buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
+    buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vacancy_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def format_vacancy_card_html(
+    *,
+    category_emoji: str,
+    category_name: str,
+    freshness: str,
+    published_at: str,
+    body: str,
+    source: str,
+    message_link: str | None = None,
+) -> str:
+    lines = [
+        f"{category_emoji} <b>{escape_html(category_name)}</b>",
+        escape_html(freshness),
+        f"🕒 Опубликовано: {escape_html(published_at)}",
+        f"📢 Из чата: {escape_html(source)}",
+        "",
+        escape_html((body or "")[:500]),
+    ]
+    if message_link and message_link.startswith("https://"):
+        lines.extend(["", f'<a href="{escape_html(message_link)}">🔗 Ссылка на сообщение</a>'])
+    return "\n".join(lines)
+
+
+async def send_vacancy_card(
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    """HTML-карточка вакансии с fallback без разметки."""
+    try:
+        await send_message_with_retry(
+            chat_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest as e:
+        if "parse" in str(e).lower():
+            plain = re.sub(r"<[^>]*>", "", text)
+            await send_message_with_retry(
+                chat_id,
+                text=plain,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        raise
 
 
 def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> str:
@@ -475,6 +543,99 @@ def get_category_emoji(category_code: str) -> str:
     }
     return emojis.get(category_code, "📌")
 
+
+def get_category_name(category_code: str) -> str:
+    names = {
+        "promoter": "Промоутер", "hostess": "Хостес", "wardrobe": "Гардеробщик",
+        "animator": "Аниматор", "helper": "Хелпер", "loader": "Грузчик",
+        "waiter": "Официант", "driver": "Водитель", "security": "Охранник",
+        "parking": "Парковщик", "supervisor": "Супервайзер",
+    }
+    return names.get(category_code, category_code)
+
+
+def build_user_help_html(user_id: int) -> str:
+    """Инструкция для исполнителя — по шагам, как в Time Bot."""
+    profile = get_subscriber_profile(user_id)
+    premium = is_user_premium(user_id)
+    trial_used = bool(profile and profile.get("trial_used"))
+
+    if premium:
+        push_block = (
+            "У вас <b>Premium</b>: новые вакансии по выбранным категориям "
+            "приходят <b>push-сообщениями</b> в этот чат."
+        )
+    else:
+        push_block = (
+            f"На <b>Free</b> push нет — открывайте ленту кнопкой "
+            f"«🔍 Посмотреть новые вакансии». Premium ({escape_html(SUBSCRIPTION_PRICE_RUB)} ₽/мес) — "
+            "мгновенные уведомления."
+        )
+
+    trial_block = ""
+    if not premium and not trial_used and TRIAL_DAYS > 0:
+        trial_block = (
+            f"\n\n🎁 После «✅ Завершить выбор» категорий — пробный Premium "
+            f"<b>{TRIAL_DAYS} дн.</b> (push + метро)."
+        )
+
+    return (
+        "<b>📖 Как пользоваться ботом</b>\n\n"
+        "PromoStaff Hunter собирает вакансии из Telegram-каналов "
+        "и показывает только те роли, которые вы выбрали.\n\n"
+        "<b>1. Категории</b>\n"
+        f"Кнопка «📋 Категории» — отметьте нужные роли "
+        f"(хелпер, промо, грузчик…). Free: до {FREE_CATEGORY_LIMIT}, Premium: без лимита.\n"
+        "Нажмите «✅ Завершить выбор».\n\n"
+        "<b>2. Смотреть вакансии</b>\n"
+        "«🔍 Посмотреть новые вакансии» — лента по вашим категориям. "
+        "Можно выбрать одну категорию или «Все».\n\n"
+        "<b>3. Push-уведомления</b>\n"
+        f"{push_block}{trial_block}\n\n"
+        "<b>4. Отклик на вакансию</b>\n"
+        "На карточке — «✋ Откликнуться». Бот отправит заказчику вашу анкету "
+        "(ФИО, возраст, телефон, фото если добавляли).\n\n"
+        "<b>5. Мои отклики</b>\n"
+        "«📨 Мои отклики» — история, статус вакансии, ссылка на пост.\n\n"
+        "<b>6. Районы (Premium)</b>\n"
+        "«📍 Мои районы» — станции метро; push и лента только по ним "
+        "(если метро в вакансии не указано — не отсекаем).\n\n"
+        "<b>7. Подписка</b>\n"
+        "«💎 Подписка» — тариф, продление, оплата по реквизитам.\n\n"
+        "<b>8. Профиль</b>\n"
+        "«📞 Мои контакты» — данные для откликов.\n\n"
+        "<b>Список команд</b>\n"
+        "/help — эта инструкция\n"
+        "/start — главное меню\n\n"
+        "Вопрос или ошибка — кнопка «❓ Поддержка».\n\n"
+        "<b>Начните с «📋 Категории», затем откройте «🔍 Посмотреть новые вакансии»!</b>"
+    )
+
+
+def build_admin_help_html() -> str:
+    return (
+        "<b>📖 Админ: как пользоваться</b>\n\n"
+        "<b>Парсер</b>\n"
+        "• «🔍 Ручная проверка» или /check_now — прогон всех чатов\n"
+        "• «📝 Отчёт парсера» — статистика последнего прогона\n"
+        "• «📋 Список чатов парсинга» — доступ и мониторинг\n\n"
+        "<b>Пользователи</b>\n"
+        "• «💎 Запросы Premium» — чек + ✅/❌\n"
+        "• /setplan USER_ID premium 30 — выдать Premium\n\n"
+        "<b>Команды</b>\n"
+        "/help — эта справка\n"
+        "/start — админ-меню\n"
+        "/debug_last — отчёт парсера"
+    )
+
+
+async def send_user_help(message: types.Message, user_id: int):
+    text = build_user_help_html(user_id)
+    try:
+        await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    except TelegramBadRequest:
+        await message.answer(re.sub(r"<[^>]*>", "", text), disable_web_page_preview=True)
+
 def calculate_age(birth_date_str: str) -> int:
     try:
         birth_date = datetime.strptime(birth_date_str, "%d.%m.%Y")
@@ -657,21 +818,19 @@ async def send_vacancy_to_subscribers(order: dict):
     published_raw = order.get("published_at")
     published_at = format_publication_time(published_raw)
     freshness = get_freshness_label(published_raw)
-    text = (
-        f"{get_category_emoji(category_code)} *Вакансия:*\n\n"
-        f"{escape_markdown(freshness)}\n"
-        f"🕒 Опубликовано: {escape_markdown(published_at)}\n\n"
-        f"{escape_markdown(order['message_text'][:500])}\n\n"
-        f"📢 Источник: {escape_markdown(order['chat_title'])}"
+    cat_name = get_category_name(category_code)
+    text = format_vacancy_card_html(
+        category_emoji=get_category_emoji(category_code),
+        category_name=cat_name,
+        freshness=freshness,
+        published_at=published_at,
+        body=order.get("message_text", ""),
+        source=order.get("chat_title") or "—",
+        message_link=order.get("message_link"),
     )
 
     address = order.get('address') or extract_address_from_text(order.get('message_text', ''))
-    buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}")]]
-    if address:
-        maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
-        buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
-    buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vacancy_id}")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    keyboard = build_vacancy_keyboard(vacancy_id, address)
 
     sent_count = 0
     skipped_free = 0
@@ -690,13 +849,7 @@ async def send_vacancy_to_subscribers(order: dict):
             skipped_metro += 1
             continue
         try:
-            await send_message_with_retry(
-                subscriber['user_id'],
-                text=text,
-                parse_mode="MarkdownV2",
-                disable_web_page_preview=True,
-                reply_markup=keyboard,
-            )
+            await send_vacancy_card(subscriber['user_id'], text, reply_markup=keyboard)
             mark_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
             sent_count += 1
             await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
@@ -740,7 +893,8 @@ def get_main_keyboard(user_id: int):
             [KeyboardButton(text="📨 Мои отклики"), KeyboardButton(text="📋 Категории")],
             [KeyboardButton(text="📍 Мои районы"), KeyboardButton(text="💎 Подписка")],
             [KeyboardButton(text="📞 Мои контакты")],
-            [KeyboardButton(text="❌ Отписаться"), KeyboardButton(text="❓ Поддержка")],
+            [KeyboardButton(text="📖 Как пользоваться"), KeyboardButton(text="❓ Поддержка")],
+            [KeyboardButton(text="❌ Отписаться")],
         ],
         resize_keyboard=True
     )
@@ -770,6 +924,23 @@ ADMIN_MENU_BUTTONS = {
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
 
+@dp.message(Command("help"))
+async def help_cmd(message: types.Message):
+    user_id = message.from_user.id
+    if user_id == YOUR_USER_ID:
+        await message.answer(build_admin_help_html(), parse_mode="HTML")
+        return
+    await send_user_help(message, user_id)
+
+
+@dp.message(lambda m: m.text == "📖 Как пользоваться")
+async def help_menu_button(message: types.Message):
+    if message.from_user.id == YOUR_USER_ID:
+        await message.answer(build_admin_help_html(), parse_mode="HTML")
+        return
+    await send_user_help(message, message.from_user.id)
+
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -798,7 +969,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
             keyboard, status_text = get_main_keyboard(user_id)
             await message.answer(
                 f"👋 С возвращением, {first_name}!\n\n{status_text}\n\n"
-                f"Используйте кнопки для управления:",
+                f"Используйте кнопки меню. Инструкция — «📖 Как пользоваться» или /help",
                 reply_markup=keyboard
             )
             return
@@ -1048,6 +1219,7 @@ async def finish_categories(callback: types.CallbackQuery):
             f"📌 Ваши категории:\n{categories_text}\n\n"
             f"{'💎 Новые вакансии приходят моментально в чат.' if await run_db(is_user_premium, user_id) else '🔍 Free: новые вакансии — кнопка «Посмотреть новые».'}"
             f"{trial_line}\n\n"
+            f"📖 Подробная инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -1283,23 +1455,19 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     await message.answer(f"📬 *Вакансии (страница {page+1} из {(total-1)//10 + 1})*", parse_mode="Markdown")
     for vac in vacancies[start:end]:
         raw_pub = vac.get('published_at') or vac.get('found_at')
-        text = (
-            f"{vac['category']['emoji']} *{vac['category']['name']}*\n"
-            f"{escape_markdown(get_freshness_label(raw_pub))}\n"
-            f"🕒 Опубликовано: {escape_markdown(format_publication_time(raw_pub))}\n"
-            f"📢 Из чата: {escape_markdown(vac['source'])}\n\n"
-            f"{escape_markdown(vac['text'][:400])}\n\n"
-            f"🔗 [Ссылка на сообщение]({vac['link']})"
+        cat = vac.get("category") or {}
+        text = format_vacancy_card_html(
+            category_emoji=cat.get("emoji") or get_category_emoji("helper"),
+            category_name=cat.get("name") or "Вакансия",
+            freshness=get_freshness_label(raw_pub),
+            published_at=format_publication_time(raw_pub),
+            body=vac.get("text") or "",
+            source=vac.get("source") or "—",
+            message_link=vac.get("link"),
         )
-        buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vac['id']}")]]
-        if vac.get('address'):
-            address = vac['address']
-            maps_url = f"https://yandex.ru/maps/?text={address.replace(' ', '%20')}"
-            buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
-        buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vac['id']}")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+        keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
         try:
-            await message.answer(text, parse_mode="MarkdownV2", reply_markup=keyboard, disable_web_page_preview=True)
+            await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"Ошибка отправки вакансии: {e}")
@@ -2445,6 +2613,14 @@ async def on_startup():
         )
     )
     logger.info(f"📡 {PARSER_LABEL} запущен (резервный опрос каждые 5 мин)")
+
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="🏠 Главное меню"),
+            BotCommand(command="help", description="📖 Как пользоваться"),
+        ])
+    except Exception as e:
+        logger.warning(f"Не удалось set_my_commands: {e}")
 
     logger.info("📡 Запуск polling...")
     await dp.start_polling(bot)
