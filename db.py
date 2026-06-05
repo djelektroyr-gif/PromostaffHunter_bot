@@ -104,6 +104,26 @@ def init_db():
             "ALTER TABLE subscribers ADD COLUMN trial_used BOOLEAN DEFAULT FALSE",
             cur=cur,
         )
+        add_column_if_missing(
+            "subscribers", "birth_date",
+            "ALTER TABLE subscribers ADD COLUMN birth_date TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "subscribers", "resume_extra",
+            "ALTER TABLE subscribers ADD COLUMN resume_extra TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "subscribers", "photo_storage_path",
+            "ALTER TABLE subscribers ADD COLUMN photo_storage_path TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "subscribers", "photo_updated_at",
+            "ALTER TABLE subscribers ADD COLUMN photo_updated_at TIMESTAMP DEFAULT NULL",
+            cur=cur,
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS categories (
@@ -330,23 +350,75 @@ def add_subscriber(user_id: int, username: str, first_name: str, last_name: str 
     """, (user_id, username, first_name, last_name))
 
 
-def update_subscriber_profile(user_id: int, full_name: str, age: int, phone: str, photo_file_id: str = None):
+def update_subscriber_profile(
+    user_id: int,
+    full_name: str,
+    age: int,
+    phone: str,
+    photo_file_id: str = None,
+    birth_date: str = None,
+):
     if photo_file_id:
         execute("""
             UPDATE subscribers
-            SET full_name = ?, age = ?, phone = ?, photo_file_id = ?
+            SET full_name = ?, age = ?, phone = ?, photo_file_id = ?, birth_date = COALESCE(?, birth_date)
             WHERE user_id = ?
-        """, (full_name, age, phone, photo_file_id, user_id))
+        """, (full_name, age, phone, photo_file_id, birth_date, user_id))
     else:
         execute("""
             UPDATE subscribers
-            SET full_name = ?, age = ?, phone = ?
+            SET full_name = ?, age = ?, phone = ?, birth_date = COALESCE(?, birth_date)
             WHERE user_id = ?
-        """, (full_name, age, phone, user_id))
+        """, (full_name, age, phone, birth_date, user_id))
+
+
+def update_subscriber_name(user_id: int, full_name: str):
+    execute("UPDATE subscribers SET full_name = ? WHERE user_id = ?", (full_name, user_id))
+
+
+def update_subscriber_age(user_id: int, age: int, birth_date: str = None):
+    execute(
+        "UPDATE subscribers SET age = ?, birth_date = COALESCE(?, birth_date) WHERE user_id = ?",
+        (age, birth_date, user_id),
+    )
+
+
+def update_subscriber_phone(user_id: int, phone: str):
+    execute("UPDATE subscribers SET phone = ? WHERE user_id = ?", (phone, user_id))
+
+
+def update_resume_extra(user_id: int, resume_extra: str | None):
+    execute("UPDATE subscribers SET resume_extra = ? WHERE user_id = ?", (resume_extra, user_id))
 
 
 def update_subscriber_photo(user_id: int, photo_file_id: str):
     execute("UPDATE subscribers SET photo_file_id = ? WHERE user_id = ?", (photo_file_id, user_id))
+
+
+def update_subscriber_photo_storage(
+    user_id: int,
+    photo_file_id: str | None,
+    photo_storage_path: str | None,
+):
+    execute(
+        """
+        UPDATE subscribers
+        SET photo_file_id = ?, photo_storage_path = ?, photo_updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+        """,
+        (photo_file_id, photo_storage_path, user_id),
+    )
+
+
+def clear_subscriber_photo(user_id: int):
+    execute(
+        """
+        UPDATE subscribers
+        SET photo_file_id = NULL, photo_storage_path = NULL, photo_updated_at = NULL
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
 
 
 def update_candidate_questionnaire(user_id: int, questionnaire_text: str):
@@ -356,7 +428,8 @@ def update_candidate_questionnaire(user_id: int, questionnaire_text: str):
 def get_subscriber_profile(user_id: int) -> dict:
     row = fetchone("""
         SELECT user_id, username, first_name, last_name, full_name, age, phone,
-               photo_file_id, questionnaire, is_active, plan, paid_until, metro_zones, trial_used
+               photo_file_id, questionnaire, is_active, plan, paid_until, metro_zones, trial_used,
+               birth_date, resume_extra, photo_storage_path, photo_updated_at
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     if row:
@@ -365,8 +438,51 @@ def get_subscriber_profile(user_id: int) -> dict:
             "full_name": row[4], "age": row[5], "phone": row[6], "photo_file_id": row[7],
             "questionnaire": row[8], "is_active": row[9], "plan": row[10] or "free",
             "paid_until": row[11], "metro_zones": row[12], "trial_used": bool(row[13]),
+            "birth_date": row[14], "resume_extra": row[15],
+            "photo_storage_path": row[16], "photo_updated_at": row[17],
         }
     return None
+
+
+def rebuild_candidate_questionnaire(user_id: int) -> str:
+    """Пересобрать текст анкеты из полей профиля (после редактирования «Мои данные»)."""
+    profile = get_subscriber_profile(user_id)
+    if not profile:
+        return ""
+    username = profile.get("username") or "нет"
+    birth_line = ""
+    if profile.get("birth_date"):
+        birth_line = f"🎂 *Дата рождения:* {profile['birth_date']}\n"
+    extra_block = ""
+    if profile.get("resume_extra"):
+        extra_block = f"\n📋 *Доп. информация:*\n{profile['resume_extra']}\n"
+    return (
+        "📝 *АНКЕТА КАНДИДАТА*\n\n"
+        f"👤 *ФИО:* {profile.get('full_name') or '—'}\n"
+        f"{birth_line}"
+        f"📊 *Возраст:* {profile.get('age') or '—'} лет\n"
+        f"📞 *Телефон:* {profile.get('phone') or '—'}\n"
+        f"🆔 *Telegram:* @{username}"
+        f"{extra_block}"
+    ).strip()
+
+
+def get_subscribers_with_photos() -> list[dict]:
+    rows = fetchall(f"""
+        SELECT user_id, photo_file_id, photo_storage_path, photo_updated_at
+        FROM subscribers
+        WHERE is_active = {bool_true()}
+          AND (photo_file_id IS NOT NULL OR photo_storage_path IS NOT NULL)
+    """)
+    return [
+        {
+            "user_id": r[0],
+            "photo_file_id": r[1],
+            "photo_storage_path": r[2],
+            "photo_updated_at": r[3],
+        }
+        for r in rows
+    ]
 
 
 def is_user_premium(user_id: int) -> bool:

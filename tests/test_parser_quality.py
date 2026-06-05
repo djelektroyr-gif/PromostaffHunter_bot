@@ -13,7 +13,19 @@ from parser import (
     detect_category,
     chat_id_aliases,
     is_chat_monitored,
+    is_vacancy_closed_text,
+    is_strikethrough_closure,
 )
+
+
+class _FakeStrike:
+    """Минимальная имитация MessageEntityStrike для тестов."""
+
+    _test_strike = True
+
+    def __init__(self, offset: int, length: int):
+        self.offset = offset
+        self.length = length
 
 
 def test_extract_address_prefers_explicit_address():
@@ -218,6 +230,33 @@ def test_make_vacancy_id_same_for_parser_and_send():
     assert make_vacancy_id(chat_id, message_id, dedupe_key) == make_vacancy_id(chat_id, message_id, dedupe_key)
     assert make_vacancy_id(chat_id, message_id, dedupe_key) != make_vacancy_id(chat_id, message_id, None)
     assert len(make_vacancy_id(chat_id, message_id)) == 16
+
+
+def test_is_vacancy_closed_text_detects_zakryto_block():
+    text = (
+        "Требуется 1 человек к 13:30\n"
+        "Ставка 500р/час\n"
+        "@egorwave\n\n"
+        "ЗАКРЫТО❌❌❌❌❌"
+    )
+    assert is_vacancy_closed_text(text) is True
+
+
+def test_is_vacancy_closed_text_open_vacancy_with_urgent_emoji():
+    text = "СРОЧНО К 13:30❗️\nТребуется грузчик\nСтавка 500р/час\n@egorwave"
+    assert is_vacancy_closed_text(text) is False
+
+
+def test_is_strikethrough_closure_detects_struck_job_header():
+    text = (
+        "❗️РАБОТА НА МЕСЯЦ❗️\n"
+        "❗️05.06.2025❗️\n"
+        " С 9 утра до 18\n"
+        "📞@aronnepalazzi"
+    )
+    header = "❗️РАБОТА НА МЕСЯЦ❗️\n❗️05.06.2025❗️\n С 9 утра до 18"
+    entities = [_FakeStrike(0, len(header))]
+    assert is_strikethrough_closure(text, entities) is True
 
 
 def test_chat_id_aliases_and_monitored():

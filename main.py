@@ -25,9 +25,21 @@ from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
     SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, VACANCY_MAX_AGE_HOURS,
 )
+from profile_photos import (
+    get_user_photos_dir, persist_user_photo, photo_health_loop, send_profile_photo,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Метка сборки — в логах и /status, чтобы проверить деплой на Bothost.
+APP_BUILD = os.getenv("APP_BUILD", "profile-menu-v1")
+
+BTN_SETTINGS = "⚙️ Настройки"
+BTN_MY_DATA = "👤 Мои данные"
+BTN_SETTINGS_LEGACY = "📋 Категории"
+BTN_MY_DATA_LEGACY = "📞 Мои контакты"
+BTN_UNSUB_LEGACY = "❌ Отписаться"
 
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -130,7 +142,7 @@ def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> s
         )
     hint_line = f"\n\n{hint}" if hint else ""
     return (
-        "📋 *Выберите категории вакансий:*\n\n"
+        "⚙️ *Настройки — категории вакансий*\n\n"
         "✅ — выбраны · ⬜ — добавить\n"
         f"{limit_line}{hint_line}\n\n"
         "Готово — «✅ Завершить выбор»"
@@ -154,6 +166,7 @@ def build_categories_markup(selected_codes: list, user_id: int) -> InlineKeyboar
             text="💎 Premium — больше категорий и push",
             callback_data="subscription_from_categories",
         )])
+    buttons.append([InlineKeyboardButton(text="🔕 Отключить рассылку", callback_data="disable_feed")])
     buttons.append([InlineKeyboardButton(text="✅ Завершить выбор", callback_data="finish_categories")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -275,7 +288,7 @@ async def activate_premium_for_user(target_id: int, days: int) -> bool:
             "• моментальные push-уведомления\n"
             "• все категории без лимита\n"
             "• фильтр по метро (📍 Мои районы)\n\n"
-            "Категории — кнопка «📋 Категории».",
+            "Категории — кнопка «⚙️ Настройки».",
             parse_mode="Markdown",
         )
         return True
@@ -533,6 +546,13 @@ class ResponseDraftState(StatesGroup):
 class PremiumPaymentState(StatesGroup):
     waiting_for_receipt = State()
 
+class ProfileEditState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_birthdate = State()
+    waiting_for_phone = State()
+    waiting_for_photo = State()
+    waiting_for_extra = State()
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
@@ -583,10 +603,10 @@ def build_user_help_html(user_id: int) -> str:
         "<b>📖 Как пользоваться ботом</b>\n\n"
         "PromoStaff Hunter собирает вакансии из Telegram-каналов "
         "и показывает только те роли, которые вы выбрали.\n\n"
-        "<b>1. Категории</b>\n"
-        f"Кнопка «📋 Категории» — отметьте нужные роли "
+        "<b>1. Настройки</b>\n"
+        f"Кнопка «⚙️ Настройки» — категории вакансий "
         f"(хелпер, промо, грузчик…). Free: до {FREE_CATEGORY_LIMIT}, Premium: без лимита.\n"
-        "Нажмите «✅ Завершить выбор».\n\n"
+        "Нажмите «✅ Завершить выбор». Отключить рассылку — «🔕 Отключить рассылку».\n\n"
         "<b>2. Смотреть вакансии</b>\n"
         "«🔍 Посмотреть новые вакансии» — лента по вашим категориям. "
         "Можно выбрать одну категорию или «Все».\n\n"
@@ -602,13 +622,13 @@ def build_user_help_html(user_id: int) -> str:
         "(если метро в вакансии не указано — не отсекаем).\n\n"
         "<b>7. Подписка</b>\n"
         "«💎 Подписка» — тариф, продление, оплата по реквизитам.\n\n"
-        "<b>8. Профиль</b>\n"
-        "«📞 Мои контакты» — данные для откликов.\n\n"
+        "<b>8. Мои данные</b>\n"
+        "«👤 Мои данные» — ФИО, телефон, фото и доп. информация для откликов. Можно редактировать.\n\n"
         "<b>Список команд</b>\n"
         "/help — эта инструкция\n"
         "/start — главное меню\n\n"
         "Вопрос или ошибка — кнопка «❓ Поддержка».\n\n"
-        "<b>Начните с «📋 Категории», затем откройте «🔍 Посмотреть новые вакансии»!</b>"
+        "<b>Начните с «⚙️ Настройки», затем откройте «🔍 Посмотреть новые вакансии»!</b>"
     )
 
 
@@ -773,9 +793,80 @@ def build_candidate_profile_text(profile: dict, extra_comment: str = None) -> st
         f"• Телефон: {profile.get('phone') or '—'}",
         f"• Telegram: @{profile.get('username') if profile.get('username') else 'нет'}",
     ]
+    if profile.get("resume_extra"):
+        lines.append(f"• О себе: {profile['resume_extra'].strip()}")
     if extra_comment:
         lines.extend(["", "Дополнительно:", extra_comment.strip()])
     return "\n".join(lines).strip()
+
+
+def profile_data_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ ФИО", callback_data="profile_edit_name"),
+            InlineKeyboardButton(text="📞 Телефон", callback_data="profile_edit_phone"),
+        ],
+        [
+            InlineKeyboardButton(text="🎂 Возраст", callback_data="profile_edit_age"),
+            InlineKeyboardButton(text="📷 Фото", callback_data="profile_edit_photo"),
+        ],
+        [InlineKeyboardButton(text="📝 Доп. информация", callback_data="profile_edit_extra")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="profile_back_menu")],
+    ])
+
+
+def build_profile_data_text(profile: dict) -> str:
+    photo_status = "нет"
+    if profile.get("photo_storage_path") or profile.get("photo_file_id"):
+        photo_status = "есть"
+    extra = (profile.get("resume_extra") or "").strip()
+    extra_block = f"\n📝 *Доп. информация:*\n{escape_markdown(extra)}\n" if extra else "\n📝 *Доп. информация:* не заполнена\n"
+    birth = f"\n🎂 *Дата рождения:* {escape_markdown(profile['birth_date'])}" if profile.get("birth_date") else ""
+    return (
+        "👤 *Мои данные*\n\n"
+        "Эти данные уходят заказчику при отклике на вакансию.\n\n"
+        f"• ФИО: {escape_markdown(profile.get('full_name') or '—')}"
+        f"{birth}\n"
+        f"• Возраст: {profile.get('age') or '—'} лет\n"
+        f"• Телефон: {escape_markdown(profile.get('phone') or '—')}\n"
+        f"• Фото: {photo_status}"
+        f"{extra_block}\n"
+        "Что изменить?"
+    )
+
+
+async def send_profile_data_screen(chat_id: int, user_id: int):
+    profile = get_subscriber_profile(user_id)
+    if not profile or not profile.get("full_name") or not profile.get("phone"):
+        await bot.send_message(
+            chat_id,
+            "⚠️ Профиль не заполнен. Нажмите /start для регистрации.",
+        )
+        return
+    text = build_profile_data_text(profile)
+    if profile.get("photo_storage_path") or profile.get("photo_file_id"):
+        try:
+            await send_profile_photo(
+                bot,
+                chat_id,
+                profile,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=profile_data_markup(),
+            )
+            return
+        except Exception as e:
+            logger.warning("send_profile_data_screen photo: %s", e)
+    await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=profile_data_markup())
+
+
+async def finish_profile_field_edit(message: types.Message, state: FSMContext, user_id: int, notice: str):
+    questionnaire = rebuild_candidate_questionnaire(user_id)
+    update_candidate_questionnaire(user_id, questionnaire)
+    keyboard, _ = get_main_keyboard(user_id)
+    await state.clear()
+    await message.answer(notice, parse_mode="Markdown", reply_markup=keyboard)
+    await send_profile_data_screen(message.chat.id, user_id)
 
 def build_contact_link(contact: str, text: str) -> str:
     if not contact:
@@ -890,11 +981,10 @@ def get_main_keyboard(user_id: int):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Посмотреть новые вакансии")],
-            [KeyboardButton(text="📨 Мои отклики"), KeyboardButton(text="📋 Категории")],
+            [KeyboardButton(text="📨 Мои отклики"), KeyboardButton(text=BTN_SETTINGS)],
             [KeyboardButton(text="📍 Мои районы"), KeyboardButton(text="💎 Подписка")],
-            [KeyboardButton(text="📞 Мои контакты")],
+            [KeyboardButton(text=BTN_MY_DATA)],
             [KeyboardButton(text="📖 Как пользоваться"), KeyboardButton(text="❓ Поддержка")],
-            [KeyboardButton(text="❌ Отписаться")],
         ],
         resize_keyboard=True
     )
@@ -910,6 +1000,7 @@ def get_admin_keyboard():
             [KeyboardButton(text="🧭 Маппинг категорий"), KeyboardButton(text="⚠️ Жалобы")],
             [KeyboardButton(text="❓ Поддержка (админ)"), KeyboardButton(text="➕ Добавить чат")],
             [KeyboardButton(text="📋 Список чатов парсинга"), KeyboardButton(text="📤 Отправить вакансию")],
+            [KeyboardButton(text="📖 Как пользоваться")],
             [KeyboardButton(text="❌ Закрыть меню")]
         ],
         resize_keyboard=True
@@ -919,7 +1010,8 @@ ADMIN_MENU_BUTTONS = {
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
     "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
     "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат",
-    "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию", "❌ Закрыть меню",
+    "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
+    "📖 Как пользоваться", "❌ Закрыть меню",
 }
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
@@ -951,7 +1043,9 @@ async def start_cmd(message: types.Message, state: FSMContext):
     if user_id == YOUR_USER_ID:
         await message.answer(
             f"👋 Здравствуйте, Администратор {first_name}!\n\n"
-            f"📊 *Бот работает в штатном режиме.*\n\n"
+            f"📊 *Бот работает в штатном режиме.*\n"
+            f"Сборка: `{APP_BUILD}`\n\n"
+            f"Справка — кнопка «📖 Как пользоваться» или /help.\n"
             f"Используйте кнопки для управления:",
             parse_mode="Markdown",
             reply_markup=get_admin_keyboard()
@@ -1073,18 +1167,10 @@ async def process_phone(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     await state.update_data(phone=phone)   # <-- СОХРАНЯЕМ ТЕЛЕФОН В СОСТОЯНИЕ
-    update_subscriber_profile(user_id, data['full_name'], data['age'], phone)
-    
-    # Анкета
-    questionnaire = f"""📝 *АНКЕТА КАНДИДАТА*
-
-👤 *ФИО:* {data['full_name']}
-🎂 *Дата рождения:* {data['birth_date']}
-📊 *Возраст:* {data['age']} лет
-📞 *Телефон:* {phone}
-🆔 *Telegram:* @{message.from_user.username if message.from_user.username else 'нет'}
-"""
-    update_candidate_questionnaire(user_id, questionnaire)
+    update_subscriber_profile(
+        user_id, data['full_name'], data['age'], phone, birth_date=data['birth_date'],
+    )
+    update_candidate_questionnaire(user_id, rebuild_candidate_questionnaire(user_id))
     
     # Запрос фото (необязательно)
     await message.answer(
@@ -1108,7 +1194,8 @@ async def process_photo(message: types.Message, state: FSMContext):
         photo_file_id = None
     elif message.photo:
         photo_file_id = message.photo[-1].file_id
-        update_subscriber_photo(user_id, photo_file_id)
+        storage_path, photo_file_id = await persist_user_photo(bot, user_id, photo_file_id)
+        update_subscriber_photo_storage(user_id, photo_file_id, storage_path)
     else:
         await message.answer("Пожалуйста, отправьте фото или нажмите «Пропустить»")
         return
@@ -1179,6 +1266,44 @@ async def subscription_from_categories(callback: types.CallbackQuery):
             logger.warning(f"subscription_from_categories: {e}")
 
 
+@dp.callback_query(lambda c: c.data == "disable_feed")
+async def disable_feed_prompt(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "🔕 *Отключить рассылку вакансий?*\n\n"
+        "Категории будут сброшены, push и лента остановятся.\n"
+        "Профиль, отклики и подписка Premium сохранятся.\n\n"
+        "Включить снова — «⚙️ Настройки» и выберите категории.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, отключить", callback_data="disable_feed_confirm"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_categories"),
+            ],
+        ]),
+    )
+
+
+@dp.callback_query(lambda c: c.data == "disable_feed_confirm")
+async def disable_feed_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await safe_callback_answer(callback, "Рассылка отключена")
+    set_user_categories(user_id, [])
+    keyboard, _ = get_main_keyboard(user_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await bot.send_message(
+        user_id,
+        "🔕 *Рассылка отключена.*\n\n"
+        "Профиль и отклики сохранены. Чтобы снова получать вакансии — "
+        "«⚙️ Настройки» и выберите категории.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
 @dp.callback_query(lambda c: c.data == "finish_categories")
 async def finish_categories(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -1219,7 +1344,7 @@ async def finish_categories(callback: types.CallbackQuery):
             f"📌 Ваши категории:\n{categories_text}\n\n"
             f"{'💎 Новые вакансии приходят моментально в чат.' if await run_db(is_user_premium, user_id) else '🔍 Free: новые вакансии — кнопка «Посмотреть новые».'}"
             f"{trial_line}\n\n"
-            f"📖 Подробная инструкция — «Как пользоваться» или /help\n\n"
+            f"📖 Инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
             parse_mode="Markdown",
             reply_markup=keyboard,
@@ -1379,7 +1504,7 @@ def build_feed_category_keyboard(user_id: int) -> tuple[InlineKeyboardMarkup, in
 async def show_feed_category_menu(message: types.Message, user_id: int):
     user_categories = get_user_categories(user_id)
     if not user_categories:
-        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте кнопку «📋 Категории»")
+        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
     markup, total = build_feed_category_keyboard(user_id)
     apply_metro, _ = _feed_metro_context(user_id)
@@ -1749,36 +1874,197 @@ async def setplan_cmd(message: types.Message):
         + ("" if notified else " (уведомление пользователю не доставлено)")
     )
 
-@dp.message(lambda m: m.text == "📋 Категории")
-@dp.message(lambda m: m.text == "📋 Мои категории")
-@dp.message(lambda m: m.text == "✏️ Изменить категории")
+@dp.message(lambda m: m.text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, "📋 Мои категории", "✏️ Изменить категории"})
 async def open_categories_menu(message: types.Message):
     await send_category_picker(message.chat.id, message.from_user.id)
 
-@dp.message(lambda m: m.text == "📞 Мои контакты")
-async def show_my_contacts(message: types.Message):
-    profile = get_subscriber_profile(message.from_user.id)
-    if profile and profile.get("full_name") and profile.get("phone"):
-        await message.answer(
-            f"📞 *Ваши контактные данные:*\n\n"
-            f"👤 ФИО: {profile['full_name']}\n"
-            f"🎂 Возраст: {profile['age']} лет\n"
-            f"📱 Телефон: {profile['phone']}\n\n"
-            f"Эти данные будут переданы работодателю при отклике на вакансию.",
-            parse_mode="Markdown"
-        )
-    else:
-        await message.answer("⚠️ Ваш профиль не заполнен. Нажмите /start для заполнения.")
 
-@dp.message(lambda m: m.text == "❌ Отписаться")
-async def unsubscribe_user(message: types.Message):
+@dp.message(lambda m: m.text in {BTN_MY_DATA, BTN_MY_DATA_LEGACY})
+async def show_my_data(message: types.Message, state: FSMContext):
+    await state.clear()
+    await send_profile_data_screen(message.chat.id, message.from_user.id)
+
+
+@dp.callback_query(lambda c: c.data == "profile_back_menu")
+async def profile_back_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_callback_answer(callback)
+    keyboard, status = get_main_keyboard(callback.from_user.id)
+    await callback.message.answer(f"🏠 Главное меню\n\n{status}", reply_markup=keyboard)
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_cancel")
+async def profile_edit_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_callback_answer(callback, "Отменено")
+    await send_profile_data_screen(callback.message.chat.id, callback.from_user.id)
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_name")
+async def profile_edit_name(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "✏️ *Новое ФИО*\n\nВведите полное имя и фамилию (минимум 2 слова):",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_edit_cancel")],
+        ]),
+    )
+    await state.set_state(ProfileEditState.waiting_for_name)
+
+
+@dp.message(ProfileEditState.waiting_for_name)
+async def profile_name_received(message: types.Message, state: FSMContext):
+    full_name = (message.text or "").strip()
+    if len(full_name.split()) < 2:
+        await message.answer("❌ Введите полное имя и фамилию (минимум 2 слова).")
+        return
+    if not re.match(r'^[a-zA-Zа-яА-ЯёЁ\s\-\.]+$', full_name):
+        await message.answer("❌ Имя может содержать только буквы, пробелы, дефисы и точки.")
+        return
+    user_id = message.from_user.id
+    update_subscriber_name(user_id, full_name)
+    await finish_profile_field_edit(message, state, user_id, f"✅ ФИО обновлено: *{escape_markdown(full_name)}*")
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_age")
+async def profile_edit_age(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "🎂 *Дата рождения*\n\nВведите дату в формате ДД.ММ.ГГГГ (пример: `25.12.1990`):",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_edit_cancel")],
+        ]),
+    )
+    await state.set_state(ProfileEditState.waiting_for_birthdate)
+
+
+@dp.message(ProfileEditState.waiting_for_birthdate)
+async def profile_birthdate_received(message: types.Message, state: FSMContext):
+    birth_date_str = (message.text or "").strip()
+    if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', birth_date_str):
+        await message.answer("❌ Формат: ДД.ММ.ГГГГ (пример: 25.12.1990)")
+        return
+    age = calculate_age(birth_date_str)
+    if age is None or age < 16 or age > 100:
+        await message.answer("❌ Некорректная дата или возраст вне диапазона 16–100 лет.")
+        return
+    user_id = message.from_user.id
+    update_subscriber_age(user_id, age, birth_date_str)
+    await finish_profile_field_edit(
+        message, state, user_id,
+        f"✅ Возраст обновлён: *{age}* лет ({escape_markdown(birth_date_str)})",
+    )
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_phone")
+async def profile_edit_phone(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    phone_keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await callback.message.answer(
+        "📞 *Новый телефон*\n\nОтправьте номер текстом или кнопкой ниже.",
+        parse_mode="Markdown",
+        reply_markup=phone_keyboard,
+    )
+    await state.set_state(ProfileEditState.waiting_for_phone)
+
+
+@dp.message(ProfileEditState.waiting_for_phone)
+async def profile_phone_received(message: types.Message, state: FSMContext):
+    if message.contact:
+        phone = message.contact.phone_number
+    else:
+        phone = (message.text or "").strip()
+        digits_only = re.sub(r'\D', '', phone)
+        if len(digits_only) < 10 or len(digits_only) > 15:
+            await message.answer("❌ Введите корректный номер или нажмите кнопку «Отправить мой номер телефона».")
+            return
+    user_id = message.from_user.id
+    update_subscriber_phone(user_id, phone)
+    await finish_profile_field_edit(
+        message, state, user_id,
+        f"✅ Телефон обновлён: {escape_markdown(phone)}",
+    )
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_photo")
+async def profile_edit_photo(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "📷 *Новое фото*\n\nОтправьте фото для откликов.\n"
+        "Чтобы удалить фото — напишите «Удалить».",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_edit_cancel")],
+        ]),
+    )
+    await state.set_state(ProfileEditState.waiting_for_photo)
+
+
+@dp.message(ProfileEditState.waiting_for_photo)
+async def profile_photo_received(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if (message.text or "").strip().lower() in {"удалить", "delete", "нет"}:
+        clear_subscriber_photo(user_id)
+        await finish_profile_field_edit(message, state, user_id, "✅ Фото удалено из профиля.")
+        return
+    if not message.photo:
+        await message.answer("Отправьте фото или напишите «Удалить».")
+        return
+    photo_file_id = message.photo[-1].file_id
+    storage_path, photo_file_id = await persist_user_photo(bot, user_id, photo_file_id)
+    update_subscriber_photo_storage(user_id, photo_file_id, storage_path)
+    await finish_profile_field_edit(message, state, user_id, "✅ Фото профиля обновлено.")
+
+
+@dp.callback_query(lambda c: c.data == "profile_edit_extra")
+async def profile_edit_extra(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        "📝 *Доп. информация для резюме*\n\n"
+        "Рост, вес, опыт, навыки — одним сообщением.\n"
+        "Чтобы очистить — напишите «Очистить».",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_edit_cancel")],
+        ]),
+    )
+    await state.set_state(ProfileEditState.waiting_for_extra)
+
+
+@dp.message(ProfileEditState.waiting_for_extra)
+async def profile_extra_received(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    text = (message.text or "").strip()
+    if text.lower() in {"очистить", "удалить", "нет"}:
+        update_resume_extra(user_id, None)
+        await finish_profile_field_edit(message, state, user_id, "✅ Доп. информация очищена.")
+        return
+    if len(text) < 3:
+        await message.answer("❌ Слишком коротко. Напишите хотя бы пару слов или «Очистить».")
+        return
+    if len(text) > 1500:
+        await message.answer("❌ Слишком длинно (макс. 1500 символов).")
+        return
+    update_resume_extra(user_id, text)
+    await finish_profile_field_edit(message, state, user_id, "✅ Доп. информация сохранена.")
+
+
+@dp.message(lambda m: m.text == BTN_UNSUB_LEGACY)
+async def unsubscribe_user_legacy(message: types.Message):
     user_id = message.from_user.id
     set_user_categories(user_id, [])
+    keyboard, _ = get_main_keyboard(user_id)
     await message.answer(
-        "❌ *Вы отписались от рассылки вакансий.*\n\n"
-        "Если передумаете, просто нажмите /start и заполните профиль заново.",
+        "🔕 *Рассылка отключена.*\n\n"
+        "Профиль сохранён. Чтобы снова получать вакансии — «⚙️ Настройки».",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=keyboard,
     )
 
 @dp.message(lambda m: m.text == "❓ Поддержка")
@@ -1932,9 +2218,10 @@ async def handle_admin_vacancy_response(callback: types.CallbackQuery):
         f"{candidate_questionnaire}\n"
         f"👤 *Ссылка на кандидата:* [Написать](tg://user?id={user_id})"
     )
-    photo_file_id = profile.get('photo_file_id')
-    if photo_file_id:
-        await bot.send_photo(YOUR_USER_ID, photo_file_id, caption=admin_message, parse_mode="Markdown")
+    if profile.get('photo_file_id') or profile.get('photo_storage_path'):
+        await send_profile_photo(
+            bot, YOUR_USER_ID, profile, caption=admin_message, parse_mode="Markdown",
+        )
     else:
         await bot.send_message(YOUR_USER_ID, admin_message, parse_mode="Markdown")
     await callback.answer("✅ Ваш отклик отправлен администратору!", show_alert=True)
@@ -2002,6 +2289,9 @@ async def respond_photo_received(message: types.Message, state: FSMContext):
 
 async def send_application(target, user_id: int, vacancy_id: str, photo_file_id: str = None):
     profile = get_subscriber_profile(user_id)
+    if profile and photo_file_id:
+        profile = dict(profile)
+        profile["photo_file_id"] = photo_file_id
     vacancy_row = get_vacancy_row(vacancy_id)
     if not vacancy_row:
         await target.answer("❌ Вакансия не найдена")
@@ -2021,8 +2311,10 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
     if employer_contact:
         try:
             msg = f"🔔 *Новый отклик на вакансию!*\n\n📢 Вакансия из канала: {source_chat}\n\n{candidate_questionnaire}\n\n🔗 Ссылка на сообщение: {vacancy_link}"
-            if photo_file_id:
-                await bot.send_photo(employer_contact, photo_file_id, caption=msg, parse_mode="Markdown")
+            if photo_file_id or profile.get("photo_storage_path"):
+                await send_profile_photo(
+                    bot, employer_contact, profile, caption=msg, parse_mode="Markdown",
+                )
             else:
                 await bot.send_message(employer_contact, msg, parse_mode="Markdown", disable_web_page_preview=True)
             await target.answer("✅ Ваша анкета отправлена работодателю!", show_alert=True)
@@ -2048,8 +2340,11 @@ async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_que
         f"📞 Свяжитесь с кандидатом: {user_link}\n\n"
         f"⚠️ *Контакт заказчика не найден!* Перешлите анкету вручную."
     )
-    if photo_file_id:
-        await bot.send_photo(YOUR_USER_ID, photo_file_id, caption=admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True)
+    if photo_file_id or profile.get("photo_storage_path"):
+        await send_profile_photo(
+            bot, YOUR_USER_ID, profile,
+            caption=admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True,
+        )
     else:
         await bot.send_message(YOUR_USER_ID, admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True)
     await target.answer("✅ Отклик отправлен администратору! Он свяжется с вами.", show_alert=True)
@@ -2068,7 +2363,7 @@ async def admin_menu(message: types.Message):
     await bot.send_chat_action(message.chat.id, "typing")
     text = await run_db(build_admin_dashboard_text)
     await message.answer(
-        text,
+        f"{text}\n\n📖 Справка — «Как пользоваться» или /help",
         parse_mode="Markdown",
         reply_markup=get_admin_keyboard(),
     )
@@ -2081,6 +2376,7 @@ async def status_cmd(message: types.Message):
     parser = get_parser_status_snapshot()
     await message.answer(
         f"📊 *Статус бота*\n\n✅ Polling активен\n"
+        f"Сборка: `{APP_BUILD}`\n"
         f"{format_parser_status_line(parser)}\n\n"
         f"👥 Подписчиков: {stats['subscribers']} | 💬 Откликов: {stats['responses']}",
         parse_mode="Markdown",
@@ -2581,7 +2877,7 @@ async def admin_close_menu(message: types.Message):
 # ========== ЗАПУСК И ОСТАНОВКА ==========
 
 async def on_startup():
-    logger.info("🚀 Запуск бота...")
+    logger.info("🚀 Запуск бота... (сборка %s)", APP_BUILD)
     init_db()
     migrated = migrate_legacy_vacancy_ids()
     if migrated:
@@ -2614,11 +2910,22 @@ async def on_startup():
     )
     logger.info(f"📡 {PARSER_LABEL} запущен (резервный опрос каждые 5 мин)")
 
+    logger.info("📷 Фото профилей: %s", get_user_photos_dir())
+
+    async def notify_photo_issue(user_id: int, text: str):
+        try:
+            await bot.send_message(user_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("notify_photo_issue user=%s: %s", user_id, e)
+
+    spawn_background_task(photo_health_loop(bot, notify_photo_issue))
+
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🏠 Главное меню"),
             BotCommand(command="help", description="📖 Как пользоваться"),
         ])
+        logger.info("✅ Меню команд Telegram: /start, /help")
     except Exception as e:
         logger.warning(f"Не удалось set_my_commands: {e}")
 

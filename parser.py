@@ -118,32 +118,132 @@ def is_chat_monitored(chat_id) -> bool:
         return False
     return bool(chat_id_aliases(chat_id) & _monitored_chat_ids)
 
-async def _process_single_message(message, chat, chat_id: str, chat_title: str, stats: dict = None):
+
+# Маркеры закрытой вакансии в тексте поста (не reply).
+_CLOSED_LINE_PATTERNS = [
+    re.compile(r"^\s*закрыто\b", re.I | re.M),
+    re.compile(r"\bзакрыто\s*❌", re.I),
+    re.compile(r"\bвакансия\s+закрыт", re.I),
+    re.compile(r"\bнабор\s+заверш", re.I),
+    re.compile(r"\bне\s+актуальн", re.I),
+    re.compile(r"\bкомплект\b", re.I),
+    re.compile(r"\bмест\s+нет\b", re.I),
+    re.compile(r"\bуже\s+нашли\b", re.I),
+    re.compile(r"\bнашли\s+всех\b", re.I),
+]
+# Короткий reply «закрыто ❌» — отдельно (там ❌ уместен).
+_REPLY_CLOSE_MARKERS = [
+    "закрыт", "закрыта", "закрыто", "❌", "набор завершён", "вакансия закрыта", "не актуально",
+]
+_STRIKE_CLOSE_HINT = re.compile(
+    r"работа|смена|нужно\s+\d|утра\s+до|\d{1,2}\.\d{1,2}\.\d{2,4}",
+    re.I,
+)
+
+
+def is_vacancy_closed_text(text: str) -> bool:
+    """Пост с «ЗАКРЫТО» в том же сообщении (частый паттерн в HelpersTeam)."""
+    if not text or not text.strip():
+        return False
+    for pat in _CLOSED_LINE_PATTERNS:
+        if pat.search(text):
+            return True
+    tail = "\n".join(text.strip().splitlines()[-5:])
+    if re.search(r"^\s*закрыт[ао]?\s*❌*\s*$", tail, re.I | re.M):
+        return True
+    return False
+
+
+def _is_reply_close_text(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _REPLY_CLOSE_MARKERS)
+
+
+def _entity_is_strike(ent) -> bool:
+    if type(ent).__name__ == "MessageEntityStrike":
+        return True
+    return bool(getattr(ent, "_test_strike", False))
+
+
+def _extract_strikethrough_text(text: str, entities) -> str:
+    if not text or not entities:
+        return ""
+    chunks = []
+    for ent in entities:
+        if not _entity_is_strike(ent):
+            continue
+        start, end = ent.offset, ent.offset + ent.length
+        if 0 <= start < len(text):
+            chunks.append(text[start:min(end, len(text))])
+    return "\n".join(chunks)
+
+
+def is_strikethrough_closure(text: str, entities=None) -> bool:
+    """Закрытие через зачёркивание заголовка/даты (редактирование поста)."""
+    struck = _extract_strikethrough_text(text or "", entities)
+    if not struck or len(struck.strip()) < 6:
+        return False
+    if _STRIKE_CLOSE_HINT.search(struck):
+        return True
+    full_len = max(len(text or ""), 1)
+    return len(struck) / full_len >= 0.28
+
+
+async def _close_vacancy_by_message_id(
+    message_id: str, chat_id: str, stats: dict = None,
+) -> dict | None:
+    vacancy_id, users = await run_db(mark_vacancy_closed, message_id, chat_id)
+    if vacancy_id and stats is not None:
+        stats["closed_vacancies"] += 1
+    if vacancy_id:
+        return {"type": "closed", "vacancy_id": vacancy_id, "users": users}
+    return None
+
+
+async def _process_single_message(
+    message, chat, chat_id: str, chat_title: str, stats: dict = None, *, allow_reprocess: bool = False,
+):
     """Обрабатывает одно сообщение: фильтр, категория, дедуп. Возвращает order или None."""
     if not message.text:
         if stats is not None:
             stats["no_text"] += 1
         return None
     message_id = str(message.id)
-    if await run_db(is_message_processed, message_id, chat_id):
+    if not allow_reprocess and await run_db(is_message_processed, message_id, chat_id):
         if stats is not None:
             stats["already_sent"] += 1
         return None
-    if not is_message_recent(message.date):
+    if not allow_reprocess and not is_message_recent(message.date):
         if stats is not None:
             stats["old_messages"] += 1
         return None
 
-    if message.is_reply:
+    entities = getattr(message, "entities", None)
+
+    if message.is_reply and _is_reply_close_text(message.text):
         original_message = await message.get_reply_message()
         if original_message and original_message.id:
-            close_markers = ["закрыт", "закрыта", "❌", "набор завершён", "вакансия закрыта", "не актуально"]
-            if any(marker in message.text.lower() for marker in close_markers):
-                original_id = str(original_message.id)
-                vacancy_id, users = await run_db(mark_vacancy_closed, original_id, chat_id)
-                if stats is not None:
-                    stats["closed_vacancies"] += 1
-                return {"type": "closed", "vacancy_id": vacancy_id, "users": users}
+            original_id = str(original_message.id)
+            closed = await _close_vacancy_by_message_id(original_id, chat_id, stats)
+            if closed:
+                return closed
+
+    if is_strikethrough_closure(message.text, entities):
+        closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
+        if not allow_reprocess:
+            await run_db(mark_message_processed, message_id, chat_id)
+        return closed
+
+    if is_vacancy_closed_text(message.text):
+        closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
+        if not allow_reprocess:
+            await run_db(mark_message_processed, message_id, chat_id)
+        return closed
+
+    if allow_reprocess:
+        return None
 
     is_relevant, reason, keywords = is_helper_message(message.text)
     if stats is not None:
@@ -388,6 +488,21 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                 f"уже в БД {startup_stats['already_sent']}"
             )
 
+            async def _dispatch_parser_result(result, chat_title: str, *, edited: bool = False):
+                if result and result.get("type") == "closed":
+                    if closed_callback and result.get("users"):
+                        await closed_callback([(result["vacancy_id"], result["users"])])
+                    if result.get("vacancy_id"):
+                        logger.info(
+                            f"🔒 {PARSER_LABEL}: закрыта вакансия {result['vacancy_id']} "
+                            f"({'редактирование' if edited else 'пост'}) «{chat_title}»"
+                        )
+                elif result:
+                    bot_callback(result)
+                    logger.info(
+                        f"⚡ {PARSER_LABEL}: вакансия [{result.get('category')}] из «{chat_title}»"
+                    )
+
             async def on_new_message(event):
                 if not is_chat_monitored(event.chat_id):
                     logger.debug(
@@ -403,18 +518,36 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
 
                 try:
                     result = await _process_single_message(message, chat, chat_id, chat_title)
-                    if result and result.get("type") == "closed":
-                        if closed_callback and result.get("users"):
-                            await closed_callback([(result["vacancy_id"], result["users"])])
-                    elif result:
-                        bot_callback(result)
-                        logger.info(
-                            f"⚡ {PARSER_LABEL}: вакансия [{result.get('category')}] из «{chat_title}»"
-                        )
+                    await _dispatch_parser_result(result, chat_title)
                 except Exception as e:
                     logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
 
+            async def on_edited_message(event):
+                if not is_chat_monitored(event.chat_id):
+                    return
+                message = event.message
+                if not message.text:
+                    return
+                closed_signal = (
+                    is_vacancy_closed_text(message.text)
+                    or is_strikethrough_closure(message.text, getattr(message, "entities", None))
+                )
+                if not closed_signal:
+                    return
+                chat = await event.get_chat()
+                chat_id = str(chat.id)
+                chat_title = chat.title or "Без названия"
+                logger.info(f"✏️ {PARSER_LABEL}: редактирование (закрытие) chat_id={event.chat_id}")
+                try:
+                    result = await _process_single_message(
+                        message, chat, chat_id, chat_title, allow_reprocess=True,
+                    )
+                    await _dispatch_parser_result(result, chat_title, edited=True)
+                except Exception as e:
+                    logger.warning(f"⚠️ {PARSER_LABEL}: ошибка edit chat={chat_title}: {e}")
+
             _realtime_client.add_event_handler(on_new_message, events.NewMessage())
+            _realtime_client.add_event_handler(on_edited_message, events.MessageEdited())
             spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
             await _realtime_client.run_until_disconnected()
         except SessionNotConfiguredError as e:
