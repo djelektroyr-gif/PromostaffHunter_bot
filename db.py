@@ -12,6 +12,7 @@ from db_backend import (
     bool_default_true,
     bool_false,
     bool_true,
+    column_exists_cur,
     db_conn,
     db_info_label,
     execute,
@@ -22,6 +23,7 @@ from db_backend import (
     now_plus_days,
     paid_until_active,
     paid_until_expired,
+    pg_column_data_type,
     q,
     serial_pk,
     table_exists,
@@ -30,6 +32,30 @@ from db_backend import (
 logger = logging.getLogger(__name__)
 
 DB_NAME = db_info_label() if IS_POSTGRES else get_database_path()
+
+
+def _migrate_pg_telegram_bigint_ids(cur) -> None:
+    """Telegram user/message id > 2^31 — INTEGER в PG переполняется."""
+    if not IS_POSTGRES:
+        return
+    targets = [
+        ("vacancies", "poster_user_id"),
+        ("vacancies", "employer_id"),
+        ("vacancies", "posted_by_bot_user_id"),
+        ("employers", "telegram_user_id"),
+        ("employers", "bot_user_id"),
+        ("last_processed", "last_message_id"),
+    ]
+    for table, column in targets:
+        if not column_exists_cur(cur, table, column):
+            continue
+        if pg_column_data_type(cur, table, column) != "integer":
+            continue
+        try:
+            cur.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
+            logger.info("PostgreSQL: %s.%s → BIGINT", table, column)
+        except Exception as e:
+            logger.warning("PostgreSQL migrate %s.%s: %s", table, column, e)
 
 
 def _migrate_legacy_database_if_needed() -> None:
@@ -438,6 +464,8 @@ def init_db():
             "ALTER TABLE premium_requests ADD COLUMN receipt_kind TEXT DEFAULT NULL",
             cur=cur,
         )
+
+        _migrate_pg_telegram_bigint_ids(cur)
 
     logger.info(db_info_label())
 

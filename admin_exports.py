@@ -24,57 +24,66 @@ def _workbook_to_bytes(wb: openpyxl.Workbook) -> bytes:
     return buf.getvalue()
 
 
-def _write_sheet(ws, headers: list[str], rows: list[list]):
-    ws.append(headers)
+def _write_sheet(ws, columns: list[tuple[str, str]], rows: list[dict]):
+    ws.append([label for _, label in columns])
     for row in rows:
-        ws.append(row)
+        ws.append([row.get(key) for key, _ in columns])
     _autosize_columns(ws)
 
 
-def build_subscribers_xlsx(rows: list[dict]) -> bytes:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "subscribers"
-    headers = [
-        "user_id", "username", "full_name", "first_name", "last_name", "phone", "age",
-        "birth_date", "user_role", "plan", "paid_until", "trial_used", "metro_zones",
-        "categories", "registered_at", "is_active", "has_photo", "resume_extra",
-    ]
-    data = []
-    for r in rows:
-        data.append([
-            r.get("user_id"), r.get("username"), r.get("full_name"), r.get("first_name"),
-            r.get("last_name"), r.get("phone"), r.get("age"), r.get("birth_date"),
-            r.get("user_role"), r.get("plan"), r.get("paid_until"), r.get("trial_used"),
-            r.get("metro_zones"), r.get("categories"), r.get("registered_at"),
-            r.get("is_active"), r.get("has_photo"), r.get("resume_extra"),
-        ])
-    _write_sheet(ws, headers, data)
-    return _workbook_to_bytes(wb)
+SUBSCRIBERS_COLUMNS = [
+    ("user_id", "ID пользователя"),
+    ("username", "Username"),
+    ("full_name", "ФИО"),
+    ("first_name", "Имя"),
+    ("last_name", "Фамилия"),
+    ("phone", "Телефон"),
+    ("age", "Возраст"),
+    ("birth_date", "Дата рождения"),
+    ("user_role", "Роль"),
+    ("plan", "Тариф"),
+    ("paid_until", "Premium до"),
+    ("trial_used", "Пробный период использован"),
+    ("metro_zones", "Станции метро"),
+    ("categories", "Категории"),
+    ("registered_at", "Дата регистрации"),
+    ("is_active", "Активен"),
+    ("has_photo", "Есть фото"),
+    ("resume_extra", "Доп. информация"),
+]
 
+VACANCIES_COLUMNS = [
+    ("id", "ID вакансии"),
+    ("category_code", "Категория"),
+    ("source_chat_title", "Чат-источник"),
+    ("author_contact", "Контакт"),
+    ("contact_source", "Источник контакта"),
+    ("poster_user_id", "ID автора (TG)"),
+    ("poster_username", "Username автора"),
+    ("poster_display_name", "Имя автора"),
+    ("employer_id", "ID заказчика"),
+    ("posted_by_bot_user_id", "ID заказчика в боте"),
+    ("address", "Адрес"),
+    ("published_at", "Опубликовано"),
+    ("found_at", "Найдено парсером"),
+    ("is_closed", "Закрыта"),
+    ("message_link", "Ссылка"),
+    ("message_text", "Текст"),
+]
 
-def build_vacancies_xlsx(rows: list[dict]) -> bytes:
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "vacancies"
-    headers = [
-        "id", "category", "source_chat_title", "author_contact", "contact_source",
-        "poster_user_id", "poster_username", "poster_display_name", "employer_id",
-        "posted_by_bot_user_id", "address", "published_at", "found_at", "is_closed",
-        "message_link", "message_text",
-    ]
-    data = []
-    for r in rows:
-        data.append([
-            r.get("id"), r.get("category_code"), r.get("source_chat_title"),
-            r.get("author_contact"), r.get("contact_source"), r.get("poster_user_id"),
-            r.get("poster_username"), r.get("poster_display_name"), r.get("employer_id"),
-            r.get("posted_by_bot_user_id"), r.get("address"), r.get("published_at"),
-            r.get("found_at"), r.get("is_closed"), r.get("message_link"), r.get("message_text"),
-        ])
-    _write_sheet(ws, headers, data)
-    return _workbook_to_bytes(wb)
-
+EMPLOYERS_COLUMNS = [
+    ("id", "ID"),
+    ("telegram_user_id", "Telegram ID"),
+    ("username", "Username"),
+    ("display_name", "Имя"),
+    ("contact_text", "Контакт"),
+    ("contact_source", "Источник контакта"),
+    ("vacancies_count", "Вакансий"),
+    ("categories_csv", "Категории"),
+    ("bot_user_id", "ID в боте"),
+    ("first_seen_at", "Первый раз"),
+    ("last_seen_at", "Последний раз"),
+]
 
 NOTFIT_REASON_LABELS = {
     "wrong_category": "Не та категория / роль",
@@ -86,48 +95,60 @@ NOTFIT_REASON_LABELS = {
 }
 
 
+def build_subscribers_xlsx(rows: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Подписчики"
+    _write_sheet(ws, SUBSCRIBERS_COLUMNS, rows)
+    return _workbook_to_bytes(wb)
+
+
+def build_vacancies_xlsx(rows: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Вакансии"
+    _write_sheet(ws, VACANCIES_COLUMNS, rows)
+    return _workbook_to_bytes(wb)
+
+
 def build_notfit_xlsx(rows: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "notfit"
-    headers = [
-        "id", "created_at", "user_id", "username", "full_name",
-        "reason_code", "reason_label", "reason_text",
-        "vacancy_id", "vacancy_category", "user_categories",
-        "source_chat", "message_link", "message_text",
+    ws.title = "Не подходит"
+    columns = [
+        ("id", "ID записи"),
+        ("created_at", "Дата"),
+        ("user_id", "ID пользователя"),
+        ("username", "Username"),
+        ("full_name", "ФИО"),
+        ("reason_code", "Код причины"),
+        ("reason_label", "Причина"),
+        ("reason_text", "Комментарий"),
+        ("vacancy_id", "ID вакансии"),
+        ("vacancy_category", "Категория вакансии"),
+        ("user_categories", "Категории пользователя"),
+        ("source_chat_title", "Чат"),
+        ("message_link", "Ссылка"),
+        ("message_text", "Текст вакансии"),
     ]
-    data = []
+    enriched = []
     for r in rows:
         code = r.get("reason_code") or ""
-        data.append([
-            r.get("id"), r.get("created_at"), r.get("user_id"), r.get("username"),
-            r.get("full_name") or r.get("first_name"),
-            code, NOTFIT_REASON_LABELS.get(code, code), r.get("reason_text"),
-            r.get("vacancy_id"), r.get("vacancy_category") or r.get("vacancy_category_live"),
-            r.get("user_categories"), r.get("source_chat_title"), r.get("message_link"),
-            r.get("message_text"),
-        ])
-    _write_sheet(ws, headers, data)
+        enriched.append({
+            **r,
+            "reason_label": NOTFIT_REASON_LABELS.get(code, code),
+            "full_name": r.get("full_name") or r.get("first_name"),
+            "vacancy_category": r.get("vacancy_category") or r.get("vacancy_category_live"),
+        })
+    _write_sheet(ws, columns, enriched)
     return _workbook_to_bytes(wb)
 
 
 def build_employers_xlsx(rows: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "employers"
-    headers = [
-        "id", "telegram_user_id", "username", "display_name", "contact_text", "contact_source",
-        "vacancies_count", "categories_csv", "bot_user_id", "first_seen_at", "last_seen_at",
-    ]
-    data = []
-    for r in rows:
-        data.append([
-            r.get("id"), r.get("telegram_user_id"), r.get("username"), r.get("display_name"),
-            r.get("contact_text"), r.get("contact_source"), r.get("vacancies_count"),
-            r.get("categories_csv"), r.get("bot_user_id"), r.get("first_seen_at"),
-            r.get("last_seen_at"),
-        ])
-    _write_sheet(ws, headers, data)
+    ws.title = "Заказчики"
+    _write_sheet(ws, EMPLOYERS_COLUMNS, rows)
     return _workbook_to_bytes(wb)
 
 

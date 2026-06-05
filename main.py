@@ -236,6 +236,9 @@ def build_order_from_vacancy_row(vacancy_id: str, row) -> dict | None:
     }
 
 BTN_SETTINGS = "⚙️ Настройки"
+BTN_METRO = "📍 Станции метро"
+BTN_SETTINGS_CATEGORIES = "📌 Категории вакансий"
+BTN_SETTINGS_BACK = "◀️ В главное меню"
 BTN_MY_DATA = "👤 Мои данные"
 BTN_SETTINGS_LEGACY = "📋 Категории"
 BTN_MY_DATA_LEGACY = "📞 Мои контакты"
@@ -537,7 +540,7 @@ async def activate_premium_for_user(target_id: int, days: int) -> bool:
             f"💎 *Premium активирован* на {days} дн.{until_line}\n\n"
             "• моментальные push-уведомления\n"
             "• все категории без лимита\n"
-            "• фильтр по метро (📍 Мои районы)\n\n"
+            "• фильтр по метро (⚙️ Настройки → 📍 Станции метро)\n\n"
             "Категории — кнопка «⚙️ Настройки».",
             parse_mode="Markdown",
         )
@@ -745,7 +748,7 @@ def format_subscription_screen(user_id: int) -> str:
         f"<b>Premium даёт:</b>\n"
         f"• моментальные push-уведомления\n"
         f"• все категории без лимита\n"
-        f"• фильтр по метро/району (📍 Мои районы)\n\n"
+        f"• фильтр по метро/району (⚙️ Настройки → 📍 Станции метро)\n\n"
         f"<b>Free:</b> до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
         f"{pay_heading}\n{pay_block}{trial_hint}"
     )
@@ -932,7 +935,7 @@ def build_user_help_html(user_id: int) -> str:
         "<b>5. Мои отклики</b>\n"
         "«📨 Мои отклики» — история, статус вакансии, ссылка на пост.\n\n"
         "<b>6. Районы (Premium)</b>\n"
-        "«📍 Мои районы» — станции метро; push и лента только по ним "
+        "«📍 Станции метро» в ⚙️ Настройках — push и лента только по выбранным станциям "
         "(если метро в вакансии не указано — не отсекаем).\n\n"
         "<b>7. Подписка</b>\n"
         "«💎 Подписка» — тариф, продление, оплата по реквизитам.\n\n"
@@ -1382,13 +1385,34 @@ def get_main_keyboard(user_id: int):
         keyboard=[
             [KeyboardButton(text="🔍 Посмотреть новые вакансии")],
             [KeyboardButton(text="📨 Мои отклики"), KeyboardButton(text=BTN_SETTINGS)],
-            [KeyboardButton(text="📍 Мои районы"), KeyboardButton(text="💎 Подписка")],
-            [KeyboardButton(text=BTN_MY_DATA)],
+            [KeyboardButton(text="💎 Подписка"), KeyboardButton(text=BTN_MY_DATA)],
             [KeyboardButton(text="📖 Как пользоваться"), KeyboardButton(text="❓ Поддержка")],
         ],
         resize_keyboard=True
     )
     return keyboard, status_text
+
+
+def get_settings_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_SETTINGS_CATEGORIES)],
+            [KeyboardButton(text=BTN_METRO)],
+            [KeyboardButton(text=BTN_SETTINGS_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+USER_MENU_BUTTONS = {
+    "🔍 Посмотреть новые вакансии",
+    "📨 Мои отклики", BTN_SETTINGS, BTN_SETTINGS_LEGACY,
+    BTN_SETTINGS_CATEGORIES, BTN_METRO, BTN_SETTINGS_BACK,
+    "📍 Мои районы",
+    "💎 Подписка", BTN_MY_DATA, BTN_MY_DATA_LEGACY,
+    "📖 Как пользоваться", "❓ Поддержка",
+    "📋 Мои категории", "✏️ Изменить категории",
+}
 
 ADMIN_BTN_HUB_PARSER = "📡 Парсер"
 ADMIN_BTN_HUB_USERS = "👥 Пользователи"
@@ -2216,7 +2240,7 @@ async def show_feed_mode_menu(message: types.Message, user_id: int):
         return
     fresh_total, archive_total = _feed_mode_totals(user_id)
     apply_metro, _ = _feed_metro_context(user_id)
-    hint = "\n\n📍 Учитывается фильтр «Мои районы»." if apply_metro else ""
+    hint = "\n\n📍 Учитывается фильтр «Станции метро»." if apply_metro else ""
     if fresh_total == 0 and archive_total == 0:
         await message.answer(
             f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
@@ -2240,7 +2264,7 @@ async def show_feed_category_menu(message: types.Message, user_id: int, feed_mod
         return
     markup, total = build_feed_category_keyboard(user_id, feed_mode)
     apply_metro, _ = _feed_metro_context(user_id)
-    hint = "\n\n📍 Учитывается фильтр «Мои районы»." if apply_metro else ""
+    hint = "\n\n📍 Учитывается фильтр «Станции метро»." if apply_metro else ""
     mode_title = f"🟢 Свежие ({FEED_FRESH_HOURS} ч)" if feed_mode == "fresh" else "📂 Ранее"
     if total == 0:
         await message.answer(
@@ -2268,7 +2292,7 @@ async def open_feed_vacancies(
     all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
     if not all_vacancies:
         apply_metro, _ = _feed_metro_context(user_id)
-        hint = "\n\nПопробуйте расширить «📍 Мои районы»." if apply_metro else ""
+        hint = "\n\nПопробуйте расширить список станций в ⚙️ Настройки → 📍 Станции метро." if apply_metro else ""
         await message.answer(f"🔍 В этой категории вакансий нет.{hint}", parse_mode="Markdown")
         return
     user_pages[user_id] = {
@@ -2573,7 +2597,32 @@ async def premium_request_reject_callback(callback: types.CallbackQuery):
         pass
 
 
-@dp.message(lambda m: m.text == "📍 Мои районы")
+def _is_metro_reset(text: str) -> bool:
+    return text.strip().lower() in {"-", "0", "сброс", "reset", "отмена", "нет"}
+
+
+async def _cancel_metro_input(message: types.Message, state: FSMContext):
+    """Выход из ввода метро без сохранения текста кнопки меню."""
+    await state.clear()
+    text = (message.text or "").strip()
+    user_id = message.from_user.id
+    if text in {BTN_MY_DATA, BTN_MY_DATA_LEGACY}:
+        await send_profile_data_screen(message.chat.id, user_id)
+        return
+    if text == BTN_SETTINGS_CATEGORIES:
+        await send_category_picker(message.chat.id, user_id)
+        return
+    if text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
+        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard())
+        return
+    if text == BTN_METRO or text == "📍 Мои районы":
+        await metro_zones_menu(message, state)
+        return
+    keyboard, status = get_main_keyboard(user_id)
+    await message.answer("Ввод станций отменён.", reply_markup=keyboard)
+
+
+@dp.message(lambda m: m.text in {BTN_METRO, "📍 Мои районы"})
 async def metro_zones_menu(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if not is_user_premium(user_id):
@@ -2581,18 +2630,20 @@ async def metro_zones_menu(message: types.Message, state: FSMContext):
             "📍 Фильтр по метро — функция *Premium*.\n\n"
             "Оформите подписку в 💎 Подписка или дождитесь окончания пробного периода.",
             parse_mode="Markdown",
+            reply_markup=get_settings_keyboard() if message.text == BTN_METRO else get_main_keyboard(user_id)[0],
         )
         return
     profile = get_subscriber_profile(user_id)
     current = profile.get("metro_zones") if profile else None
     current_line = current if current else "не заданы (приходят все локации)"
     await message.answer(
-        f"📍 *Мои станции метро*\n\n"
+        f"📍 *Станции метро*\n\n"
         f"Сейчас: {current_line}\n\n"
         f"Введите станции через запятую, например:\n"
         f"`Таганская, Беляево, Сокол`\n\n"
-        f"Отправьте `-` чтобы сбросить фильтр.",
+        f"Чтобы *сбросить* фильтр — отправьте `0` или `-`.",
         parse_mode="Markdown",
+        reply_markup=get_settings_keyboard(),
     )
     await state.set_state(MetroState.waiting_for_zones)
 
@@ -2600,18 +2651,33 @@ async def metro_zones_menu(message: types.Message, state: FSMContext):
 @dp.message(MetroState.waiting_for_zones)
 async def metro_zones_save(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    text = message.text.strip()
-    if text == "-":
+    text = (message.text or "").strip()
+    if text in USER_MENU_BUTTONS:
+        await _cancel_metro_input(message, state)
+        return
+    if _is_metro_reset(text):
         set_user_metro_zones(user_id, None)
-        await message.answer("✅ Фильтр по метро сброшен — снова все локации.")
-    else:
-        zones = ", ".join(z.strip() for z in text.split(",") if z.strip())
-        if not zones:
-            await message.answer("❌ Укажите хотя бы одну станцию или `-` для сброса.")
-            return
-        set_user_metro_zones(user_id, zones)
-        await message.answer(f"✅ Сохранено: *{zones}*\n\nPush и лента — только вакансии с этими станциями.", parse_mode="Markdown")
+        await state.clear()
+        await message.answer(
+            "✅ Фильтр по метро сброшен — снова все локации.",
+            reply_markup=get_settings_keyboard(),
+        )
+        return
+    zones = ", ".join(z.strip() for z in text.split(",") if z.strip())
+    if not zones or "👤" in zones or "⚙️" in zones:
+        await message.answer(
+            "❌ Укажите названия станций через запятую.\n"
+            "Или отправьте `0`, чтобы показывать все локации.",
+            parse_mode="Markdown",
+        )
+        return
+    set_user_metro_zones(user_id, zones)
     await state.clear()
+    await message.answer(
+        f"✅ Сохранено: *{zones}*\n\nPush и лента — только вакансии с этими станциями.",
+        parse_mode="Markdown",
+        reply_markup=get_settings_keyboard(),
+    )
 
 @dp.message(Command("setplan"))
 async def setplan_cmd(message: types.Message):
@@ -2645,8 +2711,29 @@ async def setplan_cmd(message: types.Message):
         + ("" if notified else " (уведомление пользователю не доставлено)")
     )
 
+@dp.message(lambda m: m.text == BTN_SETTINGS_BACK)
+async def settings_back_to_main(message: types.Message, state: FSMContext):
+    await state.clear()
+    keyboard, status = get_main_keyboard(message.from_user.id)
+    await message.answer(f"🏠 Главное меню\n\n{status}", reply_markup=keyboard)
+
+
 @dp.message(lambda m: m.text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, "📋 Мои категории", "✏️ Изменить категории"})
-async def open_categories_menu(message: types.Message):
+async def open_settings_menu(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "⚙️ *Настройки*\n\n"
+        "• 📌 *Категории* — какие вакансии присылать\n"
+        "• 📍 *Станции метро* — фильтр локаций (Premium)\n\n"
+        "Выберите пункт ниже.",
+        parse_mode="Markdown",
+        reply_markup=get_settings_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.text == BTN_SETTINGS_CATEGORIES)
+async def open_categories_from_settings(message: types.Message, state: FSMContext):
+    await state.clear()
     await send_category_picker(message.chat.id, message.from_user.id)
 
 

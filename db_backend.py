@@ -97,6 +97,20 @@ def column_exists_cur(cur, table_name: str, column_name: str) -> bool:
     return column_name in cols
 
 
+def pg_column_data_type(cur, table_name: str, column_name: str) -> str | None:
+    if not IS_POSTGRES:
+        return None
+    cur.execute(
+        """
+        SELECT data_type FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s AND column_name=%s
+        """,
+        (table_name, column_name),
+    )
+    row = cur.fetchone()
+    return row[0] if row else None
+
+
 def add_column_if_missing(table: str, column: str, ddl_sqlite: str, ddl_pg: str = None, cur=None):
     ddl = ddl_pg if IS_POSTGRES and ddl_pg else ddl_sqlite
     if cur is not None:
