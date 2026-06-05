@@ -22,13 +22,20 @@ def test_channel_preview_keyboard_urls():
 
 
 def test_channel_preview_text_truncates():
-    body = "x" * 500
+    body = (
+        "На завтра нужен промоутер у метро Таганская. Оплата 2000.\n"
+        "☎️ @boss123"
+    )
     text = build_channel_preview_text(
         category_name="Промоутер",
         category_emoji="📢",
         body=body,
-        source="Test",
-        freshness="Сегодня",
+        source="Secret Group",
+        freshness="несколько часов назад",
     )
     assert "Промоутер" in text
-    assert len(text) < 600
+    assert "несколько часов назад" in text
+    assert "Secret Group" not in text
+    assert "@" not in text
+    assert "boss123" not in text
+    assert "·" in text

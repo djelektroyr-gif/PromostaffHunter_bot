@@ -22,7 +22,7 @@ from parser import (
     get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
     spawn_background_task, vacancy_matches_category, evaluate_vacancy,
     resolve_vacancy_contact, build_vacancy_dedupe_key,
-    format_chat_noise_report,
+    format_chat_noise_report, parser_scan_in_progress,
 )
 from admin_exports import (
     build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
@@ -267,6 +267,18 @@ def escape_markdown(text: str) -> str:
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 
+def greeting_display_name(profile: dict | None, user: types.User) -> str:
+    """Имя для приветствия: ФИО из анкеты, иначе имя из Telegram."""
+    if profile and (profile.get("full_name") or "").strip():
+        return profile["full_name"].strip()
+    parts = [p for p in (user.first_name, user.last_name) if p]
+    if parts:
+        return " ".join(parts)
+    if user.username:
+        return user.username
+    return "друг"
+
+
 def build_maps_url(address: str) -> str | None:
     if not address or not address.strip():
         return None
@@ -335,17 +347,16 @@ def format_vacancy_card_html(
     source: str,
     message_link: str | None = None,
 ) -> str:
-    lines = [
-        f"{category_emoji} <b>{escape_html(category_name)}</b>",
-        escape_html(freshness),
-        f"🕒 Опубликовано: {escape_html(published_at)}",
-        f"📢 Из чата: {escape_html(source)}",
-        "",
-        escape_html((body or "")[:500]),
-    ]
-    if message_link and message_link.startswith("https://"):
-        lines.extend(["", f'<a href="{escape_html(message_link)}">🔗 Ссылка на сообщение</a>'])
-    return "\n".join(lines)
+    del published_at, source, message_link  # публичная карточка — без источника и ссылки на чужую группу
+    from services.vacancy_public_text import sanitize_vacancy_public_body
+
+    description = sanitize_vacancy_public_body(body or "", max_len=500)
+    if not description:
+        description = "Откройте карточку в боте — там кнопка «Отклик»."
+    return (
+        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n\n"
+        f"{escape_html(description)}"
+    )
 
 
 async def send_vacancy_card(
@@ -372,7 +383,22 @@ async def send_vacancy_card(
             **extra,
         )
     except TelegramBadRequest as e:
-        if "parse" in str(e).lower():
+        err = str(e).lower()
+        if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
+            logger.warning("send_vacancy_card: тема недоступна user=%s, fallback в общий чат", chat_id)
+            extra = {}
+            try:
+                await send_message_with_retry(
+                    chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                return
+            except TelegramBadRequest:
+                pass
+        if "parse" in err:
             plain = re.sub(r"<[^>]*>", "", text)
             await send_message_with_retry(
                 chat_id,
@@ -667,7 +693,7 @@ def build_admin_dashboard_text() -> str:
         f"• Подписчиков: {stats['subscribers']} (💎 premium: {premium})\n"
         f"• Полных профилей: {stats['full_profiles']}\n"
         f"• Откликов: {stats['responses']}\n"
-        f"• Вакансий в очереди: {stats['pending_vacancies']}\n"
+        f"• Вакансий открытых: {stats['pending_vacancies']}\n"
         f"• Всего вакансий: {stats['total_vacancies']}\n"
         f"• ⚠️ Жалоб: {stats['pending_complaints']}\n"
         f"• ❓ Поддержка: {stats['pending_support']}\n"
@@ -995,9 +1021,16 @@ def calculate_age(birth_date_str: str) -> int:
 
 def format_user_card(card: dict, idx: int = None) -> str:
     prefix = f"{idx}. " if idx is not None else ""
-    name = card.get("full_name") or "—"
+    name = (card.get("full_name") or "").strip()
+    if not name:
+        name = " ".join(p for p in (card.get("first_name"), card.get("last_name")) if p).strip()
+    if not name:
+        name = "—"
     username = f"@{card['username']}" if card.get("username") else "нет"
     cats = ", ".join(card.get("categories") or []) or "не выбраны"
+    profile_note = ""
+    if name == "—" or (not card.get("full_name") and not card.get("phone")):
+        profile_note = "\n⚠️ Анкета не заполнена (зашли из канала / не завершили регистрацию)"
     status = "активен" if card.get("is_active") else "неактивен"
     if card.get("is_premium"):
         until = format_db_date_short(card.get("paid_until"))
@@ -1013,7 +1046,7 @@ def format_user_card(card: dict, idx: int = None) -> str:
         f"Телефон: {escape_markdown(card.get('phone') or '—')}\n"
         f"Тариф: {escape_markdown(plan_line)}\n"
         f"Статус: {escape_markdown(status)}\n"
-        f"Категории: {escape_markdown(cats)}"
+        f"Категории: {escape_markdown(cats)}{profile_note}"
     )
 
 def _coerce_db_datetime(raw_dt):
@@ -1337,17 +1370,17 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
-        if CHANNEL_CROSSPOST_ENABLED:
-            from services.channel_post import post_vacancy_preview_to_channel
-            spawn_background_task(post_vacancy_preview_to_channel(
-                bot,
-                vacancy_id=vacancy_id,
-                category_name=cat_name,
-                category_emoji=get_category_emoji(category_code),
-                body=msg_text,
-                source=order.get("chat_title") or "—",
-                freshness=freshness,
-            ))
+    if CHANNEL_CROSSPOST_ENABLED:
+        from services.channel_post import post_vacancy_preview_to_channel
+        spawn_background_task(post_vacancy_preview_to_channel(
+            bot,
+            vacancy_id=vacancy_id,
+            category_name=cat_name,
+            category_emoji=get_category_emoji(category_code),
+            body=msg_text,
+            source=order.get("chat_title") or "—",
+            freshness=freshness,
+        ))
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
@@ -1552,10 +1585,11 @@ async def start_cmd(message: types.Message, state: FSMContext):
     role = get_subscriber_role(user_id)
 
     if profile and profile.get("full_name") and profile.get("phone"):
+        greet_name = escape_markdown(greeting_display_name(profile, message.from_user))
         if role == "employer":
             await setup_forum_topics_for_user(user_id)
             await message.answer(
-                f"👋 С возвращением, {first_name}!\n\n"
+                f"👋 С возвращением, {greet_name}!\n\n"
                 f"🏢 Режим заказчика — разместите вакансию или обновите контакты в «{BTN_MY_DATA}».",
                 reply_markup=get_employer_keyboard(),
             )
@@ -1565,7 +1599,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
             await setup_forum_topics_for_user(user_id)
             keyboard, status_text = get_main_keyboard(user_id)
             await message.answer(
-                f"👋 С возвращением, {first_name}!\n\n{status_text}\n\n"
+                f"👋 С возвращением, {greet_name}!\n\n{status_text}\n\n"
                 f"Используйте кнопки меню. Инструкция — «📖 Как пользоваться» или /help",
                 reply_markup=keyboard
             )
@@ -3571,6 +3605,11 @@ async def check_now_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
     status_msg = await message.answer("🔍 Начинаю проверку...")
+    if parser_scan_in_progress():
+        await status_msg.edit_text(
+            "🔍 Ожидание парсера…\n"
+            "Идёт синхронизация чатов (стартовая или ручная). Обычно 1–3 мин."
+        )
     try:
         orders, closed_data = await run_parser()
         if not orders and not closed_data:

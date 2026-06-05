@@ -153,3 +153,45 @@ def test_casting_rejected():
     ok, _, reason, _ = evaluate_vacancy(text)
     assert ok is False
     assert reason == "casting"
+
+
+def test_payment_slash_triple_format():
+    text = (
+        "Нужно 2 человека погрузка глины\n"
+        "ОПЛАТА 400/4/1600\n"
+        "Пишите в лс"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "nzboss"})
+    assert ok is True
+    assert cat == "loader"
+    assert reason == "accepted"
+
+
+def test_payment_thousands_per_day_promo():
+    text = (
+        "Требуются промоутеры на смотровую площадку!\n"
+        "Заработок от 6 до 15 тысяч рублей в день!\n"
+        "Заявки в лс"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "promoter"
+
+
+def test_ls_phrase_without_username_is_contact():
+    text = "Нужны 3 грузчика, оплата 3000, пишите в ЛС"
+    ok, reason, _ = is_job_post_for_staff(text)
+    assert ok is True
+    assert reason == "staff_job"
+
+
+def test_loader_uborka_two_people():
+    text = (
+        "На завтра к 9:00\n2 человека\n"
+        "Уборка в цеху, на улице.\n"
+        "Оплата 4500 на месте\n"
+        "@Rabotniki24"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "loader"

@@ -540,6 +540,7 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
     await asyncio.sleep(90)
     while _realtime_client and _realtime_client.is_connected():
         stats = _new_stats("periodic")
+        _publish_debug_stats(stats)
         try:
             async with _parser_lock:
                 logger.info("🔄 Плановая проверка новых вакансий (incremental)...")
@@ -550,8 +551,6 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
                     incremental=True,
                 )
             stats["finished_at"] = _iso_now()
-            global LAST_DEBUG_STATS
-            LAST_DEBUG_STATS = stats
             if closed_data and closed_callback:
                 await closed_callback(closed_data)
             for order in orders:
@@ -643,29 +642,6 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
 
             await refresh_monitored_chat_ids(_realtime_client)
 
-            async with _parser_lock:
-                logger.info("🔄 Стартовая синхронизация вакансий...")
-                startup_stats = _new_stats("startup")
-                startup_orders, startup_closed = await _scan_all_chats(
-                    _realtime_client,
-                    limit_per_chat=PER_CHAT_SCAN_LIMIT,
-                    stats=startup_stats,
-                    incremental=False,
-                )
-                startup_stats["finished_at"] = _iso_now()
-                global LAST_DEBUG_STATS
-                LAST_DEBUG_STATS = startup_stats
-            if startup_closed and closed_callback:
-                await closed_callback(startup_closed)
-            for order in startup_orders:
-                bot_callback(order)
-            logger.info(
-                f"✅ Стартовая синхронизация: {len(startup_orders)} вакансий, "
-                f"просмотрено {startup_stats['messages_scanned']}, "
-                f"отсеяно {startup_stats['non_relevant']}, "
-                f"уже в БД {startup_stats['already_sent']}"
-            )
-
             async def _dispatch_parser_result(result, chat_title: str, *, edited: bool = False):
                 for item in _flatten_parser_result(result):
                     if item.get("type") == "closed":
@@ -727,6 +703,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
 
             _realtime_client.add_event_handler(on_new_message, events.NewMessage())
             _realtime_client.add_event_handler(on_edited_message, events.MessageEdited())
+            spawn_background_task(_startup_sync(bot_callback, closed_callback))
             spawn_background_task(_periodic_scan_loop(bot_callback, closed_callback))
             await _realtime_client.run_until_disconnected()
         except SessionNotConfiguredError as e:
@@ -849,7 +826,47 @@ def _new_stats(run_kind: str = "scan") -> dict:
     return stats
 
 
+def parser_scan_in_progress() -> bool:
+    """True, пока идёт полный проход чатов (startup / manual / periodic)."""
+    return _parser_lock.locked()
+
+
+def _publish_debug_stats(stats: dict) -> None:
+    global LAST_DEBUG_STATS
+    LAST_DEBUG_STATS = stats
+
+
 LAST_DEBUG_STATS = _empty_debug_stats()
+
+
+async def _startup_sync(bot_callback, closed_callback=None):
+    """Фоновая синхронизация после перезапуска — не блокирует realtime-слушатель."""
+    stats = _new_stats("startup")
+    _publish_debug_stats(stats)
+    logger.info("🔄 Стартовая синхронизация вакансий (incremental)...")
+    try:
+        async with _parser_lock:
+            orders, closed_data = await _scan_all_chats(
+                _realtime_client,
+                limit_per_chat=PER_CHAT_SCAN_LIMIT,
+                stats=stats,
+                incremental=True,
+            )
+            stats["finished_at"] = _iso_now()
+        if closed_data and closed_callback:
+            await closed_callback(closed_data)
+        for order in orders:
+            bot_callback(order)
+        logger.info(
+            f"✅ Стартовая синхронизация: {len(orders)} вакансий, "
+            f"просмотрено {stats['messages_scanned']}, "
+            f"отсеяно {stats['non_relevant']}, "
+            f"уже в БД {stats['already_sent']}"
+        )
+    except Exception as e:
+        logger.error(f"Стартовая синхронизация: {e}", exc_info=True)
+        if stats.get("started_at") and not stats.get("finished_at"):
+            stats["finished_at"] = _iso_now()
 
 
 def get_last_debug_report() -> str:
@@ -1223,6 +1240,8 @@ _CATEGORY_KEYWORDS = {
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
         "складской работник", "на склад", "рохл", "паллет", "складирован",
         "производств", "фасовоч", "кладовщик",
+        "уборка", "разбирать", "посадка растений", "декоративные работы", "прораб",
+        "погруз", "глины", "тележк",
     ],
     "promoter": [
         "промоутер", "промоутеры", "промоутерша", "промоутером", "промо персонал", "промо",
@@ -1257,6 +1276,7 @@ _CATEGORY_KEYWORDS = {
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
     "склад", "рохл", "паллет", "фасовоч", "конвейер", "производств", "50 кг",
+    "уборка", "разнорабоч", "подсобн", "посадка", "глины",
 )
 _PROMO_HINTS = ("промоутер", "листовок", "промо-акция", "раздача листовок", "промо персонал", "промо", "анкетирован")
 _NON_SUPERVISOR_COORDINATOR = (
@@ -1292,10 +1312,10 @@ def enrich_digest_block(block_text: str, full_text: str) -> str:
     parts = [block_text.strip()]
     if not has_payment_signal(block_text):
         for line in full_text.splitlines():
-            if _PAYMENT_RATE_RE.search(line):
+            if has_payment_signal(line):
                 parts.append(line.strip())
                 break
-    if not extract_contact_from_text(block_text):
+    if not extract_contact_from_text(block_text) and not has_ls_contact_phrase(block_text):
         contact = extract_contact_from_text(full_text)
         if contact:
             parts.append(contact)
@@ -1356,9 +1376,23 @@ _PAYMENT_RATE_RE = re.compile(
     r"\d[\d\s.,]*\s*(?:руб\.?|₽|р\.?\/?\s*ч)|"
     r"₽\/?\s*ч|р\/\s*ч|руб\.?\s*/\s*ч|"
     r"ставка\s*[:\s]?\s*\d|минималка|"
-    r"оплат\w*\s*[:\s].*\d|\d[\d\s.,]*\s*(?:₽|руб)"
+    r"оплат\w*\s*[:\s].*\d|\d[\d\s.,]*\s*(?:₽|руб)|"
+    r"\d{2,5}\s*/\s*\d+\s*/\s*\d{2,5}|"
+    r"(?:заработок|доход)\s*(?:от\s*)?\d[\d\s–—\-]*(?:до|–|-|—)\s*\d+\s*(?:тыс|тысяч)|"
+    r"\d[\d\s.,]*\s*(?:тыс|тысяч)\w*\s*(?:руб|₽)?\s*/\s*день|"
+    r"оплат\w*[^\n]{0,40}?\d[\d\s.,]*\s*к\b"
     r")",
     re.I,
+)
+_LS_CONTACT_RE = re.compile(
+    r"пишите\s+(?:мне\s+)?(?:в\s+)?лс|"
+    r"заявки?\s+в\s+лс|"
+    r"напишите\s+(?:мне\s+)?(?:в\s+)?лс|"
+    r"писать\s+в\s+лс|"
+    r"обращайтесь\s+в\s+лс|"
+    r"пишите\s+мне|"
+    r"записаться\s*:?\s*$",
+    re.I | re.M,
 )
 _SERVICE_REQUEST_RES = (
     re.compile(r"ищу\s+(?:#)?(?:зомби|квест|анимационн|программ|диджей|музыкант|фотограф|ведущ)", re.I),
@@ -1442,8 +1476,20 @@ def has_payment_signal(text: str) -> bool:
     return False
 
 
+def has_ls_contact_phrase(text: str) -> bool:
+    if not text:
+        return False
+    return bool(_LS_CONTACT_RE.search(text))
+
+
 def has_contact_signal(text: str, poster: dict | None = None) -> bool:
-    return bool(resolve_vacancy_contact(text, poster)[0])
+    if extract_contact_from_text(text or ""):
+        return True
+    if has_ls_contact_phrase(text):
+        return True
+    if poster and (poster.get("username") or poster.get("user_id")):
+        return True
+    return False
 
 
 async def extract_poster_info(message) -> dict:
@@ -1476,6 +1522,8 @@ def resolve_vacancy_contact(text: str, poster: dict | None = None) -> tuple[str 
             return f"@{poster['username']}", "sender"
         if poster.get("user_id"):
             return f"tg://user?id={poster['user_id']}", "sender"
+    if has_ls_contact_phrase(text):
+        return None, "ls_intent"
     return None, None
 
 
@@ -1688,15 +1736,15 @@ async def safe_get_entity(client, chat_link: str):
         return None
 
 async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
-    global LAST_DEBUG_STATS
+    stats = _new_stats("manual")
+    _publish_debug_stats(stats)
     try:
         async with _parser_lock:
-            stats = _new_stats("manual")
-            LAST_DEBUG_STATS = stats
             if _realtime_client and _realtime_client.is_connected():
                 logger.info("🔍 Ручная проверка через shared Telethon client")
                 result = await _scan_all_chats(
                     _realtime_client, limit_per_chat=limit_per_chat, stats=stats,
+                    incremental=True,
                 )
                 stats["finished_at"] = _iso_now()
                 return result
@@ -1708,7 +1756,7 @@ async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
             return [], []
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
-        if LAST_DEBUG_STATS.get("started_at"):
+        if LAST_DEBUG_STATS.get("started_at") and not LAST_DEBUG_STATS.get("finished_at"):
             LAST_DEBUG_STATS["finished_at"] = _iso_now()
         return [], []
 

@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
 from db import is_vacancy_channel_posted, mark_vacancy_channel_posted
+from services.vacancy_public_text import sanitize_vacancy_public_body
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -25,12 +26,12 @@ def build_channel_preview_text(
     source: str,
     freshness: str,
 ) -> str:
-    snippet = (body or "").strip().replace("\n", " ")
-    if len(snippet) > 320:
-        snippet = snippet[:317] + "…"
+    del source  # не светим чужую группу в канале
+    snippet = sanitize_vacancy_public_body(body or "", max_len=320)
+    if not snippet:
+        snippet = "Подробности и отклик — в боте (кнопка ниже)."
     return (
-        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n"
-        f"📢 {escape_html(source or '—')}\n\n"
+        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n\n"
         f"{escape_html(snippet)}"
     )
 
