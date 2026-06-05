@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand, BufferedInputFile, LabeledPrice
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand, BufferedInputFile, LabeledPrice, ChatMemberUpdated
 from aiogram import F
 from db import *
 from db_backend import db_conn, fetchone, now_minus_days, bool_false, run_db
@@ -191,29 +191,37 @@ async def channel_post_for_vacancy(vacancy_id: str, *, force: bool = False) -> s
     """Кросс-пост превью в @promostaff_agency_job. Возвращает текст для админа."""
     if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
         return (
-            "❌ Кросс-пост выключен. Задайте `CHANNEL_CROSSPOST_ENABLED=1` "
+            "❌ Канал не настроен. Задайте `CHANNEL_CROSSPOST_ENABLED=1` "
             "и `HUNTER_CHANNEL_ID` на Bothost."
         )
     row = get_vacancy_push_row(vacancy_id)
     if not row:
         return f"❌ Вакансия `{vacancy_id}` не найдена."
     category_code = row[5] or "promoter"
+    body = row[0] or ""
     from services.channel_post import post_vacancy_preview_to_channel
+    from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
+
     ok = await post_vacancy_preview_to_channel(
         bot,
         vacancy_id=vacancy_id,
+        category_code=category_code,
         category_name=get_category_name(category_code),
         category_emoji=get_category_emoji(category_code),
-        body=row[0] or "",
+        body=body,
         source=row[2] or "—",
         freshness=get_freshness_label(row[8]),
         force=force,
     )
     if ok:
         return f"✅ Опубликовано в канал: `{vacancy_id}`"
-    if is_vacancy_channel_posted(vacancy_id) and not force:
-        return f"ℹ️ Вакансия `{vacancy_id}` уже была в канале."
-    return "❌ Не удалось опубликовать. Проверьте права бота в канале и `HUNTER_CHANNEL_ID`."
+    already = is_vacancy_channel_posted(vacancy_id) and not force
+    allowed, reason = evaluate_channel_crosspost(
+        category_code, body, force=force, already_posted=already,
+    )
+    if not allowed:
+        return f"⏸ Не опубликовано: {format_skip_reason(reason)}"
+    return "❌ Не удалось опубликовать. Проверьте права бота в канале."
 
 
 def build_order_from_vacancy_row(vacancy_id: str, row) -> dict | None:
@@ -716,6 +724,7 @@ async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message
             failed += 1
             if "bot was blocked" in str(e).lower():
                 logger.info(f"Рассылка: {uid} заблокировал бота")
+                _mark_subscriber_blocked_if_needed(uid)
             else:
                 logger.warning(f"Рассылка: ошибка {uid}: {e}")
         if i % 25 == 0 or i == len(subscribers):
@@ -896,6 +905,10 @@ class NotfitReasonState(StatesGroup):
 class ChannelPostState(StatesGroup):
     waiting_vacancy_id = State()
 
+
+class ChannelCustomPostState(StatesGroup):
+    waiting_content = State()
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
@@ -987,13 +1000,16 @@ def build_admin_help_html() -> str:
         "• «📊 Шум по чатам» — отсеяно vs в ленту по каждому чату\n"
         "• `/setchatroles ссылка promoter,helper` — ожидаемые роли чата\n\n"
         "<b>👥 Пользователи</b>\n"
+        "• «🗂️ Карточки пользователей» — список и карточка с активностью\n"
         "• «💎 Запросы Premium» — чек + ✅/❌\n"
-        "• /setplan USER_ID premium 30 — выдать Premium\n\n"
+        "• /user USER_ID — открыть карточку по ID\n"
+        "• /setplan USER_ID premium 30 — выдать Premium из чата\n\n"
         "<b>📥 Excel</b>\n"
         "• подписчики, вакансии, заказчики\n"
         "• «📥 Excel: не подходит» — feedback «👎 Не подходит» с причинами\n\n"
-        "<b>📝 Модерация</b>\n"
-        "• очередь вакансий от заказчиков\n\n"
+        "<b>📝 Модерация и канал</b>\n"
+        "• «📺 Канал» — лимиты, промо, новости, статистика\n"
+        "• «📣 В канал» — вакансия по ID (без лимитов)\n\n"
         "<b>Команды</b>\n"
         "/help — эта справка\n"
         "/start — админ-меню\n"
@@ -1048,6 +1064,143 @@ def format_user_card(card: dict, idx: int = None) -> str:
         f"Статус: {escape_markdown(status)}\n"
         f"Категории: {escape_markdown(cats)}{profile_note}"
     )
+
+
+def _admin_user_short_label(profile: dict, max_len: int = 18) -> str:
+    name = (profile.get("full_name") or "").strip()
+    if not name:
+        name = " ".join(p for p in (profile.get("first_name"), profile.get("last_name")) if p).strip()
+    if not name and profile.get("username"):
+        name = f"@{profile['username']}"
+    if not name:
+        name = str(profile.get("user_id") or "?")
+    if len(name) > max_len:
+        return name[: max_len - 1] + "…"
+    return name
+
+
+def build_admin_user_detail_html(user_id: int) -> str:
+    profile = get_subscriber_profile(user_id)
+    if not profile:
+        return f"❌ Пользователь <code>{user_id}</code> не найден."
+    name = _admin_user_short_label(profile, max_len=120)
+    username = profile.get("username")
+    uname_line = f"@{escape_html(username)}" if username else "—"
+    role = profile.get("user_role") or "candidate"
+    role_label = "🏢 Заказчик" if role == "employer" else "👷 Исполнитель"
+    premium = is_user_premium(user_id)
+    plan = profile.get("plan") or "free"
+    if premium:
+        until = format_db_date_short(profile.get("paid_until"))
+        plan_line = f"💎 Premium до <b>{escape_html(until)}</b>" if until else "💎 Premium"
+    elif plan == "premium":
+        until = format_db_date_short(profile.get("paid_until"))
+        plan_line = f"💎 Premium истёк ({escape_html(until)})" if until else "💎 Premium (истёк)"
+    else:
+        plan_line = "🆓 Free"
+    active = bool(profile.get("is_active"))
+    if active:
+        status_line = "✅ Активен (бот не заблокирован)"
+    else:
+        status_line = "⛔ Неактивен (заблокировал бота или снят вручную)"
+    cats = ", ".join(f"{c.get('emoji', '')} {c['name']}".strip() for c in get_user_categories(user_id)) or "—"
+    metro = (profile.get("metro_zones") or "").strip() or "все локации"
+    registered = format_db_datetime_short(get_subscriber_registered_at(user_id))
+    resp_n = count_user_responses(user_id)
+    push_n = count_user_sent_vacancies(user_id)
+    notfit_n = count_user_notfit_feedback(user_id)
+    trial = "да" if profile.get("trial_used") else "нет"
+    lines = [
+        f"<b>👤 {escape_html(name)}</b>",
+        f"ID: <code>{user_id}</code>",
+        f"Username: {uname_line}",
+        f"Телефон: {escape_html(profile.get('phone') or '—')}",
+        f"Роль: {role_label}",
+        f"Тариф: {plan_line}",
+        f"Статус: {status_line}",
+        f"Регистрация: {escape_html(registered)}",
+        f"Trial использован: {trial}",
+        "",
+        f"<b>Активность</b>",
+        f"• Push-вакансий получено: <b>{push_n}</b>",
+        f"• Откликов: <b>{resp_n}</b>",
+        f"• «Не подходит»: <b>{notfit_n}</b>",
+        "",
+        f"<b>Настройки</b>",
+        f"Категории: {escape_html(cats)}",
+        f"Метро: {escape_html(metro)}",
+    ]
+    recent = get_user_responses(user_id, limit=3)
+    if recent:
+        lines.append("")
+        lines.append("<b>Последние отклики</b>")
+        for r in recent:
+            when = format_db_datetime_short(r.get("responded_at"))
+            closed = " 🔒" if r.get("is_closed") else ""
+            snippet = (r.get("vacancy_text") or "—").replace("\n", " ")[:70]
+            lines.append(f"• {escape_html(when)}{closed} — {escape_html(snippet)}")
+    return "\n".join(lines)
+
+
+def admin_user_detail_keyboard(user_id: int, profile: dict, cards_page: int = 0) -> InlineKeyboardMarkup:
+    active = bool(profile.get("is_active"))
+    p = cards_page
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"💎 +{PREMIUM_DEFAULT_DAYS} дн.",
+                callback_data=f"adm_p_{user_id}_{PREMIUM_DEFAULT_DAYS}_{p}",
+            ),
+            InlineKeyboardButton(text="💎 +90 дн.", callback_data=f"adm_p_{user_id}_90_{p}"),
+        ],
+        [InlineKeyboardButton(text="🆓 Снять Premium", callback_data=f"adm_f_{user_id}_{p}")],
+        [
+            InlineKeyboardButton(
+                text="✅ Сделать активным" if not active else "⛔ Снять активность",
+                callback_data=f"adm_a_{user_id}_{p}",
+            ),
+        ],
+        [InlineKeyboardButton(text="📨 Все отклики", callback_data=f"adm_r_{user_id}_{p}")],
+        [InlineKeyboardButton(text="◀️ К списку карточек", callback_data=f"admin_cards_{p}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_admin_user_detail(
+    message: types.Message,
+    user_id: int,
+    cards_page: int = 0,
+    edit: bool = False,
+):
+    profile = await run_db(get_subscriber_profile, user_id)
+    if not profile:
+        text = f"❌ Пользователь <code>{user_id}</code> не найден."
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К списку", callback_data=f"admin_cards_{cards_page}")],
+        ])
+        if edit:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        else:
+            await message.answer(text, parse_mode="HTML", reply_markup=markup)
+        return
+    text = build_admin_user_detail_html(user_id)
+    markup = admin_user_detail_keyboard(user_id, profile, cards_page)
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+
+def _mark_subscriber_blocked_if_needed(user_id: int):
+    profile = get_subscriber_profile(user_id)
+    if profile and profile.get("is_active"):
+        set_subscriber_active(user_id, False)
+        logger.info(f"Пользователь {user_id} помечен неактивным (заблокировал бота)")
+
 
 def _coerce_db_datetime(raw_dt):
     """SQLite отдаёт str, PostgreSQL — datetime; приводим к aware UTC."""
@@ -1361,6 +1514,7 @@ async def send_vacancy_to_subscribers(order: dict):
         except Exception as e:
             if "bot was blocked by the user" in str(e):
                 logger.info(f"Пользователь {subscriber['user_id']} заблокировал бота")
+                _mark_subscriber_blocked_if_needed(subscriber['user_id'])
             else:
                 logger.error(f"Ошибка отправки {subscriber['user_id']}: {e}")
 
@@ -1370,11 +1524,12 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
-    if CHANNEL_CROSSPOST_ENABLED:
+    if CHANNEL_CROSSPOST_ENABLED and HUNTER_CHANNEL_ID:
         from services.channel_post import post_vacancy_preview_to_channel
         spawn_background_task(post_vacancy_preview_to_channel(
             bot,
             vacancy_id=vacancy_id,
+            category_code=category_code,
             category_name=cat_name,
             category_emoji=get_category_emoji(category_code),
             body=msg_text,
@@ -1505,10 +1660,127 @@ def get_admin_export_keyboard() -> ReplyKeyboardMarkup:
 def get_admin_mod_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📝 Модерация вакансий"), KeyboardButton(text="📣 В канал")],
+            [KeyboardButton(text="📝 Модерация вакансий"), KeyboardButton(text="📺 Канал")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
         resize_keyboard=True,
+    )
+
+
+def get_admin_channel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📺 Статус канала"), KeyboardButton(text="📊 Статистика канала")],
+            [KeyboardButton(text="📣 Вакансия в канал"), KeyboardButton(text="📝 Новость в канал")],
+            [KeyboardButton(text="📢 Промо в канал")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def _channel_env_ok() -> bool:
+    return bool(CHANNEL_CROSSPOST_ENABLED and HUNTER_CHANNEL_ID)
+
+
+def build_channel_admin_status_html() -> str:
+    from services.channel_policy import is_within_channel_posting_hours, msk_now
+
+    total_hour = count_channel_vacancy_posts_in_msk_hour()
+    loader_hour = count_channel_vacancy_posts_in_msk_hour("loader")
+    lim_total = get_channel_hourly_limit_total()
+    lim_loader = get_channel_hourly_limit_loader()
+    min_rate = get_channel_loader_min_rate()
+    xpost = is_channel_crosspost_enabled()
+    promo = is_channel_promo_enabled()
+    promo_times = ", ".join(get_channel_promo_times())
+    qstart, qend = get_channel_quiet_hours()
+    posting_ok = is_within_channel_posting_hours()
+    env_line = "✅ Канал подключён" if _channel_env_ok() else "❌ Нет HUNTER_CHANNEL_ID / env"
+    now_msk = msk_now().strftime("%H:%M")
+    return (
+        f"<b>📺 Канал @promostaff_agency_job</b>\n"
+        f"{env_line} · сейчас {escape_html(now_msk)} МСК\n\n"
+        f"<b>Автопост вакансий:</b> {'🟢 вкл' if xpost else '🔴 выкл'}\n"
+        f"<b>Промо ({escape_html(promo_times)}):</b> {'🟢 вкл' if promo else '🔴 выкл'}\n\n"
+        f"В этом часе: <b>{total_hour}/{lim_total}</b> вакансий"
+        f" (грузчик: {loader_hour}/{lim_loader}, от {min_rate} ₽/ч)\n"
+        f"Окно публикаций: {qstart:02d}:00–{qend:02d}:00 МСК — "
+        f"{'✅ можно постить' if posting_ok else '⏸ тихие часы'}\n\n"
+        f"<i>Ручная публикация по ID — без лимитов. "
+        f"Кнопки ниже меняют настройки без Bothost.</i>"
+    )
+
+
+def build_channel_admin_inline_keyboard() -> InlineKeyboardMarkup:
+    xpost = is_channel_crosspost_enabled()
+    promo = is_channel_promo_enabled()
+    lim_total = get_channel_hourly_limit_total()
+    lim_loader = get_channel_hourly_limit_loader()
+    min_rate = get_channel_loader_min_rate()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_inline_btn(
+            "🔴 Автопост: ВЫКЛ" if not xpost else "🟢 Автопост: ВКЛ",
+            callback_data="ch_t_xpost",
+        )],
+        [_inline_btn(
+            "🔴 Промо 09/14/20: ВЫКЛ" if not promo else "🟢 Промо 09/14/20: ВКЛ",
+            callback_data="ch_t_promo",
+        )],
+        [
+            _inline_btn("−", callback_data="ch_lim_tot_dec"),
+            _inline_btn(f"Всего/ч: {lim_total}", callback_data="ch_refresh"),
+            _inline_btn("+", callback_data="ch_lim_tot_inc"),
+        ],
+        [
+            _inline_btn("−", callback_data="ch_lim_ldr_dec"),
+            _inline_btn(f"Грузчик/ч: {lim_loader}", callback_data="ch_refresh"),
+            _inline_btn("+", callback_data="ch_lim_ldr_inc"),
+        ],
+        [
+            _inline_btn("−50", callback_data="ch_rate_dec"),
+            _inline_btn(f"Грузчик от {min_rate} ₽/ч", callback_data="ch_refresh"),
+            _inline_btn("+50", callback_data="ch_rate_inc"),
+        ],
+    ])
+
+
+async def send_channel_admin_status(message: types.Message, *, edit: bool = False):
+    text = build_channel_admin_status_html()
+    markup = build_channel_admin_inline_keyboard()
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
+def build_custom_post_confirm_keyboard(with_bot_button: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_inline_btn("✅ Опубликовать", callback_data="ch_custom_pub", style="success")],
+        [_inline_btn(
+            "🔘 Без кнопки бота" if with_bot_button else "➕ Кнопка «Открыть бота»",
+            callback_data="ch_custom_btn",
+        )],
+        [_inline_btn("❌ Отмена", callback_data="ch_custom_cancel", style="danger")],
+    ])
+
+
+async def send_custom_post_preview(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    text = data.get("custom_text") or ""
+    with_btn = bool(data.get("custom_with_bot_button", True))
+    from services.channel_custom_post import format_custom_post_preview
+    preview = format_custom_post_preview(text, with_bot_button=with_btn)
+    if data.get("custom_photo_file_id"):
+        preview += "\n\n📷 <i>К посту будет приложено фото</i>"
+    await message.answer(
+        preview,
+        parse_mode="HTML",
+        reply_markup=build_custom_post_confirm_keyboard(with_btn),
     )
 
 
@@ -1525,7 +1797,9 @@ ADMIN_MENU_BUTTONS = {
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
-    "📣 В канал", "📖 Как пользоваться", "📖 Справка", "❌ Закрыть меню",
+    "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
+    "📣 В канал", "📣 Вакансия в канал", "📝 Новость в канал", "📢 Промо в канал",
+    "📖 Как пользоваться", "📖 Справка", "❌ Закрыть меню",
 }
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
@@ -2111,11 +2385,12 @@ async def send_responses_page(message: types.Message, user_id: int, page: int = 
         if len(preview) > 160:
             preview = preview[:160] + "…"
         source = resp.get("source_chat_title") or "—"
+        responded = format_db_datetime_short(resp.get("responded_at"))
         text = (
-            f"*{i}.* {format_db_datetime_short(resp.get('responded_at'))} · "
-            f"{_response_status_label(resp.get('is_closed'))}\n"
-            f"📢 {escape_markdown(source)}\n\n"
-            f"{escape_markdown(preview)}"
+            f"<b>{i}.</b> {escape_html(responded)} · "
+            f"{escape_html(_response_status_label(resp.get('is_closed')))}\n"
+            f"📢 {escape_html(source)}\n\n"
+            f"{escape_html(preview)}"
         )
         buttons = []
         if resp.get("vacancy_link"):
@@ -2134,8 +2409,15 @@ async def send_responses_page(message: types.Message, user_id: int, page: int = 
             ])
         markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
         try:
-            await message.answer(text, parse_mode="MarkdownV2", reply_markup=markup)
+            await message.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
             await asyncio.sleep(0.2)
+        except TelegramBadRequest as e:
+            logger.warning(f"send_responses_page item {i}: {e}")
+            plain = re.sub(r"<[^>]*>", "", text)
+            try:
+                await message.answer(plain, reply_markup=markup, disable_web_page_preview=True)
+            except Exception as e2:
+                logger.warning(f"send_responses_page item {i} fallback: {e2}")
         except Exception as e:
             logger.warning(f"send_responses_page item {i}: {e}")
 
@@ -2712,6 +2994,26 @@ async def metro_zones_save(message: types.Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=get_settings_keyboard(),
     )
+
+@dp.message(Command("user"))
+async def user_admin_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/user USER_ID</code>\n\n"
+            "Пример: <code>/user 227713003</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ USER_ID должен быть числом.")
+        return
+    await show_admin_user_detail(message, target_id, cards_page=0, edit=False)
+
 
 @dp.message(Command("setplan"))
 async def setplan_cmd(message: types.Message):
@@ -3961,7 +4263,17 @@ async def show_admin_user_cards(message: types.Message, page: int = 0, edit: boo
         nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"admin_cards_{page-1}"))
     if page + 1 < pages_total:
         nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"admin_cards_{page+1}"))
-    markup = InlineKeyboardMarkup(inline_keyboard=[nav]) if nav else None
+    user_rows = []
+    for card in cards:
+        label = _admin_user_short_label(card)
+        user_rows.append([
+            InlineKeyboardButton(
+                text=f"👤 {label}",
+                callback_data=f"adm_u_{card['user_id']}_{page}",
+            ),
+        ])
+    inline = user_rows + ([nav] if nav else [])
+    markup = InlineKeyboardMarkup(inline_keyboard=inline) if inline else None
     body = "\n".join(lines)
     if edit:
         try:
@@ -4023,6 +4335,85 @@ async def admin_cards_page_callback(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
     await show_admin_user_cards(callback.message, page=page, edit=True)
     await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_u_"))
+async def admin_user_open_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    cards_page = int(parts[3]) if len(parts) > 3 else 0
+    await safe_callback_answer(callback)
+    await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_p_"))
+async def admin_user_premium_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    days = int(parts[3])
+    cards_page = int(parts[4]) if len(parts) > 4 else 0
+    was_active = is_user_premium(target_id)
+    notified = await activate_premium_for_user(target_id, days)
+    mode = "продлён" if was_active else "выдан"
+    note = "" if notified else " (уведомление не доставлено)"
+    await safe_callback_answer(callback, f"Premium {mode} +{days} дн.{note}", show_alert=not notified)
+    await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_f_"))
+async def admin_user_free_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    cards_page = int(parts[3]) if len(parts) > 3 else 0
+    set_user_plan(target_id, plan="free")
+    await safe_callback_answer(callback, "Premium снят")
+    await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_a_"))
+async def admin_user_active_toggle_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    cards_page = int(parts[3]) if len(parts) > 3 else 0
+    profile = get_subscriber_profile(target_id)
+    if not profile:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    new_active = not bool(profile.get("is_active"))
+    set_subscriber_active(target_id, new_active)
+    label = "активен" if new_active else "неактивен"
+    await safe_callback_answer(callback, f"Статус: {label}")
+    await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_r_"))
+async def admin_user_responses_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    profile = get_subscriber_profile(target_id)
+    name = _admin_user_short_label(profile or {"user_id": target_id})
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        f"📨 Отклики пользователя <b>{escape_html(name)}</b> "
+        f"(<code>{target_id}</code>):",
+        parse_mode="HTML",
+    )
+    await send_responses_page(callback.message, target_id, page=0)
 
 @dp.message(lambda m: m.text == "⚠️ Жалобы")
 async def admin_complaints_button(message: types.Message):
@@ -4199,22 +4590,213 @@ async def admin_chat_noise_button(message: types.Message):
     await message.answer(report, parse_mode="Markdown", disable_web_page_preview=True)
 
 
-@dp.message(lambda m: m.text == "📣 В канал")
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == "📺 Канал")
+async def admin_nav_channel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "📺 *Канал* — лимиты, промо, новости и статистика.\n"
+        "Настройки сохраняются в БД (без правок env на Bothost).",
+        parse_mode="Markdown",
+        reply_markup=get_admin_channel_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.text == "📺 Статус канала")
+async def admin_channel_status_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await send_channel_admin_status(message)
+
+
+@dp.message(lambda m: m.text in {"📣 В канал", "📣 Вакансия в канал"})
 async def admin_channel_post_start(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
         return
-    if not CHANNEL_CROSSPOST_ENABLED:
+    if not _channel_env_ok():
         await message.answer(
-            "Кросс-пост выключен (`CHANNEL_CROSSPOST_ENABLED=0`).",
-            reply_markup=get_admin_mod_keyboard(),
+            "❌ Канал не настроен на сервере (`CHANNEL_CROSSPOST_ENABLED` + `HUNTER_CHANNEL_ID`).",
+            reply_markup=get_admin_channel_keyboard(),
         )
         return
     await state.set_state(ChannelPostState.waiting_vacancy_id)
     await message.answer(
         "📣 Отправьте *ID вакансии* для публикации в @promostaff_agency_job.\n"
-        "Повторная публикация разрешена.",
+        "Ручной пост — *без лимитов* и вне тихих часов.",
         parse_mode="Markdown",
     )
+
+
+@dp.message(lambda m: m.text == "📢 Промо в канал")
+async def admin_channel_promo_now(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if not _channel_env_ok():
+        await message.answer("❌ Канал не настроен.", reply_markup=get_admin_channel_keyboard())
+        return
+    from services.channel_promo import post_channel_promo
+    ok = await post_channel_promo(bot, manual=True)
+    if ok:
+        await message.answer("✅ Промо-пост опубликован.", reply_markup=get_admin_channel_keyboard())
+    else:
+        await message.answer("❌ Не удалось опубликовать промо.", reply_markup=get_admin_channel_keyboard())
+
+
+@dp.message(lambda m: m.text == "📊 Статистика канала")
+async def admin_channel_stats_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if not _channel_env_ok():
+        await message.answer("❌ Канал не настроен.", reply_markup=get_admin_channel_keyboard())
+        return
+    from services.channel_stats import build_channel_stats_report
+    report = await build_channel_stats_report(bot, HUNTER_CHANNEL_ID)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_inline_btn("🔄 Обновить", callback_data="ch_stats_refresh")],
+    ])
+    await message.answer(report, parse_mode="HTML", reply_markup=markup)
+
+
+@dp.message(lambda m: m.text == "📝 Новость в канал")
+async def admin_channel_custom_post_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if not _channel_env_ok():
+        await message.answer("❌ Канал не настроен.", reply_markup=get_admin_channel_keyboard())
+        return
+    await state.set_state(ChannelCustomPostState.waiting_content)
+    await state.update_data(custom_with_bot_button=True, custom_text="", custom_photo_file_id=None)
+    await message.answer(
+        "📝 *Новость / пост в канал*\n\n"
+        "Отправьте текст (HTML: &lt;b&gt;, &lt;i&gt;, ссылки).\n"
+        "Можно *фото с подписью* одним сообщением.\n\n"
+        "«◀️ Назад» — отмена.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(ChannelCustomPostState.waiting_content)
+async def admin_channel_custom_post_content(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if message.text == ADMIN_BTN_BACK:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_admin_channel_keyboard())
+        return
+    text = (message.text or message.caption or "").strip()
+    photo_id = message.photo[-1].file_id if message.photo else None
+    if not text and not photo_id:
+        await message.answer("Нужен текст или фото с подписью.")
+        return
+    await state.update_data(custom_text=text, custom_photo_file_id=photo_id)
+    await send_custom_post_preview(message, state)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("ch_custom"))
+async def admin_channel_custom_post_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    if callback.data == "ch_custom_cancel":
+        await state.clear()
+        await safe_callback_answer(callback, "Отменено")
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("Отменено.", reply_markup=get_admin_channel_keyboard())
+        return
+    data = await state.get_data()
+    if callback.data == "ch_custom_btn":
+        with_btn = not bool(data.get("custom_with_bot_button", True))
+        await state.update_data(custom_with_bot_button=with_btn)
+        from services.channel_custom_post import format_custom_post_preview
+        text = data.get("custom_text") or ""
+        preview = format_custom_post_preview(text, with_bot_button=with_btn)
+        if data.get("custom_photo_file_id"):
+            preview += "\n\n📷 <i>К посту будет приложено фото</i>"
+        await callback.message.edit_text(
+            preview,
+            parse_mode="HTML",
+            reply_markup=build_custom_post_confirm_keyboard(with_btn),
+        )
+        await safe_callback_answer(callback)
+        return
+    if callback.data == "ch_custom_pub":
+        from services.channel_custom_post import post_custom_to_channel
+        ok, result = await post_custom_to_channel(
+            bot,
+            text=data.get("custom_text") or "",
+            photo_file_id=data.get("custom_photo_file_id"),
+            with_bot_button=bool(data.get("custom_with_bot_button", True)),
+        )
+        await state.clear()
+        await safe_callback_answer(callback, "Опубликовано" if ok else "Ошибка", show_alert=not ok)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        if ok:
+            await callback.message.answer(
+                f"✅ Пост опубликован в канал (`{result}`).",
+                parse_mode="Markdown",
+                reply_markup=get_admin_channel_keyboard(),
+            )
+        else:
+            await callback.message.answer(
+                f"❌ Не удалось: {escape_html(str(result))}",
+                parse_mode="HTML",
+                reply_markup=get_admin_channel_keyboard(),
+            )
+
+
+@dp.callback_query(lambda c: c.data == "ch_stats_refresh")
+async def admin_channel_stats_refresh(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    if not _channel_env_ok():
+        await callback.answer("Канал не настроен", show_alert=True)
+        return
+    from services.channel_stats import build_channel_stats_report
+    report = await build_channel_stats_report(bot, HUNTER_CHANNEL_ID)
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [_inline_btn("🔄 Обновить", callback_data="ch_stats_refresh")],
+    ])
+    try:
+        await callback.message.edit_text(report, parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+    await safe_callback_answer(callback, "Обновлено")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("ch_") and not c.data.startswith("ch_custom") and c.data != "ch_stats_refresh")
+async def admin_channel_settings_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    data = callback.data
+    if data == "ch_t_xpost":
+        set_channel_setting(
+            "crosspost_enabled",
+            "0" if is_channel_crosspost_enabled() else "1",
+        )
+    elif data == "ch_t_promo":
+        set_channel_setting(
+            "promo_enabled",
+            "0" if is_channel_promo_enabled() else "1",
+        )
+    elif data == "ch_lim_tot_dec":
+        set_channel_setting("hourly_limit_total", str(max(1, get_channel_hourly_limit_total() - 1)))
+    elif data == "ch_lim_tot_inc":
+        set_channel_setting("hourly_limit_total", str(min(24, get_channel_hourly_limit_total() + 1)))
+    elif data == "ch_lim_ldr_dec":
+        set_channel_setting("hourly_limit_loader", str(max(0, get_channel_hourly_limit_loader() - 1)))
+    elif data == "ch_lim_ldr_inc":
+        set_channel_setting("hourly_limit_loader", str(min(6, get_channel_hourly_limit_loader() + 1)))
+    elif data == "ch_rate_dec":
+        set_channel_setting("loader_min_rate", str(max(200, get_channel_loader_min_rate() - 50)))
+    elif data == "ch_rate_inc":
+        set_channel_setting("loader_min_rate", str(min(2000, get_channel_loader_min_rate() + 50)))
+    await safe_callback_answer(callback, "Сохранено")
+    await send_channel_admin_status(callback.message, edit=True)
 
 
 @dp.message(ChannelPostState.waiting_vacancy_id)
@@ -4223,7 +4805,7 @@ async def admin_channel_post_vacancy_id(message: types.Message, state: FSMContex
         return
     if message.text == ADMIN_BTN_BACK:
         await state.clear()
-        await message.answer("Отменено.", reply_markup=get_admin_mod_keyboard())
+        await message.answer("Отменено.", reply_markup=get_admin_channel_keyboard())
         return
     vacancy_id = (message.text or "").strip()
     if not vacancy_id:
@@ -4231,7 +4813,24 @@ async def admin_channel_post_vacancy_id(message: types.Message, state: FSMContex
         return
     await state.clear()
     result = await channel_post_for_vacancy(vacancy_id, force=True)
-    await message.answer(result, parse_mode="Markdown", reply_markup=get_admin_mod_keyboard())
+    await message.answer(result, parse_mode="Markdown", reply_markup=get_admin_channel_keyboard())
+
+
+@dp.chat_member()
+async def channel_member_update(event: ChatMemberUpdated):
+    if not HUNTER_CHANNEL_ID or event.chat.id != HUNTER_CHANNEL_ID:
+        return
+    old_s = event.old_chat_member.status
+    new_s = event.new_chat_member.status
+    user = event.new_chat_member.user
+    uid = user.id if user else None
+    uname = user.username if user else None
+    if new_s in ("member", "administrator") and old_s in ("left", "kicked", "banned"):
+        record_channel_member_event("join", uid, uname)
+        logger.info("Channel join user_id=%s", uid)
+    elif old_s in ("member", "restricted", "administrator") and new_s in ("left", "kicked", "banned"):
+        record_channel_member_event("leave", uid, uname)
+        logger.info("Channel leave user_id=%s", uid)
 
 
 @dp.message(lambda m: m.text == "📝 Модерация вакансий")
@@ -4311,6 +4910,23 @@ async def on_startup():
 
     spawn_background_task(photo_health_loop(bot, notify_photo_issue))
 
+    from services.channel_promo import channel_promo_scheduler_loop
+    spawn_background_task(channel_promo_scheduler_loop(bot))
+    logger.info("📺 Планировщик промо канала: 09:00, 14:00, 20:00 МСК")
+
+    async def channel_snapshot_loop():
+        import asyncio
+        from services.channel_stats import fetch_and_store_member_count
+        while True:
+            try:
+                if HUNTER_CHANNEL_ID:
+                    await fetch_and_store_member_count(bot, HUNTER_CHANNEL_ID)
+            except Exception as e:
+                logger.warning("channel_snapshot_loop: %s", e)
+            await asyncio.sleep(6 * 3600)
+
+    spawn_background_task(channel_snapshot_loop())
+
     try:
         await bot.set_my_commands([
             BotCommand(command="start", description="🏠 Главное меню"),
@@ -4321,7 +4937,8 @@ async def on_startup():
         logger.warning(f"Не удалось set_my_commands: {e}")
 
     logger.info("📡 Запуск polling...")
-    await dp.start_polling(bot)
+    allowed = list(set(dp.resolve_used_update_types() + ["chat_member"]))
+    await dp.start_polling(bot, allowed_updates=allowed)
 
 async def on_shutdown():
     logger.info("🛑 Остановка бота...")

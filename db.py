@@ -280,6 +280,48 @@ def init_db():
                 posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        for col, ddl in (
+            ("category_code", "ALTER TABLE vacancy_channel_posts ADD COLUMN category_code TEXT"),
+            ("post_kind", "ALTER TABLE vacancy_channel_posts ADD COLUMN post_kind TEXT DEFAULT 'vacancy'"),
+            ("message_id", "ALTER TABLE vacancy_channel_posts ADD COLUMN message_id INTEGER"),
+            ("preview_text", "ALTER TABLE vacancy_channel_posts ADD COLUMN preview_text TEXT"),
+        ):
+            add_column_if_missing("vacancy_channel_posts", col, ddl, cur=cur)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS channel_subscriber_snapshots (
+                id {serial_pk()},
+                member_count INTEGER NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS channel_member_events (
+                id {serial_pk()},
+                event_type TEXT NOT NULL,
+                user_id INTEGER,
+                username TEXT,
+                event_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_member_events_at ON channel_member_events(event_at)"
+        )
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channel_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS channel_promo_sent (
+                promo_slot TEXT NOT NULL,
+                sent_date TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (promo_slot, sent_date)
+            )
+        """)
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS llm_usage (
@@ -466,9 +508,288 @@ def init_db():
             cur=cur,
         )
 
+        _seed_channel_settings(cur)
+
         _migrate_pg_telegram_bigint_ids(cur)
 
     logger.info(db_info_label())
+
+
+CHANNEL_SETTING_DEFAULTS = {
+    "crosspost_enabled": "1",
+    "promo_enabled": "1",
+    "hourly_limit_total": "6",
+    "hourly_limit_loader": "1",
+    "loader_min_rate": "450",
+    "quiet_hour_start": "9",
+    "quiet_hour_end": "22",
+    "promo_times": "09:00,14:00,20:00",
+}
+
+
+def _seed_channel_settings(cur):
+    for key, value in CHANNEL_SETTING_DEFAULTS.items():
+        cur.execute(
+            q("""
+                INSERT INTO channel_settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO NOTHING
+            """),
+            (key, value),
+        )
+
+
+def get_channel_setting(key: str, default: str | None = None) -> str | None:
+    fallback = default if default is not None else CHANNEL_SETTING_DEFAULTS.get(key)
+    try:
+        row = fetchone("SELECT value FROM channel_settings WHERE key = ?", (key,))
+    except Exception:
+        return fallback
+    if row:
+        return row[0]
+    return fallback
+
+
+def set_channel_setting(key: str, value: str):
+    execute(
+        """
+        INSERT INTO channel_settings (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def get_channel_settings_dict() -> dict:
+    rows = fetchall("SELECT key, value FROM channel_settings")
+    merged = dict(CHANNEL_SETTING_DEFAULTS)
+    merged.update({r[0]: r[1] for r in rows})
+    return merged
+
+
+def _parse_channel_int(key: str, default: int) -> int:
+    raw = get_channel_setting(key, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def is_channel_crosspost_enabled() -> bool:
+    return get_channel_setting("crosspost_enabled", "1") in ("1", "true", "yes")
+
+
+def is_channel_promo_enabled() -> bool:
+    return get_channel_setting("promo_enabled", "1") in ("1", "true", "yes")
+
+
+def get_channel_hourly_limit_total() -> int:
+    return max(0, _parse_channel_int("hourly_limit_total", 6))
+
+
+def get_channel_hourly_limit_loader() -> int:
+    return max(0, _parse_channel_int("hourly_limit_loader", 1))
+
+
+def get_channel_loader_min_rate() -> int:
+    return max(0, _parse_channel_int("loader_min_rate", 450))
+
+
+def get_channel_quiet_hours() -> tuple[int, int]:
+    return _parse_channel_int("quiet_hour_start", 9), _parse_channel_int("quiet_hour_end", 22)
+
+
+def get_channel_promo_times() -> list[str]:
+    raw = get_channel_setting("promo_times", CHANNEL_SETTING_DEFAULTS["promo_times"]) or ""
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+
+def mark_vacancy_channel_posted(
+    vacancy_id: str,
+    category_code: str | None = None,
+    post_kind: str = "vacancy",
+    message_id: int | None = None,
+    preview_text: str | None = None,
+):
+    execute(
+        """
+        INSERT INTO vacancy_channel_posts
+            (vacancy_id, category_code, post_kind, message_id, preview_text, posted_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(vacancy_id) DO UPDATE SET
+            category_code = excluded.category_code,
+            post_kind = excluded.post_kind,
+            message_id = COALESCE(excluded.message_id, vacancy_channel_posts.message_id),
+            preview_text = COALESCE(excluded.preview_text, vacancy_channel_posts.preview_text),
+            posted_at = CURRENT_TIMESTAMP
+        """,
+        (vacancy_id, category_code, post_kind, message_id, preview_text),
+    )
+
+
+def record_channel_post(
+    post_id: str,
+    *,
+    post_kind: str,
+    category_code: str | None = None,
+    message_id: int | None = None,
+    preview_text: str | None = None,
+):
+    mark_vacancy_channel_posted(
+        post_id,
+        category_code=category_code,
+        post_kind=post_kind,
+        message_id=message_id,
+        preview_text=preview_text,
+    )
+
+
+def record_subscriber_snapshot(member_count: int):
+    execute(
+        "INSERT INTO channel_subscriber_snapshots (member_count) VALUES (?)",
+        (member_count,),
+    )
+
+
+def record_channel_member_event(event_type: str, user_id: int | None = None, username: str | None = None):
+    execute(
+        """
+        INSERT INTO channel_member_events (event_type, user_id, username)
+        VALUES (?, ?, ?)
+        """,
+        (event_type, user_id, username),
+    )
+
+
+def get_subscriber_snapshot_near(days_ago: int = 7) -> int | None:
+    row = fetchone(
+        f"""
+        SELECT member_count FROM channel_subscriber_snapshots
+        WHERE recorded_at <= {now_minus_days(days_ago)}
+        ORDER BY recorded_at DESC
+        LIMIT 1
+        """,
+    )
+    return int(row[0]) if row else None
+
+
+def get_latest_subscriber_snapshot() -> int | None:
+    row = fetchone(
+        "SELECT member_count FROM channel_subscriber_snapshots ORDER BY recorded_at DESC LIMIT 1",
+    )
+    return int(row[0]) if row else None
+
+
+def count_channel_member_events(event_type: str, days: int = 7) -> int:
+    return fetchval(
+        f"""
+        SELECT COUNT(*) FROM channel_member_events
+        WHERE event_type = ? AND event_at >= {now_minus_days(days)}
+        """,
+        (event_type,),
+        default=0,
+    )
+
+
+def get_channel_posts_summary(days: int = 7) -> dict:
+    rows = fetchall(
+        f"""
+        SELECT COALESCE(post_kind, 'vacancy') AS kind, COUNT(*)
+        FROM vacancy_channel_posts
+        WHERE posted_at >= {now_minus_days(days)}
+        GROUP BY COALESCE(post_kind, 'vacancy')
+        """,
+    )
+    summary = {"vacancy": 0, "promo": 0, "custom": 0, "total": 0}
+    for kind, cnt in rows:
+        summary[kind] = int(cnt)
+        summary["total"] += int(cnt)
+    return summary
+
+
+def get_channel_posts_by_hour_msk(days: int = 7) -> list[tuple[int, int]]:
+    """Часы МСК (0–23) → число постов за период (наша публикация через бота)."""
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/Moscow")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    rows = fetchall(
+        "SELECT posted_at FROM vacancy_channel_posts WHERE posted_at IS NOT NULL",
+    )
+    buckets = [0] * 24
+    for (posted_at,) in rows:
+        dt = _parse_db_timestamp_msk(posted_at)
+        if dt is None:
+            continue
+        if dt.astimezone(timezone.utc) < cutoff:
+            continue
+        buckets[dt.hour] += 1
+    return list(enumerate(buckets))
+
+
+def count_channel_vacancy_posts_in_msk_hour(category_code: str | None = None) -> int:
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("Europe/Moscow")
+    now = datetime.now(tz)
+    start = now.replace(minute=0, second=0, microsecond=0)
+    end = start + timedelta(hours=1)
+    rows = fetchall(
+        """
+        SELECT category_code, posted_at FROM vacancy_channel_posts
+        WHERE COALESCE(post_kind, 'vacancy') = 'vacancy'
+        """
+    )
+    count = 0
+    for cat, posted_at in rows:
+        if category_code and cat != category_code:
+            continue
+        dt = _parse_db_timestamp_msk(posted_at)
+        if dt and start <= dt < end:
+            count += 1
+    return count
+
+
+def _parse_db_timestamp_msk(raw) -> datetime | None:
+    from zoneinfo import ZoneInfo
+
+    if raw is None:
+        return None
+    tz_msk = ZoneInfo("Europe/Moscow")
+    if isinstance(raw, datetime):
+        dt = raw
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        s = str(raw).strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace(" ", "T", 1))
+        except ValueError:
+            try:
+                dt = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz_msk)
+
+
+def is_promo_sent_for_msk_date(promo_slot: str, sent_date: str) -> bool:
+    return fetchone(
+        "SELECT 1 FROM channel_promo_sent WHERE promo_slot = ? AND sent_date = ?",
+        (promo_slot, sent_date),
+    ) is not None
+
+
+def mark_promo_sent(promo_slot: str, sent_date: str):
+    execute(
+        """
+        INSERT INTO channel_promo_sent (promo_slot, sent_date) VALUES (?, ?)
+        ON CONFLICT(promo_slot, sent_date) DO NOTHING
+        """,
+        (promo_slot, sent_date),
+    )
 
 
 def add_subscriber(user_id: int, username: str, first_name: str, last_name: str = None):
@@ -958,16 +1279,6 @@ def save_user_topic_thread(user_id: int, topic_key: str, thread_id: int):
 def is_vacancy_channel_posted(vacancy_id: str) -> bool:
     row = fetchone("SELECT 1 FROM vacancy_channel_posts WHERE vacancy_id = ?", (vacancy_id,))
     return bool(row)
-
-
-def mark_vacancy_channel_posted(vacancy_id: str):
-    execute(
-        """
-        INSERT INTO vacancy_channel_posts (vacancy_id) VALUES (?)
-        ON CONFLICT(vacancy_id) DO NOTHING
-        """,
-        (vacancy_id,),
-    )
 
 
 def get_llm_usage_today(user_id: int, usage_day: str) -> int:
@@ -1523,6 +1834,32 @@ def count_user_responses(user_id: int) -> int:
         (user_id,),
         default=0,
     )
+
+
+def count_user_sent_vacancies(user_id: int) -> int:
+    return fetchval(
+        "SELECT COUNT(*) FROM sent_vacancies WHERE user_id = ?",
+        (user_id,),
+        default=0,
+    )
+
+
+def count_user_notfit_feedback(user_id: int) -> int:
+    return fetchval(
+        "SELECT COUNT(*) FROM vacancy_notfit_feedback WHERE user_id = ?",
+        (user_id,),
+        default=0,
+    )
+
+
+def set_subscriber_active(user_id: int, is_active: bool):
+    flag = bool_true() if is_active else bool_false()
+    execute(f"UPDATE subscribers SET is_active = {flag} WHERE user_id = ?", (user_id,))
+
+
+def get_subscriber_registered_at(user_id: int):
+    row = fetchone("SELECT registered_at FROM subscribers WHERE user_id = ?", (user_id,))
+    return row[0] if row else None
 
 
 def get_user_responses(user_id: int, limit: int = 5, offset: int = 0) -> list:

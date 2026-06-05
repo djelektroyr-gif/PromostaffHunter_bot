@@ -6,10 +6,12 @@ import logging
 from html import escape as escape_html
 from typing import TYPE_CHECKING
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup
 
 from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
 from db import is_vacancy_channel_posted, mark_vacancy_channel_posted
+from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
+from services.telegram_buttons import styled_inline_button
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
 if TYPE_CHECKING:
@@ -39,13 +41,15 @@ def build_channel_preview_text(
 def build_channel_preview_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     bot_user = (BOT_USERNAME or "PromostaffHunter_bot").lstrip("@")
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="Подробнее в боте",
+        [styled_inline_button(
+            "✋ Подробнее в боте",
             url=f"https://t.me/{bot_user}?start=vac_{vacancy_id}",
+            style="success",
         )],
-        [InlineKeyboardButton(
-            text="Разместить вакансию",
+        [styled_inline_button(
+            "📤 Разместить вакансию",
             url=f"https://t.me/{bot_user}?start=employer",
+            style="primary",
         )],
     ])
 
@@ -54,6 +58,7 @@ async def post_vacancy_preview_to_channel(
     bot: Bot,
     *,
     vacancy_id: str,
+    category_code: str,
     category_name: str,
     category_emoji: str,
     body: str,
@@ -63,7 +68,20 @@ async def post_vacancy_preview_to_channel(
 ) -> bool:
     if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
         return False
-    if not force and is_vacancy_channel_posted(vacancy_id):
+    already = is_vacancy_channel_posted(vacancy_id)
+    allowed, reason = evaluate_channel_crosspost(
+        category_code,
+        body,
+        force=force,
+        already_posted=already and not force,
+    )
+    if not allowed:
+        logger.info(
+            "Channel skip vacancy_id=%s cat=%s reason=%s",
+            vacancy_id,
+            category_code,
+            format_skip_reason(reason),
+        )
         return False
     text = build_channel_preview_text(
         category_name=category_name,
@@ -81,8 +99,14 @@ async def post_vacancy_preview_to_channel(
             reply_markup=markup,
             disable_web_page_preview=True,
         )
-        mark_vacancy_channel_posted(vacancy_id)
-        logger.info("Channel cross-post vacancy_id=%s", vacancy_id)
+        snippet = sanitize_vacancy_public_body(body or "", max_len=120)
+        mark_vacancy_channel_posted(
+            vacancy_id,
+            category_code=category_code,
+            message_id=msg.message_id,
+            preview_text=snippet,
+        )
+        logger.info("Channel cross-post vacancy_id=%s cat=%s", vacancy_id, category_code)
         return True
     except Exception as e:
         logger.exception("channel cross-post %s: %s", vacancy_id, e)
