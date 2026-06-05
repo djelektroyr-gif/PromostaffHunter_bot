@@ -18,11 +18,38 @@ SUBSCRIPTION_SUPPORT = os.getenv("SUBSCRIPTION_SUPPORT", "@promostaff_support").
 SUBSCRIPTION_PRICE_RUB = os.getenv("SUBSCRIPTION_PRICE_RUB", "299").strip()
 SUBSCRIPTION_CARD_HINT = os.getenv("SUBSCRIPTION_CARD_HINT", "").strip()
 
-# Окно свежести вакансий (часы) — вместо «только сегодня» по МСК
+# Окно свежести вакансий (часы) — при парсинге
 VACANCY_MAX_AGE_HOURS = int(os.getenv("VACANCY_MAX_AGE_HOURS", "36"))
+
+# Лента «Посмотреть новые»: свежие (ч) и архив (макс. возраст, ч)
+FEED_FRESH_HOURS = int(os.getenv("FEED_FRESH_HOURS", "24"))
+FEED_ARCHIVE_MAX_HOURS = int(os.getenv("FEED_ARCHIVE_MAX_HOURS", "168"))
 
 # Пробный Premium при первой регистрации (дней, 0 = отключить)
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
+
+# Forum topics в личке (BotFather → Threaded Mode)
+FORUM_TOPICS_ENABLED = os.getenv("FORUM_TOPICS_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+
+# Канал @promostaff_agency_job — кросс-пост превью
+HUNTER_CHANNEL_ID = os.getenv("HUNTER_CHANNEL_ID", "").strip()
+if HUNTER_CHANNEL_ID.lstrip("-").isdigit():
+    HUNTER_CHANNEL_ID = int(HUNTER_CHANNEL_ID)
+else:
+    HUNTER_CHANNEL_ID = None
+CHANNEL_CROSSPOST_ENABLED = os.getenv("CHANNEL_CROSSPOST_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "PromostaffHunter_bot").strip().lstrip("@")
+
+# LLM (deepseek_gateway)
+LLM_ENABLED = os.getenv("LLM_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "").strip()
+LLM_INTERNAL_TOKEN = os.getenv("LLM_INTERNAL_TOKEN", "").strip()
+LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
+LLM_DAILY_LIMIT_PREMIUM = int(os.getenv("LLM_DAILY_LIMIT_PREMIUM", "20"))
+
+# Telegram Stars — расширенный отклик
+STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+STARS_EXTENDED_RESPONSE_PRICE = int(os.getenv("STARS_EXTENDED_RESPONSE_PRICE", "35"))
 
 # Telethon Settings
 API_ID = int(os.getenv("API_ID", "0"))
@@ -233,6 +260,8 @@ EXCLUDE_CATEGORIES = [
 
 STOP_PHRASES = [
     "агентство полного цикла", "продаем", "на себя", "ищу работу", "резюме",
+    "резюме в лс", "присылайте программу", "присылайте видео", "ищу исполнителя",
+    "open call",
 ]
 
 # For compatibility

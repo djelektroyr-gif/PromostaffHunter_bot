@@ -23,6 +23,7 @@ from db_backend import run_db
 logger = logging.getLogger(__name__)
 
 _realtime_client = None
+_chat_expected_roles: dict[str, set[str]] = {}
 _monitored_chat_ids = set()
 _parser_lock = asyncio.Lock()
 _last_health_alert = {}
@@ -202,10 +203,196 @@ async def _close_vacancy_by_message_id(
     return None
 
 
+def _bump_chat_stat(stats: dict | None, chat_title: str, field: str, reason: str | None = None):
+    if stats is None or not chat_title:
+        return
+    bucket = stats.setdefault("by_chat", {}).setdefault(
+        chat_title,
+        {"scanned": 0, "matched": 0, "rejected": 0, "role_mismatch": 0, "reasons": {}},
+    )
+    if field == "scanned":
+        bucket["scanned"] += 1
+    elif field == "matched":
+        bucket["matched"] += 1
+    elif field == "rejected":
+        bucket["rejected"] += 1
+        if reason:
+            bucket["reasons"][reason] = bucket["reasons"].get(reason, 0) + 1
+    elif field == "role_mismatch":
+        bucket["role_mismatch"] += 1
+
+
+async def refresh_chat_expected_roles_cache(client):
+    """chat_id alias → set(category codes) из target_chats.expected_roles."""
+    global _chat_expected_roles
+    from db import list_target_chats
+
+    _chat_expected_roles = {}
+    for row in await run_db(list_target_chats):
+        if not row.get("is_active"):
+            continue
+        raw = row.get("expected_roles") or ""
+        roles = {p.strip() for p in raw.split(",") if p.strip()}
+        if not roles:
+            continue
+        entity = await safe_get_entity(client, row["chat_link"])
+        if not entity:
+            continue
+        for alias in chat_id_aliases(entity.id):
+            _chat_expected_roles[alias] = roles
+
+
+def format_chat_noise_report(stats: dict | None = None) -> str:
+    s = stats or LAST_DEBUG_STATS
+    by_chat = s.get("by_chat") or {}
+    if not by_chat:
+        return "📊 *Шум по чатам*\n\nНет данных — запустите «🔍 Ручная проверка» или дождитесь планового прогона."
+    lines = ["📊 *Шум по чатам* (последний прогон)", ""]
+    ranked = []
+    for title, bucket in by_chat.items():
+        scanned = bucket.get("scanned") or 0
+        matched = bucket.get("matched") or 0
+        rejected = bucket.get("rejected") or 0
+        total = scanned or (matched + rejected)
+        noise_pct = int(rejected * 100 / total) if total else 0
+        ranked.append((noise_pct, title, bucket, total))
+    ranked.sort(reverse=True)
+    for noise_pct, title, bucket, total in ranked[:12]:
+        top_reason = ""
+        reasons = bucket.get("reasons") or {}
+        if reasons:
+            r, c = max(reasons.items(), key=lambda x: x[1])
+            top_reason = f", топ: {r} ({c})"
+        mismatch = bucket.get("role_mismatch") or 0
+        mm = f", вне профиля чата: {mismatch}" if mismatch else ""
+        lines.append(
+            f"• *{title}* — шум ~{noise_pct}% ({bucket.get('rejected', 0)}/{total}), "
+            f"в ленту: {bucket.get('matched', 0)}{mm}{top_reason}"
+        )
+    lines.append("\nПрофиль чата: `/setchatroles ссылка promoter,helper,loader`")
+    return "\n".join(lines)
+
+
+def _flatten_parser_result(result):
+    """Один order, список orders (digest) или closed — в список для dispatch."""
+    if not result:
+        return []
+    if isinstance(result, list):
+        return [r for r in result if r]
+    return [result]
+
+
+async def _save_parsed_vacancy_block(
+    *,
+    block_text: str,
+    message,
+    chat,
+    chat_id: str,
+    chat_title: str,
+    message_id: str,
+    poster: dict,
+    block_index: int | None,
+    stats: dict | None,
+) -> dict | None:
+    """Один блок текста → evaluate, dedupe, save_vacancy, order для push."""
+    _bump_chat_stat(stats, chat_title, "scanned")
+    eval_text = block_text
+    if block_index is not None and message.text:
+        eval_text = enrich_digest_block(block_text, message.text)
+    accepted, category, reason, keywords = evaluate_vacancy(eval_text, poster)
+    if stats is not None:
+        stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+    if not accepted or not category:
+        _bump_chat_stat(stats, chat_title, "rejected", reason)
+        return None
+
+    expected = _chat_expected_roles.get(str(chat_id)) or _chat_expected_roles.get(chat_id)
+    if expected and category not in expected:
+        _bump_chat_stat(stats, chat_title, "role_mismatch")
+
+    if stats is not None:
+        stats["categories"][category] = stats["categories"].get(category, 0) + 1
+
+    cleaned_text = clean_message_text(eval_text)
+    message_link = get_message_link(chat.id, message.id)
+    author_contact, contact_source = resolve_vacancy_contact(eval_text, poster)
+    if not author_contact and message.text and message.text != eval_text:
+        author_contact, contact_source = resolve_vacancy_contact(message.text, poster)
+    address = extract_address_from_text(eval_text) or extract_address_from_text(message.text or "")
+    dedupe_key = build_vacancy_dedupe_key(cleaned_text, author_contact)
+
+    duplicate_type = await run_db(detect_duplicate_type, cleaned_text, author_contact, dedupe_key)
+    if duplicate_type:
+        if stats is not None:
+            if duplicate_type == "exact":
+                stats["duplicates_exact"] += 1
+            else:
+                stats["duplicates_fuzzy"] += 1
+        return None
+
+    from db import upsert_employer_from_post
+
+    employer_id = await run_db(
+        upsert_employer_from_post,
+        telegram_user_id=poster.get("user_id"),
+        username=poster.get("username"),
+        display_name=poster.get("display_name"),
+        contact_text=author_contact,
+        contact_source=contact_source,
+        category_code=category,
+    )
+
+    sub_id = f"{message_id}_b{block_index}" if block_index is not None else message_id
+    vacancy_id = make_vacancy_id(chat_id, sub_id, dedupe_key)
+    await run_db(
+        save_vacancy,
+        vacancy_id,
+        chat_id,
+        chat_title,
+        category,
+        cleaned_text[:2000],
+        message_link,
+        author_contact,
+        address,
+        False,
+        dedupe_key,
+        message.date.strftime("%Y-%m-%d %H:%M:%S"),
+        poster.get("user_id"),
+        poster.get("username"),
+        poster.get("display_name"),
+        contact_source,
+        employer_id,
+        None,
+        "approved",
+    )
+    _bump_chat_stat(stats, chat_title, "matched")
+    if stats is not None:
+        stats["matched"] += 1
+
+    return {
+        "vacancy_id": vacancy_id,
+        "chat_title": chat_title,
+        "message_text": cleaned_text,
+        "message_link": message_link,
+        "category": category,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "keywords": keywords[:5],
+        "reason": reason,
+        "author_contact": author_contact,
+        "address": address,
+        "dedupe_key": dedupe_key,
+        "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
+        "poster_user_id": poster.get("user_id"),
+        "poster_username": poster.get("username"),
+        "contact_source": contact_source,
+    }
+
+
 async def _process_single_message(
     message, chat, chat_id: str, chat_title: str, stats: dict = None, *, allow_reprocess: bool = False,
 ):
-    """Обрабатывает одно сообщение: фильтр, категория, дедуп. Возвращает order или None."""
+    """Обрабатывает одно сообщение. Возвращает order, list[order] (digest) или closed."""
     if not message.text:
         if stats is not None:
             stats["no_text"] += 1
@@ -245,68 +432,57 @@ async def _process_single_message(
     if allow_reprocess:
         return None
 
-    is_relevant, reason, keywords = is_helper_message(message.text)
-    if stats is not None:
-        stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
-    if not is_relevant:
+    poster = await extract_poster_info(message)
+
+    if should_split_digest(message.text):
+        blocks = split_vacancy_blocks(message.text)[:MAX_DIGEST_BLOCKS]
+        if stats is not None:
+            stats["digest_posts"] = stats.get("digest_posts", 0) + 1
+        orders = []
+        for idx, block in enumerate(blocks):
+            order = await _save_parsed_vacancy_block(
+                block_text=block,
+                message=message,
+                chat=chat,
+                chat_id=chat_id,
+                chat_title=chat_title,
+                message_id=message_id,
+                poster=poster,
+                block_index=idx,
+                stats=stats,
+            )
+            if order:
+                orders.append(order)
+        await run_db(mark_message_processed, message_id, chat_id)
+        await run_db(update_last_processed_id, chat_id, message.id)
+        if stats is not None:
+            stats["digest_blocks_saved"] = stats.get("digest_blocks_saved", 0) + len(orders)
+            if not orders:
+                stats["non_relevant"] += 1
+        if not orders:
+            return None
+        return orders if len(orders) > 1 else orders[0]
+
+    order = await _save_parsed_vacancy_block(
+        block_text=message.text,
+        message=message,
+        chat=chat,
+        chat_id=chat_id,
+        chat_title=chat_title,
+        message_id=message_id,
+        poster=poster,
+        block_index=None,
+        stats=stats,
+    )
+    if not order:
         if stats is not None:
             stats["non_relevant"] += 1
         return None
 
-    category = detect_category(message.text)
-    if stats is not None:
-        stats["categories"][category] = stats["categories"].get(category, 0) + 1
-    cleaned_text = clean_message_text(message.text)
-    message_link = get_message_link(chat.id, message.id)
-    author_contact = extract_contact_from_text(message.text)
-    address = extract_address_from_text(message.text)
-    dedupe_key = build_vacancy_dedupe_key(message.text, author_contact)
-
-    duplicate_type = await run_db(detect_duplicate_type, message.text, author_contact, dedupe_key)
-    if duplicate_type:
-        if stats is not None:
-            if duplicate_type == "exact":
-                stats["duplicates_exact"] += 1
-            else:
-                stats["duplicates_fuzzy"] += 1
-        await run_db(mark_message_processed, message_id, chat_id)
-        return None
-
-    vacancy_id = make_vacancy_id(chat_id, message_id, dedupe_key)
-    await run_db(
-        save_vacancy,
-        vacancy_id,
-        chat_id,
-        chat_title,
-        category,
-        cleaned_text[:2000],
-        message_link,
-        author_contact,
-        address,
-        False,
-        dedupe_key,
-        message.date.strftime("%Y-%m-%d %H:%M:%S"),
-    )
     await run_db(mark_message_processed, message_id, chat_id)
     await run_db(update_last_processed_id, chat_id, message.id)
-    if stats is not None:
-        stats["matched"] += 1
+    return order
 
-    return {
-        "vacancy_id": vacancy_id,
-        "chat_title": chat_title,
-        "message_text": cleaned_text,
-        "message_link": message_link,
-        "category": category,
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "keywords": keywords[:5],
-        "reason": reason,
-        "author_contact": author_contact,
-        "address": address,
-        "dedupe_key": dedupe_key,
-        "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
-    }
 
 async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None, *, incremental: bool = False):
     all_results = []
@@ -316,6 +492,7 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
         return [], []
 
     await refresh_monitored_chat_ids(client)
+    await refresh_chat_expected_roles_cache(client)
 
     for i, chat_link in enumerate(target_chats, 1):
         entity = await safe_get_entity(client, chat_link)
@@ -343,11 +520,12 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
                     await asyncio.sleep(0)
             try:
                 result = await _process_single_message(message, entity, chat_id, chat_title, stats)
-                if result and result.get("type") == "closed":
-                    closed_vacancies_users.append((result["vacancy_id"], result["users"]))
-                elif result:
-                    all_results.append(result)
-                    await asyncio.sleep(0.05)
+                for item in _flatten_parser_result(result):
+                    if item.get("type") == "closed":
+                        closed_vacancies_users.append((item["vacancy_id"], item["users"]))
+                    else:
+                        all_results.append(item)
+                        await asyncio.sleep(0.05)
             except Exception as e:
                 if stats is not None:
                     stats["errors"] += 1
@@ -489,19 +667,20 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
             )
 
             async def _dispatch_parser_result(result, chat_title: str, *, edited: bool = False):
-                if result and result.get("type") == "closed":
-                    if closed_callback and result.get("users"):
-                        await closed_callback([(result["vacancy_id"], result["users"])])
-                    if result.get("vacancy_id"):
+                for item in _flatten_parser_result(result):
+                    if item.get("type") == "closed":
+                        if closed_callback and item.get("users"):
+                            await closed_callback([(item["vacancy_id"], item["users"])])
+                        if item.get("vacancy_id"):
+                            logger.info(
+                                f"🔒 {PARSER_LABEL}: закрыта вакансия {item['vacancy_id']} "
+                                f"({'редактирование' if edited else 'пост'}) «{chat_title}»"
+                            )
+                    else:
+                        bot_callback(item)
                         logger.info(
-                            f"🔒 {PARSER_LABEL}: закрыта вакансия {result['vacancy_id']} "
-                            f"({'редактирование' if edited else 'пост'}) «{chat_title}»"
+                            f"⚡ {PARSER_LABEL}: вакансия [{item.get('category')}] из «{chat_title}»"
                         )
-                elif result:
-                    bot_callback(result)
-                    logger.info(
-                        f"⚡ {PARSER_LABEL}: вакансия [{result.get('category')}] из «{chat_title}»"
-                    )
 
             async def on_new_message(event):
                 if not is_chat_monitored(event.chat_id):
@@ -656,6 +835,8 @@ def _empty_debug_stats() -> dict:
         "closed_vacancies": 0,
         "duplicates_exact": 0,
         "duplicates_fuzzy": 0,
+        "digest_posts": 0,
+        "digest_blocks_saved": 0,
         "run_kind": None,
     }
 
@@ -697,6 +878,7 @@ def get_last_debug_report() -> str:
         f"уже обработано: {s.get('already_sent', 0)} | старых: {s.get('old_messages', 0)} | "
         f"закрыто: {s.get('closed_vacancies', 0)}",
         f"Дубли: exact={s.get('duplicates_exact', 0)} | fuzzy={s.get('duplicates_fuzzy', 0)}",
+        f"Digest: постов {s.get('digest_posts', 0)}, сохранено блоков {s.get('digest_blocks_saved', 0)}",
         f"Локальных ошибок: {s.get('errors', 0)}",
     ]
 
@@ -728,14 +910,42 @@ def get_last_debug_report() -> str:
         lines.append("\n⚠️ Ошибки по чатам:")
         for chat, count in sorted(chat_errors.items(), key=lambda x: x[1], reverse=True)[:5]:
             lines.append(f"  • {chat}: {count}")
+    by_chat = s.get("by_chat") or {}
+    if by_chat:
+        lines.append("\n📊 *Шум по чатам (топ):*")
+        ranked = []
+        for title, bucket in by_chat.items():
+            total = (bucket.get("scanned") or 0) or (
+                (bucket.get("matched") or 0) + (bucket.get("rejected") or 0)
+            )
+            if not total:
+                continue
+            noise = int((bucket.get("rejected") or 0) * 100 / total)
+            ranked.append((noise, title, bucket))
+        for noise, title, bucket in sorted(ranked, reverse=True)[:5]:
+            lines.append(
+                f"  • {title}: шум {noise}%, в ленту {bucket.get('matched', 0)}"
+            )
     return "\n".join(lines)
 
 def extract_contact_from_text(text: str) -> str:
     if not text:
         return None
+    md_user = re.search(r"\]\(tg://user\?id=(\d+)\)", text, re.IGNORECASE)
+    if md_user:
+        return f"tg://user?id={md_user.group(1)}"
+    user_link = re.search(r"tg://user\?id=(\d+)", text, re.IGNORECASE)
+    if user_link:
+        return f"tg://user?id={user_link.group(1)}"
     resolve_match = re.search(r'tg://resolve\?domain=([a-zA-Z0-9_]{5,32})', text, re.IGNORECASE)
     if resolve_match:
         return f"@{resolve_match.group(1)}"
+    wa_match = re.search(r'(?:https?://)?wa\.me/(\d{5,15})', text, re.IGNORECASE)
+    if wa_match:
+        return f"https://wa.me/{wa_match.group(1)}"
+    api_wa = re.search(r'(?:https?://)?api\.whatsapp\.com/send\?phone=(\d{5,15})', text, re.IGNORECASE)
+    if api_wa:
+        return f"https://wa.me/{api_wa.group(1)}"
     username_match = re.search(r'@([a-zA-Z0-9_]{5,32})', text)
     if username_match:
         return username_match.group(0)
@@ -1007,11 +1217,12 @@ _CATEGORY_TIEBREAK = (
 _CATEGORY_KEYWORDS = {
     "loader": [
         "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
-        "погрузка", "разгрузка", "выгрузка", "выгрузк", "такелаж", "такелажник",
+        "погрузка", "разгрузка", "выгрузка", "выгрузк", "разгрузк", "погрузк",
+        "такелаж", "такелажник",
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
         "складской работник", "на склад", "рохл", "паллет", "складирован",
-        "производств", "фасовоч",
+        "производств", "фасовоч", "кладовщик",
     ],
     "promoter": [
         "промоутер", "промоутеры", "промоутерша", "промоутером", "промо персонал", "промо",
@@ -1054,13 +1265,53 @@ _NON_SUPERVISOR_COORDINATOR = (
 )
 
 
+MAX_DIGEST_BLOCKS = 12
+
+
 def split_vacancy_blocks(text: str) -> list:
-    """Digest-посты «1. … 2. …» — категория по первому блоку с явной ролью."""
+    """Digest «1. … 2. …» / буллеты — отдельные блоки."""
     if not text:
         return []
-    parts = re.split(r"(?=\n\s*\d+[\.\)]\s)", text)
+    parts = re.split(
+        r"(?:(?<=\n)|(?<=^))\s*(?:\d+[\.\)]|[•▪–—\-])\s+",
+        text,
+    )
     blocks = [p.strip() for p in parts if p.strip()]
-    return blocks if len(blocks) > 1 else [text]
+    if len(blocks) > 1:
+        return blocks
+    # «**1. текст» без переноса перед номером
+    parts2 = re.split(r"\s*\d+[\.\)]\s+", text, maxsplit=0)
+    blocks2 = [p.strip() for p in parts2 if p.strip()]
+    if len(blocks2) > 1:
+        return blocks2
+    return [text]
+
+
+def enrich_digest_block(block_text: str, full_text: str) -> str:
+    """Подмешивает оплату/контакт из шапки digest в блок без своих."""
+    parts = [block_text.strip()]
+    if not has_payment_signal(block_text):
+        for line in full_text.splitlines():
+            if _PAYMENT_RATE_RE.search(line):
+                parts.append(line.strip())
+                break
+    if not extract_contact_from_text(block_text):
+        contact = extract_contact_from_text(full_text)
+        if contact:
+            parts.append(contact)
+    return "\n".join(parts)
+
+
+def _numbered_vacancy_count(text: str) -> int:
+    if not text:
+        return 0
+    if re.search(r"(?:^|\n)\s*2[\.\)]\s", text):
+        markers = re.findall(
+            r"(?:^|\n|\*{1,4})\s*(\d+)[\.\)]\s+(?!\d{1,2}[\./]\d)",
+            text,
+        )
+        return max(len(markers), 2)
+    return len(re.findall(r"(?:^|\n)\s*3[\.\)]\s", text))
 
 
 def _score_categories(text_lower: str) -> dict:
@@ -1096,37 +1347,288 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     return winners[0]
 
 
-def _fallback_category(text_lower: str) -> str:
-    if any(w in text_lower for w in ("хелпер", "хэлпер", "helper", "бекфотограф", "бэкстейдж")):
-        return "helper"
-    if any(w in text_lower for w in _LABOR_HINTS):
-        return "loader"
-    if any(w in text_lower for w in _PROMO_HINTS):
-        return "promoter"
-    if "массовк" in text_lower:
-        return "animator"
-    if "аниматор" in text_lower:
-        return "animator"
-    if "водител" in text_lower:
-        return "driver"
-    if "супервайзер" in text_lower or "супервизор" in text_lower:
-        return "supervisor"
-    return "helper"
+_STAFF_HIRING_EXTRA = (
+    "набор", "на мероприятие", "ищем", "персонал", "комплект", "staff", "бригада",
+    "еще 1 рабочий", "ещё 1 рабочий",
+)
+_PAYMENT_RATE_RE = re.compile(
+    r"(?:"
+    r"\d[\d\s.,]*\s*(?:руб\.?|₽|р\.?\/?\s*ч)|"
+    r"₽\/?\s*ч|р\/\s*ч|руб\.?\s*/\s*ч|"
+    r"ставка\s*[:\s]?\s*\d|минималка|"
+    r"оплат\w*\s*[:\s].*\d|\d[\d\s.,]*\s*(?:₽|руб)"
+    r")",
+    re.I,
+)
+_SERVICE_REQUEST_RES = (
+    re.compile(r"ищу\s+(?:#)?(?:зомби|квест|анимационн|программ|диджей|музыкант|фотограф|ведущ)", re.I),
+    re.compile(r"присылайте\s+(?:программу|видео|описание|варианты|прайс|цены)", re.I),
+    re.compile(r"бюджет\s+\d+.*(?:ищу|нужен\s+#)", re.I),
+    re.compile(r"ищу\s+#\w+\s+на\s+\d", re.I),
+)
 
 
-def detect_category(text: str) -> str:
-    """Категория только по тексту поста; название группы/канала не учитывается."""
+def _detect_category_scored(text: str) -> str | None:
     if not text:
-        return "helper"
+        return None
+    text_lower = text.lower()
+    return _pick_category_from_scores(_score_categories(text_lower), text_lower)
+
+
+def detect_category(text: str) -> str | None:
+    """Категория по тексту; без уверенного scoring — None (не fallback)."""
+    if not text:
+        return None
     blocks = split_vacancy_blocks(text)
     for block in blocks:
-        text_lower = block.lower()
-        cat = _pick_category_from_scores(_score_categories(text_lower), text_lower)
+        cat = _detect_category_scored(block)
         if cat:
             return cat
-    text_lower = text.lower()
-    cat = _pick_category_from_scores(_score_categories(text_lower), text_lower)
-    return cat if cat else _fallback_category(text_lower)
+    return _detect_category_scored(text)
+
+
+def is_casting_call(text: str) -> bool:
+    """Кастинг моделей/съёмок — не event-staff."""
+    if not text:
+        return False
+    tl = text.lower()
+    markers = (
+        "кастинг", "casting", "фотомодел", "видеомодел", "модель на съём",
+        "модель на съем", "моделей на реклам", "open call",
+    )
+    if not any(m in tl for m in markers):
+        return False
+    event_staff = (
+        "промоутер", "хостес", "хелпер", "хэлпер", "грузчик", "аниматор",
+        "мероприят", "на площадке", "смен", "персонал", "официант",
+    )
+    return not any(w in tl for w in event_staff)
+
+
+def is_service_request(text: str) -> bool:
+    if not text:
+        return False
+    for pat in _SERVICE_REQUEST_RES:
+        if pat.search(text):
+            return True
+    return False
+
+
+def has_hiring_signal(text: str) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+    for hv in (*HIRING_VERBS, *_STAFF_HIRING_EXTRA):
+        if hv.lower() in tl:
+            return True
+    if re.search(r"\d+\s*(?:чел|человек|чел\b|рабоч|сотрудник)", tl):
+        return True
+    if re.search(r"позиция\s*[:\s]", tl):
+        return True
+    if _detect_category_scored(text):
+        return True
+    return False
+
+
+def has_payment_signal(text: str) -> bool:
+    if not text or is_unpaid_vacancy(text):
+        return False
+    tl = text.lower()
+    if _PAYMENT_RATE_RE.search(tl):
+        return True
+    for token in ("ставка", "минималка", "гонорар", "зарплат", "з/п"):
+        if token in tl:
+            return True
+    return False
+
+
+def has_contact_signal(text: str, poster: dict | None = None) -> bool:
+    return bool(resolve_vacancy_contact(text, poster)[0])
+
+
+async def extract_poster_info(message) -> dict:
+    """Автор поста из Telethon (не список участников группы)."""
+    info: dict = {}
+    try:
+        sender = await message.get_sender()
+        if sender and getattr(sender, "id", None):
+            info["user_id"] = int(sender.id)
+            uname = getattr(sender, "username", None)
+            if uname:
+                info["username"] = uname
+            fn = (getattr(sender, "first_name", None) or "").strip()
+            ln = (getattr(sender, "last_name", None) or "").strip()
+            info["display_name"] = f"{fn} {ln}".strip() or None
+    except Exception as e:
+        logger.debug("extract_poster_info sender: %s", e)
+    post_author = getattr(message, "post_author", None)
+    if post_author and not info.get("display_name"):
+        info["display_name"] = str(post_author).strip()
+    return info
+
+
+def resolve_vacancy_contact(text: str, poster: dict | None = None) -> tuple[str | None, str | None]:
+    from_text = extract_contact_from_text(text or "")
+    if from_text:
+        return from_text, "text"
+    if poster:
+        if poster.get("username"):
+            return f"@{poster['username']}", "sender"
+        if poster.get("user_id"):
+            return f"tg://user?id={poster['user_id']}", "sender"
+    return None, None
+
+
+def should_split_digest(text: str) -> bool:
+    """Нумерованный digest «1. … 2. …» — разбираем по блокам, не одной вакансией."""
+    if not text:
+        return False
+    if _numbered_vacancy_count(text) < 2:
+        return False
+    return len(split_vacancy_blocks(text)) > 1
+
+
+def evaluate_digest_blocks(text: str, poster: dict | None = None) -> list[tuple[str, str]]:
+    """Принятые блоки digest: [(category, block_text), …]."""
+    accepted = []
+    for block in split_vacancy_blocks(text)[:MAX_DIGEST_BLOCKS]:
+        ok, cat, _, _ = evaluate_vacancy(block, poster)
+        if ok and cat:
+            accepted.append((cat, block))
+    return accepted
+
+
+def is_mixed_digest_post(text: str) -> bool:
+    """Обратная совместимость тестов — то же, что should_split_digest."""
+    return should_split_digest(text)
+
+
+def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, str, list]:
+    """Общий gate: найм персонала на смену (все категории)."""
+    if not text:
+        return False, "empty", []
+    tl = text.lower()
+    if is_unpaid_vacancy(text):
+        return False, "unpaid", []
+    for phrase in STOP_PHRASES:
+        if phrase.lower() in tl:
+            return False, f"stop_phrase: {phrase}", []
+    if is_service_request(text):
+        return False, "service_request", []
+    if is_casting_call(text):
+        return False, "casting", []
+    if re.search(r"#\s*(аниматор|квест|диджей|музыкант|фотограф)\b", tl):
+        if not has_hiring_signal(text) and not any(
+            w in tl for w in ("хелпер", "хэлпер", "грузчик", "разнорабоч", "промоутер", "нужен", "нужны", "требу")
+        ):
+            return False, "excluded_hashtag_role", []
+    if any(p in tl for p in ("организатор", "координатор свад", "свадеб")) and "супервайзер" not in tl:
+        if not any(w in tl for w in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "промо", "нужны", "требу")):
+            return False, "excluded_organizer", []
+    for category in EXCLUDE_CATEGORIES:
+        if category.lower() in tl:
+            if not any(hw in tl for hw in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "нужны", "требу")):
+                return False, f"excluded_category: {category}", []
+    if not has_hiring_signal(text):
+        return False, "no_hiring", []
+    if not has_payment_signal(text):
+        return False, "no_payment", []
+    if not has_contact_signal(text, poster):
+        return False, "no_contact", []
+    keywords = []
+    cat = detect_category(text)
+    if cat:
+        keywords.append(cat)
+    return True, "staff_job", keywords
+
+
+def passes_quality_gate(category: str, text: str) -> bool:
+    """Per-category gate: роль в тексте совпадает и нет явного конфликта."""
+    if not text or not category:
+        return False
+    if is_unpaid_vacancy(text):
+        return False
+    tl = text.lower()
+    scores = _score_categories(tl)
+    cat_score = scores.get(category, 0)
+    if cat_score <= 0:
+        return False
+    if cat_score < max(scores.values()):
+        return False
+
+    if category == "helper":
+        helper_markers = (
+            "хелпер", "хэлпер", "helper", "помощник на мероприят", "помощник организатора",
+            "помощь на площадке", "принеси", "подай", "бекфотограф", "бэкстейдж", "ассистент по акт",
+        )
+        if not any(m in tl for m in helper_markers):
+            return False
+        if any(w in tl for w in _PROMO_HINTS) and "промоутер" not in tl and "позиция: промо" not in tl:
+            if not any(m in tl for m in ("хелпер", "хэлпер", "helper")):
+                return False
+        if any(w in tl for w in _LABOR_HINTS) and not any(m in tl for m in ("хелпер", "хэлпер", "helper", "помощник")):
+            return False
+    elif category == "loader":
+        if not any(w in tl for w in _LABOR_HINTS + ("грузчик", "разнорабоч", "подсобник", "такелаж", "кладовщик", "разгрузк", "погрузк")):
+            return False
+    elif category == "promoter":
+        if not any(w in tl for w in _PROMO_HINTS):
+            return False
+        if re.search(r"позиция\s*[:\s].*хелпер", tl) and "промо" not in tl and "промоутер" not in tl:
+            return False
+    elif category == "animator":
+        if not any(w in tl for w in ("аниматор", "анимац", "массовк", "клоун", "ростовые")):
+            return False
+        if is_service_request(text):
+            return False
+    elif category == "hostess":
+        if not any(w in tl for w in ("хостес", "ресепшн", "встреча гостей", "встречать гостей")):
+            return False
+    elif category == "wardrobe":
+        if not any(w in tl for w in ("гардероб", "гардеробщ", "раздевалка", "номерков")):
+            return False
+    elif category == "waiter":
+        if not any(w in tl for w in ("официант", "бармен", "обслуживание гостей")):
+            return False
+    elif category == "driver":
+        if not any(w in tl for w in ("водител", "курьер", "экспедитор")):
+            return False
+    elif category == "security":
+        if not any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити", "пропускной")):
+            return False
+    elif category == "parking":
+        if not any(w in tl for w in ("парковщик", "паркинг", "парковоч")):
+            return False
+    elif category == "supervisor":
+        if not any(w in tl for w in (
+            "супервайзер", "супервизор", "старший смены", "контроль промо", "координатор промо",
+            "координатор проекта", "координатор мероприят",
+        )):
+            return False
+    return True
+
+
+def evaluate_vacancy(
+    text: str, poster: dict | None = None, *, force_category: str | None = None,
+) -> tuple[bool, str | None, str, list]:
+    """Полный P0-pipeline: staff gate → category → per-category gate."""
+    if should_split_digest(text):
+        return False, None, "digest_split_required", []
+    ok, reason, keywords = is_job_post_for_staff(text, poster)
+    if not ok:
+        return False, None, reason, keywords
+    category = force_category or detect_category(text)
+    if not category:
+        return False, None, "ambiguous_category", keywords
+    if not passes_quality_gate(category, text):
+        return False, None, f"quality_gate:{category}", keywords
+    return True, category, "accepted", keywords
+
+
+def vacancy_matches_category(text: str, category_code: str) -> bool:
+    """Перепроверка для ленты и push — тот же pipeline, что при парсинге."""
+    accepted, category, _, _ = evaluate_vacancy(text)
+    return accepted and category == category_code
 
 
 def is_unpaid_vacancy(text: str) -> bool:
@@ -1137,46 +1639,22 @@ def is_unpaid_vacancy(text: str) -> bool:
         return True
     if re.search(r"💵\s*нет\b", text_lower):
         return True
+    if re.search(r"оплата\s*[:\s]*нет\b", text_lower):
+        return True
     if any(p in text_lower for p in ("безмерную благодарность", "без оплаты", "бесплатно", "волонтер")):
         return True
     return False
 
 
 def is_helper_message(text: str):
-    if not text:
-        return False, "empty", []
-    text_lower = text.lower()
-    if is_unpaid_vacancy(text):
-        return False, "unpaid", []
-    if any(p in text_lower for p in ("организатор", "координатор свад", "свадеб")) and "супервайзер" not in text_lower:
-        if not any(w in text_lower for w in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "промо")):
-            return False, "excluded_organizer", []
-    for phrase in STOP_PHRASES:
-        if phrase.lower() in text_lower:
-            return False, f"stop_phrase: {phrase}", []
-    labor_keywords = ["грузчик", "грузчики", "разнорабочий", "такелажник", "погрузка", "разгрузка", "такелаж"]
-    for kw in labor_keywords:
-        if kw in text_lower:
-            return True, "labor_work", [kw]
-    for category in EXCLUDE_CATEGORIES:
-        if category.lower() in text_lower:
-            if not any(hw in text_lower for hw in ["хелпер", "хэлпер", "промоутер", "аниматор", "грузчик"]):
-                return False, f"excluded_category: {category}", []
-    found_helpers = [hw for hw in HELPER_KEYWORDS if hw.lower() in text_lower]
-    found_hiring = [hv for hv in HIRING_VERBS if hv.lower() in text_lower]
-    found_one_time = [ot for ot in ONE_TIME_JOB_KEYWORDS if ot.lower() in text_lower]
-    found_payment = [pi for pi in PAYMENT_INDICATORS if pi.lower() in text_lower]
-    if found_helpers and found_hiring:
-        return True, "helper_plus_hiring", found_helpers + found_hiring[:2]
-    if found_helpers and found_one_time:
-        return True, "helper_plus_one_time", found_helpers + found_one_time[:2]
-    if found_helpers and found_payment:
-        return True, "helper_plus_payment", found_helpers + found_payment[:2]
-    if found_hiring and "хелпер" in text_lower:
-        return True, "hiring_plus_helper_text", found_hiring + ["хелпер"]
-    if found_hiring and "промоутер" in text_lower:
-        return True, "hiring_plus_promoter_text", found_hiring + ["промоутер"]
-    return False, "no_match", []
+    """Обратная совместимость: делегирует в evaluate_vacancy / is_job_post_for_staff."""
+    accepted, category, reason, keywords = evaluate_vacancy(text)
+    if accepted:
+        return True, reason, keywords
+    ok, staff_reason, staff_kw = is_job_post_for_staff(text)
+    if ok:
+        return False, reason, keywords
+    return False, staff_reason, staff_kw
 
 def clean_message_text(text: str) -> str:
     if not text:
@@ -1258,14 +1736,14 @@ async def test_filter(chat_link: str, limit: int = 30):
         async for message in client.iter_messages(entity, limit=limit):
             if not message.text:
                 continue
-            is_rel, reason, keywords = is_helper_message(message.text)
-            if is_rel:
-                cat = detect_category(message.text)
-                category_stats[cat] = category_stats.get(cat, 0) + 1
+            accepted, category, reason, keywords = evaluate_vacancy(message.text)
+            if accepted and category:
+                category_stats[category] = category_stats.get(category, 0) + 1
                 passed += 1
-                logger.info(f"✅ [{cat}] [{reason}] {message.text[:80]}...")
+                logger.info(f"✅ [{category}] [{reason}] {message.text[:80]}...")
             else:
                 blocked += 1
+                logger.debug(f"⛔ [{reason}] {message.text[:60]}...")
         logger.info(f"\n{'='*60}")
         logger.info(f"📊 ПРОПУЩЕНО: {passed} | ОТСЕЯНО: {blocked}")
         logger.info(f"📊 Категории: {category_stats}")

@@ -11,7 +11,8 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand, BufferedInputFile, LabeledPrice
+from aiogram import F
 from db import *
 from db_backend import db_conn, fetchone, now_minus_days, bool_false, run_db
 from parser import (
@@ -19,11 +20,20 @@ from parser import (
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
     make_vacancy_id, PARSER_LABEL, inspect_parser_chats, format_parser_chats_report,
     get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
-    spawn_background_task,
+    spawn_background_task, vacancy_matches_category, evaluate_vacancy,
+    resolve_vacancy_contact, build_vacancy_dedupe_key,
+    format_chat_noise_report,
+)
+from admin_exports import (
+    build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
+    build_notfit_xlsx, export_filename,
 )
 from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
     SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, VACANCY_MAX_AGE_HOURS,
+    FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS,
+    FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED,
+    LLM_ENABLED, LLM_DAILY_LIMIT_PREMIUM, STARS_ENABLED, STARS_EXTENDED_RESPONSE_PRICE,
 )
 from profile_photos import (
     get_user_photos_dir, persist_user_photo, photo_health_loop, send_profile_photo,
@@ -33,7 +43,197 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Метка сборки — в логах и /status, чтобы проверить деплой на Bothost.
-APP_BUILD = os.getenv("APP_BUILD", "profile-menu-v1")
+APP_BUILD = os.getenv("APP_BUILD", "tool-v4")
+
+
+def configure_third_party_logging():
+    """Telethon на INFO сыпет «Got difference…» — в проде оставляем WARNING+."""
+    for name in (
+        "telethon",
+        "telethon.client",
+        "telethon.client.updates",
+        "telethon.network",
+        "aiogram",
+        "aiohttp",
+        "httpx",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+configure_third_party_logging()
+
+BTN_EMPLOYER_POST = "📤 Разместить вакансию"
+BTN_SWITCH_CANDIDATE = "👷 Режим исполнителя"
+
+def build_role_picker_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👷 Ищу работу", callback_data="role_candidate"),
+            InlineKeyboardButton(text="🏢 Ищу персонал", callback_data="role_employer"),
+        ],
+    ])
+
+
+def poster_from_tg_user(user: types.User) -> dict:
+    display = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
+    return {
+        "user_id": user.id,
+        "username": user.username,
+        "display_name": display or user.first_name,
+    }
+
+
+def poster_from_order(order: dict) -> dict | None:
+    if order.get("poster"):
+        return order["poster"]
+    uid = order.get("poster_user_id")
+    uname = order.get("poster_username")
+    if uid or uname:
+        return {"user_id": uid, "username": uname}
+    contact = (order.get("author_contact") or "").strip()
+    if contact.startswith("tg://user?id="):
+        try:
+            raw = contact.split("id=")[1].split("&")[0]
+            return {"user_id": int(raw)}
+        except (ValueError, IndexError):
+            pass
+    if contact.startswith("@"):
+        return {"username": contact[1:]}
+    return None
+
+
+async def publish_employer_vacancy(user: types.User, category_code: str, vacancy_text: str) -> tuple[bool, str]:
+    """Публикация заказчиком → модерация, push после одобрения админом."""
+    poster = poster_from_tg_user(user)
+    profile = get_subscriber_profile(user.id)
+    phone = (profile or {}).get("phone")
+    body = vacancy_text.strip()
+    if phone and phone not in body:
+        body = f"{body}\n\n📞 {phone}"
+
+    accepted, cat, reason, _ = evaluate_vacancy(body, poster, force_category=category_code)
+    if not accepted or cat != category_code:
+        hints = {
+            "no_hiring": "Укажите, кого ищете (промоутер, хелпер и т.д.).",
+            "no_payment": "Укажите оплату (ставка, ₽/час, сумма).",
+            "no_contact": "Добавьте @username или телефон — или войдите с аккаунтом с username.",
+            "ambiguous_category": "Текст не совпадает с выбранной категорией — уточните роль.",
+        }
+        base = hints.get(reason.split(":")[0], reason)
+        if reason.startswith("quality_gate"):
+            base = f"Текст не подходит под категорию «{get_category_name(category_code)}». Уточните роль и задачи."
+        return False, base
+
+    author_contact, contact_source = resolve_vacancy_contact(body, poster)
+    address = extract_address_from_text(body)
+    dedupe_key = build_vacancy_dedupe_key(body, author_contact)
+    ts = str(int(datetime.now().timestamp()))
+    vacancy_id = make_vacancy_id(f"employer_{user.id}", ts, dedupe_key)
+    published_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    display_name = poster.get("display_name")
+
+    employer_id = upsert_employer_from_post(
+        telegram_user_id=user.id,
+        username=user.username,
+        display_name=display_name,
+        contact_text=author_contact,
+        contact_source=contact_source,
+        category_code=category_code,
+        bot_user_id=user.id,
+    )
+    save_vacancy(
+        vacancy_id,
+        f"employer_{user.id}",
+        "PromoStaff Hunter · заказчик",
+        category_code,
+        body[:2000],
+        None,
+        author_contact,
+        address,
+        False,
+        dedupe_key,
+        published_at,
+        user.id,
+        user.username,
+        display_name,
+        contact_source,
+        employer_id,
+        user.id,
+        "pending",
+    )
+    return True, vacancy_id
+
+
+async def notify_admin_moderation(vacancy_id: str, category_code: str, preview: str, employer_user_id: int):
+    if not YOUR_USER_ID:
+        return
+    cat_name = get_category_name(category_code)
+    text = (
+        f"📝 *Модерация вакансии заказчика*\n\n"
+        f"ID: `{vacancy_id}`\n"
+        f"Категория: {cat_name}\n"
+        f"Заказчик user_id: `{employer_user_id}`\n\n"
+        f"{escape_markdown(preview[:400])}"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod_ok_{vacancy_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_no_{vacancy_id}"),
+        ],
+    ])
+    try:
+        await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        logger.warning("notify_admin_moderation: %s", e)
+
+
+async def channel_post_for_vacancy(vacancy_id: str, *, force: bool = False) -> str:
+    """Кросс-пост превью в @promostaff_agency_job. Возвращает текст для админа."""
+    if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
+        return (
+            "❌ Кросс-пост выключен. Задайте `CHANNEL_CROSSPOST_ENABLED=1` "
+            "и `HUNTER_CHANNEL_ID` на Bothost."
+        )
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        return f"❌ Вакансия `{vacancy_id}` не найдена."
+    category_code = row[5] or "promoter"
+    from services.channel_post import post_vacancy_preview_to_channel
+    ok = await post_vacancy_preview_to_channel(
+        bot,
+        vacancy_id=vacancy_id,
+        category_name=get_category_name(category_code),
+        category_emoji=get_category_emoji(category_code),
+        body=row[0] or "",
+        source=row[2] or "—",
+        freshness=get_freshness_label(row[8]),
+        force=force,
+    )
+    if ok:
+        return f"✅ Опубликовано в канал: `{vacancy_id}`"
+    if is_vacancy_channel_posted(vacancy_id) and not force:
+        return f"ℹ️ Вакансия `{vacancy_id}` уже была в канале."
+    return "❌ Не удалось опубликовать. Проверьте права бота в канале и `HUNTER_CHANNEL_ID`."
+
+
+def build_order_from_vacancy_row(vacancy_id: str, row) -> dict | None:
+    if not row:
+        return None
+    return {
+        "vacancy_id": vacancy_id,
+        "chat_title": row[2] or "PromoStaff Hunter · заказчик",
+        "message_text": row[0],
+        "message_link": row[1],
+        "category": row[5],
+        "chat_id": row[6],
+        "author_contact": row[3],
+        "address": row[4],
+        "dedupe_key": row[7],
+        "published_at": row[8],
+        "poster_user_id": row[9],
+        "poster_username": row[10],
+        "from_bot_employer": True,
+    }
 
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_MY_DATA = "👤 Мои данные"
@@ -73,12 +273,52 @@ def build_maps_url(address: str) -> str | None:
     return url
 
 
+def _inline_btn(
+    text: str,
+    *,
+    callback_data: str | None = None,
+    url: str | None = None,
+    style: str | None = None,
+) -> InlineKeyboardButton:
+    kwargs: dict = {"text": text}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if style is not None:
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+
+NOTFIT_REASONS = {
+    "wrong_category": "Не та категория / роль",
+    "low_pay": "Мало платят",
+    "wrong_area": "Не мой район / далеко",
+    "spam": "Спам или не вакансия",
+    "duplicate": "Уже видел / повтор",
+    "other": "Другое (напишу)",
+}
+
+
+def build_notfit_reason_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
+    rows = [
+        [_inline_btn(label, callback_data=f"nfr:{code}:{vacancy_id}")]
+        for code, label in NOTFIT_REASONS.items()
+    ]
+    rows.append([_inline_btn("Отмена", callback_data=f"notfit_cancel:{vacancy_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def build_vacancy_keyboard(vacancy_id: str, address: str | None = None) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(text="✋ Откликнуться", callback_data=f"respond_{vacancy_id}")]]
+    """Inline-кнопки с цветами Bot API 9.4 (style на InlineKeyboardButton)."""
+    buttons = [[_inline_btn("Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
     maps_url = build_maps_url(address) if address else None
     if maps_url:
-        buttons.append([InlineKeyboardButton(text="🗺️ Показать на карте", url=maps_url)])
-    buttons.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{vacancy_id}")])
+        buttons.append([_inline_btn("На карте", url=maps_url, style="primary")])
+    buttons.append([
+        _inline_btn("Не подходит", callback_data=f"notfit_{vacancy_id}"),
+        _inline_btn("Жалоба", callback_data=f"complain_{vacancy_id}", style="danger"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -109,8 +349,16 @@ async def send_vacancy_card(
     chat_id: int,
     text: str,
     reply_markup: InlineKeyboardMarkup | None = None,
+    *,
+    topic_key: str | None = "vacancies",
 ):
     """HTML-карточка вакансии с fallback без разметки."""
+    extra: dict = {}
+    if topic_key and FORUM_TOPICS_ENABLED:
+        if not get_user_topic_thread_id(chat_id, topic_key):
+            await setup_forum_topics_for_user(chat_id)
+        from services.forum_topics import topic_message_kwargs
+        extra = topic_message_kwargs(chat_id, topic_key)
     try:
         await send_message_with_retry(
             chat_id,
@@ -118,6 +366,7 @@ async def send_vacancy_card(
             parse_mode="HTML",
             reply_markup=reply_markup,
             disable_web_page_preview=True,
+            **extra,
         )
     except TelegramBadRequest as e:
         if "parse" in str(e).lower():
@@ -127,6 +376,7 @@ async def send_vacancy_card(
                 text=plain,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
+                **extra,
             )
             return
         raise
@@ -347,6 +597,51 @@ async def send_message_with_retry(user_id: int, **kwargs):
                 continue
             raise
 
+
+async def setup_forum_topics_for_user(user_id: int):
+    if not FORUM_TOPICS_ENABLED:
+        return
+    try:
+        from services.forum_topics import ensure_user_forum_topics
+        await ensure_user_forum_topics(bot, user_id)
+    except Exception as e:
+        logger.warning("forum topics setup user=%s: %s", user_id, e)
+
+
+async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwargs):
+    """send_message в тему лички (или general без topic_key)."""
+    extra: dict = {}
+    if topic_key and FORUM_TOPICS_ENABLED:
+        if not get_user_topic_thread_id(user_id, topic_key):
+            await setup_forum_topics_for_user(user_id)
+        from services.forum_topics import topic_message_kwargs
+        extra = topic_message_kwargs(user_id, topic_key)
+    return await send_message_with_retry(user_id, **extra, **kwargs)
+
+
+async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy_id: str):
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        await message.answer("❌ Вакансия не найдена или уже снята.")
+        return
+    if row[11] not in (None, "approved"):
+        await message.answer("⏳ Вакансия на модерации.")
+        return
+    msg_text, message_link, source_title, _contact, address = row[0], row[1], row[2], row[3], row[4]
+    category_code = row[5] or "promoter"
+    published_raw = row[8]
+    text = format_vacancy_card_html(
+        category_emoji=get_category_emoji(category_code),
+        category_name=get_category_name(category_code),
+        freshness=get_freshness_label(published_raw),
+        published_at=format_publication_time(published_raw),
+        body=msg_text or "",
+        source=source_title or row[6] or "—",
+        message_link=message_link,
+    )
+    keyboard = build_vacancy_keyboard(vacancy_id, address)
+    await send_vacancy_card(user_id, text, reply_markup=keyboard)
+
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown", chunk_size: int = 3800):
     """Разбивает длинный текст на части (лимит Telegram ~4096)."""
     if len(text) <= chunk_size:
@@ -493,12 +788,12 @@ async def notify_admin_parser_issue(text: str):
     except Exception as e:
         logger.warning(f"Не удалось отправить алерт админу: {e}")
 
-def get_postvacancy_categories_keyboard():
+def get_postvacancy_categories_keyboard(prefix: str = "postcat"):
     categories = get_all_categories()
     buttons, row = [], []
     for i, cat in enumerate(categories):
         row.append(InlineKeyboardButton(
-            text=f"{cat['emoji']} {cat['name']}", callback_data=f"postcat_{cat['code']}"
+            text=f"{cat['emoji']} {cat['name']}", callback_data=f"{prefix}_{cat['code']}"
         ))
         if len(row) == 2 or i == len(categories) - 1:
             buttons.append(row)
@@ -552,6 +847,25 @@ class ProfileEditState(StatesGroup):
     waiting_for_phone = State()
     waiting_for_photo = State()
     waiting_for_extra = State()
+
+
+class EmployerRegState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_phone = State()
+
+
+class EmployerPostState(StatesGroup):
+    waiting_for_category = State()
+    waiting_for_text = State()
+
+
+class NotfitReasonState(StatesGroup):
+
+    waiting_other = State()
+
+
+class ChannelPostState(StatesGroup):
+    waiting_vacancy_id = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -635,13 +949,22 @@ def build_user_help_html(user_id: int) -> str:
 def build_admin_help_html() -> str:
     return (
         "<b>📖 Админ: как пользоваться</b>\n\n"
-        "<b>Парсер</b>\n"
+        "Меню разбито на разделы — «📡 Парсер», «👥 Пользователи», «📥 Excel». "
+        "«◀️ Назад» возвращает в главное админ-меню.\n\n"
+        "<b>📡 Парсер</b>\n"
         "• «🔍 Ручная проверка» или /check_now — прогон всех чатов\n"
         "• «📝 Отчёт парсера» — статистика последнего прогона\n"
-        "• «📋 Список чатов парсинга» — доступ и мониторинг\n\n"
-        "<b>Пользователи</b>\n"
+        "• «📋 Список чатов парсинга» — доступ и мониторинг\n"
+        "• «📊 Шум по чатам» — отсеяно vs в ленту по каждому чату\n"
+        "• `/setchatroles ссылка promoter,helper` — ожидаемые роли чата\n\n"
+        "<b>👥 Пользователи</b>\n"
         "• «💎 Запросы Premium» — чек + ✅/❌\n"
         "• /setplan USER_ID premium 30 — выдать Premium\n\n"
+        "<b>📥 Excel</b>\n"
+        "• подписчики, вакансии, заказчики\n"
+        "• «📥 Excel: не подходит» — feedback «👎 Не подходит» с причинами\n\n"
+        "<b>📝 Модерация</b>\n"
+        "• очередь вакансий от заказчиков\n\n"
         "<b>Команды</b>\n"
         "/help — эта справка\n"
         "/start — админ-меню\n"
@@ -739,14 +1062,51 @@ def get_freshness_label(raw_dt) -> str:
     if published is None:
         return "🟢 Актуальна"
     try:
-        delta_minutes = (datetime.now(timezone.utc) - published).total_seconds() / 60
-        if delta_minutes <= 30:
-            return "🟢 Актуальна: только что"
-        if delta_minutes <= 180:
-            return "🟢 Актуальна: сегодня"
-        return "🟡 Актуальна: ранее сегодня"
+        now = datetime.now(timezone.utc)
+        delta = now - published.astimezone(timezone.utc)
+        minutes = delta.total_seconds() / 60
+        hours = minutes / 60
+        pub_msk = published.astimezone(MSK_TZ).date()
+        today_msk = now.astimezone(MSK_TZ).date()
+        if minutes <= 30:
+            return "🟢 Свежая: только что"
+        if hours <= 6:
+            return "🟢 Свежая: несколько часов назад"
+        if pub_msk == today_msk:
+            return "🟢 Свежая: сегодня"
+        if pub_msk == today_msk - timedelta(days=1):
+            return "🟡 Вчера"
+        days = (today_msk - pub_msk).days
+        if days <= 7:
+            return f"🟠 {days} дн. назад"
+        return "🔴 Давно"
     except Exception:
         return "🟢 Актуальна"
+
+
+def _vacancy_age_hours(vac: dict) -> float | None:
+    raw = vac.get("published_at") or vac.get("found_at")
+    dt = _coerce_db_datetime(raw)
+    if dt is None:
+        return None
+    return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600
+
+
+def _vacancy_in_feed_mode(vac: dict, feed_mode: str) -> bool:
+    age = _vacancy_age_hours(vac)
+    if age is None:
+        return feed_mode == "fresh"
+    if feed_mode == "fresh":
+        return age <= FEED_FRESH_HOURS
+    return FEED_FRESH_HOURS < age <= FEED_ARCHIVE_MAX_HOURS
+
+
+def _detected_category_display(text: str) -> tuple[str, str]:
+    """Эмодзи и название по тексту поста (не только код в БД)."""
+    code = detect_category(text or "")
+    if not code:
+        return "📌", "—"
+    return get_category_emoji(code), get_category_name(code)
 
 def normalize_chat_link(raw: str) -> str:
     if not raw:
@@ -875,6 +1235,10 @@ def build_contact_link(contact: str, text: str) -> str:
     if contact.startswith("@"):
         username = contact[1:]
         return f"https://t.me/{username}?text={quote(text)}"
+    if contact.startswith("tg://user?id="):
+        return f"{contact}&text={quote(text)}"
+    if contact.startswith("https://wa.me/") or contact.startswith("http://wa.me/"):
+        return contact
     digits = re.sub(r"\D", "", contact)
     if digits:
         if len(digits) == 11 and digits.startswith("8"):
@@ -896,11 +1260,29 @@ def schedule_vacancy_push(order: dict):
 
 
 async def send_vacancy_to_subscribers(order: dict):
-    category_code = order.get('category', detect_category(order['message_text']))
+    msg_text = order.get('message_text') or ''
+    poster = poster_from_order(order)
+    force_cat = order.get('category') if order.get('from_bot_employer') else None
+    accepted, category_code, gate_reason, _ = evaluate_vacancy(
+        msg_text, poster, force_category=force_cat,
+    )
+    if not accepted or not category_code:
+        vacancy_id = order.get("vacancy_id") or make_vacancy_id(
+            order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
+        )
+        logger.info(
+            f"Push skip {vacancy_id}: quality re-check ({gate_reason}), "
+            f"stored={order.get('category')}"
+        )
+        return
     dedupe_key = order.get("dedupe_key")
     vacancy_id = order.get("vacancy_id") or make_vacancy_id(
-        order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=dedupe_key
+        order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
     )
+    mod_row = get_vacancy_push_row(vacancy_id)
+    if mod_row and mod_row[11] not in (None, "approved"):
+        logger.info(f"Push skip {vacancy_id}: moderation_status={mod_row[11]}")
+        return
     subscribers = get_subscribers_by_category(category_code)
     if not subscribers:
         logger.info(f"Нет подписчиков на категорию {category_code}")
@@ -915,12 +1297,12 @@ async def send_vacancy_to_subscribers(order: dict):
         category_name=cat_name,
         freshness=freshness,
         published_at=published_at,
-        body=order.get("message_text", ""),
+        body=msg_text,
         source=order.get("chat_title") or "—",
         message_link=order.get("message_link"),
     )
 
-    address = order.get('address') or extract_address_from_text(order.get('message_text', ''))
+    address = order.get('address') or extract_address_from_text(msg_text)
     keyboard = build_vacancy_keyboard(vacancy_id, address)
 
     sent_count = 0
@@ -932,11 +1314,7 @@ async def send_vacancy_to_subscribers(order: dict):
             continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
             continue
-        if not vacancy_matches_user_metro(
-            order.get('message_text', ''),
-            address,
-            subscriber.get('metro_zones'),
-        ):
+        if not vacancy_matches_user_metro(msg_text, address, subscriber.get('metro_zones')):
             skipped_metro += 1
             continue
         try:
@@ -956,6 +1334,17 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
+        if CHANNEL_CROSSPOST_ENABLED:
+            from services.channel_post import post_vacancy_preview_to_channel
+            spawn_background_task(post_vacancy_preview_to_channel(
+                bot,
+                vacancy_id=vacancy_id,
+                category_name=cat_name,
+                category_emoji=get_category_emoji(category_code),
+                body=msg_text,
+                source=order.get("chat_title") or "—",
+                freshness=freshness,
+            ))
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
@@ -970,6 +1359,17 @@ async def notify_closed_vacancies(closed_data: list):
                 logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
 
 # ========== КЛАВИАТУРЫ ==========
+
+def get_employer_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_EMPLOYER_POST)],
+            [KeyboardButton(text=BTN_MY_DATA), KeyboardButton(text="❓ Поддержка")],
+            [KeyboardButton(text=BTN_SWITCH_CANDIDATE), KeyboardButton(text="📖 Как пользоваться")],
+        ],
+        resize_keyboard=True,
+    )
+
 
 def get_main_keyboard(user_id: int):
     categories = get_user_categories(user_id)
@@ -990,28 +1390,85 @@ def get_main_keyboard(user_id: int):
     )
     return keyboard, status_text
 
-def get_admin_keyboard():
+ADMIN_BTN_HUB_PARSER = "📡 Парсер"
+ADMIN_BTN_HUB_USERS = "👥 Пользователи"
+ADMIN_BTN_HUB_EXPORT = "📥 Excel"
+ADMIN_BTN_HUB_MOD = "📝 Модерация"
+ADMIN_BTN_BACK = "◀️ Назад"
+
+
+def get_admin_hub_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔍 Ручная проверка")],
-            [KeyboardButton(text="📋 Список откликов"), KeyboardButton(text="📝 Отчёт парсера")],
-            [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="🗂️ Карточки пользователей"), KeyboardButton(text="💎 Запросы Premium")],
-            [KeyboardButton(text="🧭 Маппинг категорий"), KeyboardButton(text="⚠️ Жалобы")],
-            [KeyboardButton(text="❓ Поддержка (админ)"), KeyboardButton(text="➕ Добавить чат")],
-            [KeyboardButton(text="📋 Список чатов парсинга"), KeyboardButton(text="📤 Отправить вакансию")],
-            [KeyboardButton(text="📖 Как пользоваться")],
-            [KeyboardButton(text="❌ Закрыть меню")]
+            [KeyboardButton(text=ADMIN_BTN_HUB_PARSER), KeyboardButton(text=ADMIN_BTN_HUB_USERS)],
+            [KeyboardButton(text=ADMIN_BTN_HUB_EXPORT), KeyboardButton(text=ADMIN_BTN_HUB_MOD)],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="📖 Справка"), KeyboardButton(text="❌ Закрыть меню")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
+
+def get_admin_parser_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Ручная проверка"), KeyboardButton(text="📝 Отчёт парсера")],
+            [KeyboardButton(text="📋 Список чатов парсинга"), KeyboardButton(text="📊 Шум по чатам")],
+            [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📤 Отправить вакансию")],
+            [KeyboardButton(text="🧭 Маппинг категорий")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_admin_users_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="🗂️ Карточки пользователей")],
+            [KeyboardButton(text="💎 Запросы Premium"), KeyboardButton(text="📋 Список откликов")],
+            [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_admin_export_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📥 Excel: подписчики"), KeyboardButton(text="📥 Excel: вакансии")],
+            [KeyboardButton(text="📥 Excel: заказчики"), KeyboardButton(text="📥 Excel: не подходит")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_admin_mod_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📝 Модерация вакансий"), KeyboardButton(text="📣 В канал")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def get_admin_keyboard():
+    return get_admin_hub_keyboard()
+
+
 ADMIN_MENU_BUTTONS = {
+    ADMIN_BTN_HUB_PARSER, ADMIN_BTN_HUB_USERS, ADMIN_BTN_HUB_EXPORT, ADMIN_BTN_HUB_MOD,
+    ADMIN_BTN_BACK,
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
     "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
     "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат",
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
-    "📖 Как пользоваться", "❌ Закрыть меню",
+    "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
+    "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
+    "📣 В канал", "📖 Как пользоваться", "📖 Справка", "❌ Закрыть меню",
 }
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
@@ -1025,7 +1482,7 @@ async def help_cmd(message: types.Message):
     await send_user_help(message, user_id)
 
 
-@dp.message(lambda m: m.text == "📖 Как пользоваться")
+@dp.message(lambda m: m.text in ("📖 Как пользоваться", "📖 Справка"))
 async def help_menu_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
         await message.answer(build_admin_help_html(), parse_mode="HTML")
@@ -1039,6 +1496,8 @@ async def start_cmd(message: types.Message, state: FSMContext):
     username = message.from_user.username
     first_name = message.from_user.first_name
     last_name = message.from_user.last_name
+    parts = (message.text or "").split(maxsplit=1)
+    start_payload = parts[1].strip().lower() if len(parts) > 1 else ""
 
     if user_id == YOUR_USER_ID:
         await message.answer(
@@ -1053,13 +1512,33 @@ async def start_cmd(message: types.Message, state: FSMContext):
         return
 
     add_subscriber(user_id, username, first_name, last_name)
+    if start_payload == "employer":
+        set_subscriber_role(user_id, "employer")
+
+    if start_payload.startswith("vac_"):
+        vacancy_id = start_payload[4:].strip()
+        if vacancy_id:
+            await show_vacancy_by_deeplink(message, user_id, vacancy_id)
+
     expired_msg = downgrade_expired_premium(user_id)
     if expired_msg:
         await message.answer(expired_msg, parse_mode="Markdown")
+
     profile = get_subscriber_profile(user_id)
+    role = get_subscriber_role(user_id)
+
     if profile and profile.get("full_name") and profile.get("phone"):
+        if role == "employer":
+            await setup_forum_topics_for_user(user_id)
+            await message.answer(
+                f"👋 С возвращением, {first_name}!\n\n"
+                f"🏢 Режим заказчика — разместите вакансию или обновите контакты в «{BTN_MY_DATA}».",
+                reply_markup=get_employer_keyboard(),
+            )
+            return
         categories = get_user_categories(user_id)
         if categories:
+            await setup_forum_topics_for_user(user_id)
             keyboard, status_text = get_main_keyboard(user_id)
             await message.answer(
                 f"👋 С возвращением, {first_name}!\n\n{status_text}\n\n"
@@ -1067,16 +1546,201 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 reply_markup=keyboard
             )
             return
-        else:
-            await send_category_picker(message.chat.id, user_id)
-            return
+        await send_category_picker(message.chat.id, user_id)
+        return
+
+    if role == "employer" or start_payload == "employer":
+        set_subscriber_role(user_id, "employer")
+        await message.answer(
+            "🏢 *PromoStaff Hunter — для заказчиков*\n\n"
+            "Размещайте вакансии — их увидят исполнители с Premium-подпиской.\n\n"
+            "Как вас представить? (компания или ФИО контактного лица)",
+            parse_mode="Markdown",
+        )
+        await state.set_state(EmployerRegState.waiting_for_name)
+        return
 
     await message.answer(
-        "👋 *Добро пожаловать в бот поиска работы!*\n\n"
-        "Я помогу вам найти подходящие вакансии.\n\n"
-        "📝 *Давайте заполним ваш профиль*\n\n"
+        "👋 *Добро пожаловать!*\n\n"
+        "Выберите, как будете пользоваться ботом:",
+        parse_mode="Markdown",
+        reply_markup=build_role_picker_markup(),
+    )
+
+
+@dp.callback_query(lambda c: c.data == "role_candidate")
+async def role_candidate_pick(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    user_id = callback.from_user.id
+    set_subscriber_role(user_id, "candidate")
+    await callback.message.edit_text(
+        "👷 *Режим исполнителя*\n\n"
+        "Я помогу найти подходящие вакансии.\n\n"
         "Как вас зовут? (ФИО полностью)\n\nПример: *Иван Петров*",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+    )
+    await state.set_state(RegistrationState.waiting_for_name)
+
+
+@dp.callback_query(lambda c: c.data == "role_employer")
+async def role_employer_pick(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    user_id = callback.from_user.id
+    set_subscriber_role(user_id, "employer")
+    await callback.message.edit_text(
+        "🏢 *Режим заказчика*\n\n"
+        "Как вас представить? (компания или ФИО контактного лица)",
+        parse_mode="Markdown",
+    )
+    await state.set_state(EmployerRegState.waiting_for_name)
+
+
+@dp.message(EmployerRegState.waiting_for_name)
+async def employer_reg_name(message: types.Message, state: FSMContext):
+    full_name = message.text.strip()
+    if len(full_name) < 2:
+        await message.answer("❌ Введите название компании или ФИО (минимум 2 символа).")
+        return
+    await state.update_data(full_name=full_name)
+    phone_keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await message.answer(
+        "📞 *Контактный телефон*\n\n"
+        "Номер для связи с кандидатами при откликах.",
+        parse_mode="Markdown",
+        reply_markup=phone_keyboard,
+    )
+    await state.set_state(EmployerRegState.waiting_for_phone)
+
+
+@dp.message(EmployerRegState.waiting_for_phone)
+async def employer_reg_phone(message: types.Message, state: FSMContext):
+    user = message.from_user
+    if message.contact:
+        phone = message.contact.phone_number
+    else:
+        phone = message.text.strip()
+        digits_only = re.sub(r"\D", "", phone)
+        if len(digits_only) < 10 or len(digits_only) > 15:
+            await message.answer("❌ Введите корректный номер или нажмите кнопку отправки контакта.")
+            return
+
+    data = await state.get_data()
+    update_subscriber_profile(user.id, data["full_name"], None, phone, birth_date=None)
+    poster = poster_from_tg_user(user)
+    contact_text, contact_source = resolve_vacancy_contact("", poster)
+    upsert_employer_from_post(
+        telegram_user_id=user.id,
+        username=user.username,
+        display_name=data["full_name"],
+        contact_text=contact_text or phone,
+        contact_source=contact_source or "profile_phone",
+        category_code=None,
+        bot_user_id=user.id,
+    )
+    await state.clear()
+    await message.answer(
+        f"✅ *Профиль заказчика создан*\n\n"
+        f"🏢 {data['full_name']}\n"
+        f"📞 {phone}\n\n"
+        f"Нажмите «{BTN_EMPLOYER_POST}», чтобы опубликовать вакансию.",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.answer("Меню заказчика:", reply_markup=get_employer_keyboard())
+
+
+@dp.message(lambda m: m.text == BTN_EMPLOYER_POST)
+async def employer_post_start(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id == YOUR_USER_ID:
+        return
+    if get_subscriber_role(user_id) != "employer":
+        await message.answer("Эта функция доступна в режиме заказчика. Напишите /start и выберите «Ищу персонал».")
+        return
+    profile = get_subscriber_profile(user_id)
+    if not profile or not profile.get("phone"):
+        await message.answer("Сначала заполните профиль — /start")
+        return
+    await message.answer(
+        "📤 *Размещение вакансии*\n\n"
+        "Выберите категорию персонала:",
+        parse_mode="Markdown",
+        reply_markup=get_postvacancy_categories_keyboard(prefix="employercat"),
+    )
+    await state.set_state(EmployerPostState.waiting_for_category)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("employercat_"))
+async def employer_post_category(callback: types.CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != EmployerPostState.waiting_for_category:
+        await callback.answer("Сначала нажмите «Разместить вакансию»", show_alert=True)
+        return
+    category_code = callback.data.replace("employercat_", "")
+    cat_name = get_category_name(category_code)
+    await state.update_data(category_code=category_code, category_name=cat_name)
+    await callback.message.answer(
+        f"📝 Введите текст вакансии (категория: *{cat_name}*).\n\n"
+        "Обязательно: роль, оплата, адрес/дата. Контакт подставится из вашего профиля.",
+        parse_mode="Markdown",
+    )
+    await state.set_state(EmployerPostState.waiting_for_text)
+    await callback.answer()
+
+
+@dp.message(EmployerPostState.waiting_for_text)
+async def employer_post_text(message: types.Message, state: FSMContext):
+    if message.text in ADMIN_MENU_BUTTONS:
+        return
+    data = await state.get_data()
+    category_code = data.get("category_code")
+    if not category_code:
+        await state.clear()
+        return
+    ok, info = await publish_employer_vacancy(message.from_user, category_code, message.text)
+    await state.clear()
+    if not ok:
+        await message.answer(
+            f"❌ Вакансия не принята: {info}\n\n"
+            "Проверьте текст и попробуйте снова.",
+            reply_markup=get_employer_keyboard(),
+        )
+        return
+    cat_name = data.get("category_name") or get_category_name(category_code)
+    await notify_admin_moderation(info, category_code, message.text, message.from_user.id)
+    await message.answer(
+        f"✅ Вакансия «{cat_name}» отправлена на модерацию.\n"
+        f"ID: `{info}`\n\n"
+        "После проверки администратором её увидят Premium-подписчики.",
+        parse_mode="Markdown",
+        reply_markup=get_employer_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.text == BTN_SWITCH_CANDIDATE)
+async def employer_switch_to_candidate(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    if user_id == YOUR_USER_ID:
+        return
+    set_subscriber_role(user_id, "candidate")
+    profile = get_subscriber_profile(user_id)
+    if profile and profile.get("full_name") and profile.get("phone"):
+        categories = get_user_categories(user_id)
+        if categories:
+            keyboard, status_text = get_main_keyboard(user_id)
+            await message.answer(
+                f"👷 Режим исполнителя.\n\n{status_text}",
+                reply_markup=keyboard,
+            )
+            return
+        await send_category_picker(message.chat.id, user_id)
+        return
+    await message.answer(
+        "👷 Режим исполнителя. Заполните профиль — как вас зовут? (ФИО)",
     )
     await state.set_state(RegistrationState.waiting_for_name)
 
@@ -1327,6 +1991,7 @@ async def finish_categories(callback: types.CallbackQuery):
         categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
         keyboard, _ = get_main_keyboard(user_id)
         trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
+        await setup_forum_topics_for_user(user_id)
         trial_line = ""
         if trial_granted:
             trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро!"
@@ -1342,7 +2007,8 @@ async def finish_categories(callback: types.CallbackQuery):
             user_id,
             f"{title}\n\n"
             f"📌 Ваши категории:\n{categories_text}\n\n"
-            f"{'💎 Новые вакансии приходят моментально в чат.' if await run_db(is_user_premium, user_id) else '🔍 Free: новые вакансии — кнопка «Посмотреть новые».'}"
+            f"{'💎 Новые вакансии — в теме «📬 Вакансии».' if FORUM_TOPICS_ENABLED else '💎 Новые вакансии приходят моментально в чат.'}"
+            f"{' Push Premium.' if await run_db(is_user_premium, user_id) else ' Free: «Посмотреть новые».'}"
             f"{trial_line}\n\n"
             f"📖 Инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
@@ -1451,10 +2117,16 @@ def _feed_metro_context(user_id: int) -> tuple[bool, str | None]:
     return apply_metro, metro_zones
 
 
-def _feed_vacancies_for_category(user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None) -> list:
+def _feed_vacancies_for_category(
+    user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None, feed_mode: str = "fresh",
+) -> list:
     vacancies = get_feed_vacancies_for_user(user_id, cat["code"])
     result = []
     for vac in vacancies:
+        if not _vacancy_in_feed_mode(vac, feed_mode):
+            continue
+        if not vacancy_matches_category(vac.get("text") or "", cat["code"]):
+            continue
         if apply_metro and not vacancy_matches_user_metro(
             vac.get("text", ""), vac.get("address"), metro_zones
         ):
@@ -1464,7 +2136,9 @@ def _feed_vacancies_for_category(user_id: int, cat: dict, apply_metro: bool, met
     return result
 
 
-def _collect_feed_vacancies(user_id: int, category_codes: list[str] | None = None) -> list:
+def _collect_feed_vacancies(
+    user_id: int, category_codes: list[str] | None = None, feed_mode: str = "fresh",
+) -> list:
     apply_metro, metro_zones = _feed_metro_context(user_id)
     user_categories = get_user_categories(user_id)
     if category_codes is not None:
@@ -1472,46 +2146,78 @@ def _collect_feed_vacancies(user_id: int, category_codes: list[str] | None = Non
         user_categories = [c for c in user_categories if c["code"] in codes]
     all_vacancies = []
     for cat in user_categories:
-        all_vacancies.extend(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones))
-    all_vacancies.sort(key=lambda v: v.get("found_at") or "", reverse=True)
+        all_vacancies.extend(
+            _feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones, feed_mode)
+        )
+    all_vacancies.sort(
+        key=lambda v: v.get("published_at") or v.get("found_at") or "",
+        reverse=True,
+    )
     return all_vacancies
 
 
-def _feed_count_for_category(user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None) -> int:
-    return len(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones))
+def _feed_count_for_category(
+    user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None, feed_mode: str = "fresh",
+) -> int:
+    return len(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones, feed_mode))
 
 
-def build_feed_category_keyboard(user_id: int) -> tuple[InlineKeyboardMarkup, int]:
+def _feed_mode_totals(user_id: int) -> tuple[int, int]:
+    apply_metro, metro_zones = _feed_metro_context(user_id)
+    fresh_total = archive_total = 0
+    for cat in get_user_categories(user_id):
+        fresh_total += _feed_count_for_category(user_id, cat, apply_metro, metro_zones, "fresh")
+        archive_total += _feed_count_for_category(user_id, cat, apply_metro, metro_zones, "archive")
+    return fresh_total, archive_total
+
+
+def build_feed_mode_keyboard(fresh_total: int, archive_total: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🟢 Свежие до {FEED_FRESH_HOURS} ч ({fresh_total})",
+            callback_data="feed_mode_fresh",
+        )],
+        [InlineKeyboardButton(
+            text=f"📂 Ранее {FEED_FRESH_HOURS}–{FEED_ARCHIVE_MAX_HOURS // 24} дн. ({archive_total})",
+            callback_data="feed_mode_archive",
+        )],
+    ])
+
+
+def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKeyboardMarkup, int]:
     user_categories = get_user_categories(user_id)
     apply_metro, metro_zones = _feed_metro_context(user_id)
     buttons, row = [], []
     total = 0
+    mode_label = "свежие" if feed_mode == "fresh" else "ранее"
     for i, cat in enumerate(user_categories):
-        count = _feed_count_for_category(user_id, cat, apply_metro, metro_zones)
+        count = _feed_count_for_category(user_id, cat, apply_metro, metro_zones, feed_mode)
         total += count
         row.append(InlineKeyboardButton(
             text=f"{cat['emoji']} {cat['name']} ({count})",
-            callback_data=f"feed_cat_{cat['code']}",
+            callback_data=f"feed_{feed_mode}_{cat['code']}",
         ))
         if len(row) == 2 or i == len(user_categories) - 1:
             buttons.append(row)
             row = []
     if total > 0:
-        buttons.append([InlineKeyboardButton(text=f"📋 Все категории ({total})", callback_data="feed_all")])
+        buttons.append([InlineKeyboardButton(
+            text=f"📋 Все {mode_label} ({total})",
+            callback_data=f"feed_{feed_mode}_all",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Период", callback_data="feed_pick_mode")])
     return InlineKeyboardMarkup(inline_keyboard=buttons), total
 
 
-async def show_feed_category_menu(message: types.Message, user_id: int):
+async def show_feed_mode_menu(message: types.Message, user_id: int):
     user_categories = get_user_categories(user_id)
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
-    markup, total = build_feed_category_keyboard(user_id)
+    fresh_total, archive_total = _feed_mode_totals(user_id)
     apply_metro, _ = _feed_metro_context(user_id)
-    hint = ""
-    if apply_metro:
-        hint = "\n\n📍 Учитывается фильтр «Мои районы»."
-    if total == 0:
+    hint = "\n\n📍 Учитывается фильтр «Мои районы»." if apply_metro else ""
+    if fresh_total == 0 and archive_total == 0:
         await message.answer(
             f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
             f"{'💎 Premium — push сразу в чат.' if is_user_premium(user_id) else 'Я продолжаю мониторинг.'}",
@@ -1519,50 +2225,106 @@ async def show_feed_category_menu(message: types.Message, user_id: int):
         )
         return
     await message.answer(
-        f"🔍 *Лента вакансий* — выберите категорию ({total} новых):{hint}",
+        f"🔍 *Лента вакансий* — выберите период:{hint}\n\n"
+        f"🟢 *Свежие* — опубликованы за последние {FEED_FRESH_HOURS} ч.\n"
+        f"📂 *Ранее* — от {FEED_FRESH_HOURS} ч до {FEED_ARCHIVE_MAX_HOURS // 24} дн.",
+        parse_mode="Markdown",
+        reply_markup=build_feed_mode_keyboard(fresh_total, archive_total),
+    )
+
+
+async def show_feed_category_menu(message: types.Message, user_id: int, feed_mode: str):
+    user_categories = get_user_categories(user_id)
+    if not user_categories:
+        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
+        return
+    markup, total = build_feed_category_keyboard(user_id, feed_mode)
+    apply_metro, _ = _feed_metro_context(user_id)
+    hint = "\n\n📍 Учитывается фильтр «Мои районы»." if apply_metro else ""
+    mode_title = f"🟢 Свежие ({FEED_FRESH_HOURS} ч)" if feed_mode == "fresh" else "📂 Ранее"
+    if total == 0:
+        await message.answer(
+            f"{mode_title} — в этой категории вакансий нет.{hint}\n\n"
+            "Попробуйте другой период или категорию.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Период", callback_data="feed_pick_mode")],
+            ]),
+        )
+        return
+    await message.answer(
+        f"🔍 *{mode_title}* — выберите категорию ({total}):{hint}",
         parse_mode="Markdown",
         reply_markup=markup,
     )
 
 
-async def open_feed_vacancies(message: types.Message, user_id: int, category_codes: list[str] | None = None):
-    all_vacancies = _collect_feed_vacancies(user_id, category_codes)
+async def open_feed_vacancies(
+    message: types.Message,
+    user_id: int,
+    feed_mode: str,
+    category_codes: list[str] | None = None,
+):
+    all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
     if not all_vacancies:
         apply_metro, _ = _feed_metro_context(user_id)
         hint = "\n\nПопробуйте расширить «📍 Мои районы»." if apply_metro else ""
-        await message.answer(f"🔍 В этой категории новых вакансий нет.{hint}", parse_mode="Markdown")
+        await message.answer(f"🔍 В этой категории вакансий нет.{hint}", parse_mode="Markdown")
         return
     user_pages[user_id] = {
         "vacancies": all_vacancies,
         "page": 0,
         "total": len(all_vacancies),
         "feed_filter": category_codes,
+        "feed_mode": feed_mode,
     }
     await send_vacancy_page(message, user_id, 0)
 
 
 @dp.message(lambda m: m.text == "🔍 Посмотреть новые вакансии")
 async def show_new_vacancies(message: types.Message):
-    await show_feed_category_menu(message, message.from_user.id)
+    await show_feed_mode_menu(message, message.from_user.id)
 
 
-@dp.callback_query(lambda c: c.data == "feed_all")
-async def feed_all_callback(callback: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data == "feed_pick_mode")
+async def feed_pick_mode_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
-    await open_feed_vacancies(callback.message, callback.from_user.id, category_codes=None)
+    await show_feed_mode_menu(callback.message, callback.from_user.id)
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("feed_cat_"))
-async def feed_category_callback(callback: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data in {"feed_mode_fresh", "feed_mode_archive"})
+async def feed_mode_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
-    code = callback.data.replace("feed_cat_", "", 1)
-    await open_feed_vacancies(callback.message, callback.from_user.id, category_codes=[code])
+    mode = "fresh" if callback.data == "feed_mode_fresh" else "archive"
+    await show_feed_category_menu(callback.message, callback.from_user.id, mode)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("feed_fresh_"))
+async def feed_fresh_routes(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    suffix = callback.data.replace("feed_fresh_", "", 1)
+    if suffix == "all":
+        await open_feed_vacancies(callback.message, callback.from_user.id, "fresh", None)
+    else:
+        await open_feed_vacancies(callback.message, callback.from_user.id, "fresh", [suffix])
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("feed_archive_"))
+async def feed_archive_routes(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    suffix = callback.data.replace("feed_archive_", "", 1)
+    if suffix == "all":
+        await open_feed_vacancies(callback.message, callback.from_user.id, "archive", None)
+    else:
+        await open_feed_vacancies(callback.message, callback.from_user.id, "archive", [suffix])
 
 
 @dp.callback_query(lambda c: c.data == "feed_menu")
 async def feed_menu_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
-    await show_feed_category_menu(callback.message, callback.from_user.id)
+    data = user_pages.get(callback.from_user.id) or {}
+    mode = data.get("feed_mode") or "fresh"
+    await show_feed_category_menu(callback.message, callback.from_user.id, mode)
 
 
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
@@ -1580,10 +2342,10 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     await message.answer(f"📬 *Вакансии (страница {page+1} из {(total-1)//10 + 1})*", parse_mode="Markdown")
     for vac in vacancies[start:end]:
         raw_pub = vac.get('published_at') or vac.get('found_at')
-        cat = vac.get("category") or {}
+        emoji, cat_name = _detected_category_display(vac.get("text") or "")
         text = format_vacancy_card_html(
-            category_emoji=cat.get("emoji") or get_category_emoji("helper"),
-            category_name=cat.get("name") or "Вакансия",
+            category_emoji=emoji,
+            category_name=cat_name,
             freshness=get_freshness_label(raw_pub),
             published_at=format_publication_time(raw_pub),
             body=vac.get("text") or "",
@@ -1593,19 +2355,28 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
         try:
             await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
+            mark_vacancy_sent_to_user(vac["id"], user_id)
             await asyncio.sleep(0.3)
         except Exception as e:
             logger.error(f"Ошибка отправки вакансии: {e}")
 
-    nav_buttons = []
+    nav_rows = []
+    pager = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"vac_page_{page-1}"))
+        pager.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"vac_page_{page-1}"))
     if end < total:
-        nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"vac_page_{page+1}"))
-    nav_buttons.append(InlineKeyboardButton(text="📋 К категориям", callback_data="feed_menu"))
-    if nav_buttons:
-        nav_markup = InlineKeyboardMarkup(inline_keyboard=[nav_buttons])
-        await message.answer("📄 *Навигация*", parse_mode="Markdown", reply_markup=nav_markup)
+        pager.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"vac_page_{page+1}"))
+    if pager:
+        nav_rows.append(pager)
+    nav_rows.append([
+        InlineKeyboardButton(text="📋 К категориям", callback_data="feed_menu"),
+        InlineKeyboardButton(text="🏠 Период", callback_data="feed_pick_mode"),
+    ])
+    await message.answer(
+        "📄 *Навигация*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_rows),
+    )
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_page_"))
@@ -2069,11 +2840,15 @@ async def unsubscribe_user_legacy(message: types.Message):
 
 @dp.message(lambda m: m.text == "❓ Поддержка")
 async def support_menu(message: types.Message, state: FSMContext):
-    await message.answer(
-        "📞 *Поддержка*\n\n"
-        "Опишите вашу проблему или вопрос, и администратор ответит вам в ближайшее время.\n\n"
-        "Напишите ваше сообщение:",
-        parse_mode="Markdown"
+    await send_user_message(
+        message.from_user.id,
+        topic_key="support",
+        text=(
+            "📞 *Поддержка*\n\n"
+            "Опишите вашу проблему или вопрос, и администратор ответит вам в ближайшее время.\n\n"
+            "Напишите ваше сообщение:"
+        ),
+        parse_mode="Markdown",
     )
     await state.set_state(SupportState.waiting_for_question)
 
@@ -2082,11 +2857,199 @@ async def process_support_question(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username
     add_support_request(user_id, message.text, username)
-    await message.answer("✅ Ваш вопрос отправлен администратору. Ответ придёт сюда.")
+    await send_user_message(
+        user_id,
+        topic_key="support",
+        text="✅ Ваш вопрос отправлен администратору. Ответ придёт в эту тему.",
+    )
     await state.clear()
 
 
-# ========== ЖАЛОБЫ НА ВАКАНСИИ ==========
+# ========== ЖАЛОБЫ НА ВАКАНСИИ / FEEDBACK «НЕ ПОДХОДИТ» ==========
+
+async def _finalize_notfit_feedback(
+    user_id: int,
+    vacancy_id: str,
+    reason_code: str,
+    reason_text: str | None,
+    *,
+    callback: types.CallbackQuery | None = None,
+    message: types.Message | None = None,
+):
+    row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
+    vac_cat = row[0] if row else ""
+    user_cats = [c["code"] for c in get_user_categories(user_id)]
+    record_vacancy_notfit(
+        user_id, vacancy_id, vac_cat or "", user_cats,
+        reason_code=reason_code, reason_text=reason_text,
+    )
+    mark_vacancy_sent_to_user(vacancy_id, user_id)
+    thank = (
+        "Спасибо! Эту вакансию больше не покажем.\n"
+        "Причина сохранена — по ней настраиваем фильтры и Excel-отчёт для админа."
+    )
+    if callback:
+        await callback.answer("Учтено")
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(thank)
+    elif message:
+        await message.answer(thank)
+
+
+@dp.callback_query(lambda c: c.data and re.fullmatch(r"notfit_[^:]+", c.data))
+async def notfit_vacancy_pick(callback: types.CallbackQuery):
+    vacancy_id = callback.data.replace("notfit_", "", 1)
+    await callback.answer()
+    kb = build_notfit_reason_keyboard(vacancy_id)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except TelegramBadRequest:
+        await callback.message.answer("Почему не подходит?", reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("notfit_cancel:"))
+async def notfit_vacancy_cancel(callback: types.CallbackQuery):
+    vacancy_id = callback.data.split(":", 1)[1]
+    row = fetchone("SELECT address FROM vacancies WHERE id = ?", (vacancy_id,))
+    address = row[0] if row else None
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_vacancy_keyboard(vacancy_id, address),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Отменено")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("nfr:"))
+async def notfit_reason_chosen(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":", 2)
+    if len(parts) != 3:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    _, reason_code, vacancy_id = parts
+    if reason_code not in NOTFIT_REASONS:
+        await callback.answer("Неизвестная причина", show_alert=True)
+        return
+    if reason_code == "other":
+        await state.set_state(NotfitReasonState.waiting_other)
+        await state.update_data(notfit_vacancy_id=vacancy_id)
+        await callback.answer()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer("Напишите одним сообщением, почему не подходит:")
+        return
+    await _finalize_notfit_feedback(
+        callback.from_user.id, vacancy_id, reason_code, None, callback=callback,
+    )
+
+
+@dp.message(NotfitReasonState.waiting_other)
+async def notfit_reason_other_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    vacancy_id = data.get("notfit_vacancy_id")
+    if not vacancy_id:
+        await state.clear()
+        await message.answer("Сессия устарела. Нажмите «Не подходит» на вакансии ещё раз.")
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Напишите коротко, что не так, или /start чтобы отменить.")
+        return
+    await state.clear()
+    await _finalize_notfit_feedback(
+        message.from_user.id, vacancy_id, "other", text[:500], message=message,
+    )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("mod_ok_"))
+async def moderation_approve(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    vacancy_id = callback.data.replace("mod_ok_", "", 1)
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        await callback.answer("Вакансия не найдена", show_alert=True)
+        return
+    set_vacancy_moderation(vacancy_id, "approved")
+    order = build_order_from_vacancy_row(vacancy_id, row)
+    if order:
+        schedule_vacancy_push(order)
+    employer_uid = row[12]
+    if employer_uid:
+        try:
+            await bot.send_message(
+                employer_uid,
+                f"✅ Ваша вакансия одобрена и отправлена подписчикам.\nID: `{vacancy_id}`",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("moderation notify employer: %s", e)
+    await callback.message.edit_text(f"✅ Вакансия `{vacancy_id}` опубликована.", parse_mode="Markdown")
+    await callback.answer("Опубликовано")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("mod_ch_"))
+async def moderation_channel_post(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    vacancy_id = callback.data.replace("mod_ch_", "", 1)
+    await callback.answer("Публикую…")
+    result = await channel_post_for_vacancy(vacancy_id, force=True)
+    await callback.message.answer(result, parse_mode="Markdown")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("mod_no_"))
+async def moderation_reject(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    vacancy_id = callback.data.replace("mod_no_", "", 1)
+    row = get_vacancy_push_row(vacancy_id)
+    set_vacancy_moderation(vacancy_id, "rejected")
+    employer_uid = row[12] if row else None
+    if employer_uid:
+        try:
+            await bot.send_message(
+                employer_uid,
+                f"❌ Вакансия не прошла модерацию.\nID: `{vacancy_id}`\n\n"
+                "Уточните роль, оплату и контакт и отправьте снова.",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("moderation reject notify: %s", e)
+    await callback.message.edit_text(f"❌ Вакансия `{vacancy_id}` отклонена.", parse_mode="Markdown")
+    await callback.answer("Отклонено")
+
+
+@dp.message(Command("setchatroles"))
+async def setchatroles_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Использование:\n`/setchatroles https://t.me/chatname promoter,helper,loader`",
+            parse_mode="Markdown",
+        )
+        return
+    chat_link = normalize_chat_link(parts[1])
+    if not chat_link:
+        await message.answer("❌ Неверная ссылка на чат.")
+        return
+    set_target_chat_expected_roles(chat_link, parts[2].replace(" ", ""))
+    await message.answer(
+        f"✅ Профиль чата `{chat_link}`:\nожидаемые роли: *{parts[2]}*",
+        parse_mode="Markdown",
+    )
+
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("complain_"))
 async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
@@ -2145,6 +3108,7 @@ async def complaint_text(message: types.Message, state: FSMContext):
     lambda c: c.data
     and c.data.startswith("respond_")
     and not c.data.startswith("respond_add_")
+    and not c.data.startswith("respond_llm_")
     and c.data != "respond_cancel"
 )
 async def handle_response(callback: types.CallbackQuery, state: FSMContext):
@@ -2184,13 +3148,145 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if contact_link:
         buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
     buttons.append([InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data=f"respond_add_{vacancy_id}")])
+    if LLM_ENABLED and is_user_premium(user_id):
+        buttons.append([_inline_btn("✨ Улучшить текст", callback_data=f"respond_llm_{vacancy_id}", style="primary")])
+    if STARS_ENABLED and not has_star_purchase_for_vacancy(user_id, vacancy_id):
+        buttons.append([_inline_btn("⭐ Расширенный отклик", callback_data=f"star_resp_{vacancy_id}")])
     buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
     add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, profile.get('photo_file_id'))
-    await callback.message.answer(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.message.answer(
-        "📨 Отклик сохранён — смотрите в «📨 Мои отклики».",
+    from services.forum_topics import TOPIC_RESPONSES
+    await send_user_message(user_id, topic_key=TOPIC_RESPONSES, text=msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await send_user_message(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
+        text="📨 Отклик сохранён — смотрите в «📨 Мои отклики».",
     )
     await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("respond_llm_"))
+async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    vacancy_id = callback.data.replace("respond_llm_", "", 1)
+    if not is_user_premium(user_id):
+        await callback.answer("Доступно с Premium", show_alert=True)
+        return
+    usage_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if get_llm_usage_today(user_id, usage_day) >= LLM_DAILY_LIMIT_PREMIUM:
+        await callback.answer("Лимит LLM на сегодня исчерпан", show_alert=True)
+        return
+    profile = get_subscriber_profile(user_id)
+    row = get_vacancy_row(vacancy_id)
+    if not profile or not row:
+        await callback.answer("Ошибка данных", show_alert=True)
+        return
+    vacancy_text = row[0] or ""
+    employer_contact = row[3] or extract_contact_from_text(vacancy_text)
+    await callback.answer("Составляю текст…")
+    await bot.send_chat_action(callback.message.chat.id, "typing")
+    from services.llm_client import ask_llm
+    from services.llm_prompts import build_response_draft_prompt
+    from services.forum_topics import TOPIC_RESPONSES
+    cat_row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
+    cat_code = cat_row[0] if cat_row else "promoter"
+    prompt = build_response_draft_prompt(
+        vacancy_text=vacancy_text,
+        category_name=get_category_name(cat_code),
+        profile_summary=build_candidate_profile_text(profile),
+    )
+    draft = await ask_llm(prompt)
+    if not draft:
+        await send_user_message(
+            user_id, topic_key=TOPIC_RESPONSES,
+            text="Не удалось улучшить текст — используйте стандартный черновик выше.",
+        )
+        return
+    increment_llm_usage(user_id, usage_day)
+    link = build_contact_link(employer_contact, draft) if employer_contact else None
+    lines = ["✨ *Улучшенный черновик:*", "", draft]
+    kb = [[_inline_btn("Открыть чат", url=link, style="success")]] if link else []
+    await send_user_message(
+        user_id, topic_key=TOPIC_RESPONSES,
+        text="\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None,
+    )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("star_resp_"))
+async def star_response_invoice(callback: types.CallbackQuery):
+    if not STARS_ENABLED:
+        await callback.answer("Оплата Stars временно недоступна", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    vacancy_id = callback.data.replace("star_resp_", "", 1)
+    if has_star_purchase_for_vacancy(user_id, vacancy_id):
+        await callback.answer("Уже оплачено для этой вакансии", show_alert=True)
+        return
+    payload = f"ext_resp:{vacancy_id}"
+    create_star_purchase(user_id, vacancy_id, STARS_EXTENDED_RESPONSE_PRICE, payload)
+    await bot.send_invoice(
+        chat_id=user_id,
+        title="Расширенный отклик",
+        description="Приоритетный отклик с улучшенным текстом для заказчика",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Расширенный отклик", amount=STARS_EXTENDED_RESPONSE_PRICE)],
+    )
+    await callback.answer()
+
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: types.Message):
+    payment = message.successful_payment
+    payload = payment.invoice_payload or ""
+    if not payload.startswith("ext_resp:"):
+        return
+    purchase = complete_star_purchase(payload)
+    if not purchase:
+        await message.answer("Платёж получен, но запись не найдена. Напишите в поддержку.")
+        return
+    user_id = purchase["user_id"]
+    vacancy_id = purchase["vacancy_id"]
+    set_response_star_boost(user_id, vacancy_id)
+    profile = get_subscriber_profile(user_id)
+    row = get_vacancy_row(vacancy_id)
+    if not profile or not row:
+        await message.answer("✅ Оплата прошла. Откройте вакансию в «Мои отклики».")
+        return
+    vacancy_text = row[0] or ""
+    employer_contact = row[3] or extract_contact_from_text(vacancy_text)
+    prefix = "⭐ Приоритетный отклик через Promostaff Hunter\n\n"
+    draft = build_candidate_profile_text(profile)
+    if LLM_ENABLED and is_user_premium(user_id):
+        from services.llm_client import ask_llm
+        from services.llm_prompts import build_response_draft_prompt
+        cat_row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
+        cat_code = cat_row[0] if cat_row else "promoter"
+        enhanced = await ask_llm(build_response_draft_prompt(
+            vacancy_text=vacancy_text,
+            category_name=get_category_name(cat_code),
+            profile_summary=build_candidate_profile_text(profile),
+        ))
+        if enhanced:
+            draft = enhanced
+    draft = prefix + draft
+    link = build_contact_link(employer_contact, draft) if employer_contact else None
+    from services.forum_topics import TOPIC_RESPONSES
+    kb = [[_inline_btn("Открыть чат и отправить", url=link, style="success")]] if link else []
+    await send_user_message(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
+        text="✅ *Расширенный отклик активирован!*\n\n" + draft,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None,
+    )
+
 
 @dp.callback_query(lambda c: c.data == "admin_vacancy")
 async def handle_admin_vacancy_response(callback: types.CallbackQuery):
@@ -2853,7 +3949,12 @@ async def answer_support(message: types.Message):
     user_id = row[0]
     mark_support_answered(req_id, answer_text)
     try:
-        await bot.send_message(user_id, f"📞 *Ответ от администратора:*\n\n{answer_text}", parse_mode="Markdown")
+        await send_user_message(
+            user_id,
+            topic_key="support",
+            text=f"📞 *Ответ от администратора:*\n\n{answer_text}",
+            parse_mode="Markdown",
+        )
         await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
     except Exception as e:
         await message.answer(f"❌ Не удалось отправить ответ: {e}")
@@ -2867,6 +3968,170 @@ async def admin_add_chat_button(message: types.Message, state: FSMContext):
 async def admin_post_vacancy_button(message: types.Message, state: FSMContext):
     if message.from_user.id == YOUR_USER_ID:
         await post_vacancy_cmd(message, state)
+
+
+async def _send_admin_xlsx(message: types.Message, caption: str, prefix: str, builder, rows_getter):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    status = await message.answer("📥 Готовлю Excel…")
+    try:
+        rows = rows_getter()
+        payload = builder(rows)
+        fname = export_filename(prefix)
+        await message.answer_document(
+            BufferedInputFile(payload, filename=fname),
+            caption=f"{caption}: {len(rows)} строк",
+            reply_markup=get_admin_export_keyboard(),
+        )
+        await status.delete()
+    except Exception as e:
+        logger.exception("admin xlsx %s", prefix)
+        await status.edit_text(f"❌ Ошибка выгрузки: {str(e)[:120]}")
+
+
+@dp.message(lambda m: m.text == "📥 Excel: подписчики")
+async def admin_export_subscribers(message: types.Message):
+    await _send_admin_xlsx(
+        message, "Подписчики", "subscribers",
+        build_subscribers_xlsx, get_subscribers_export_rows,
+    )
+
+
+@dp.message(lambda m: m.text == "📥 Excel: вакансии")
+async def admin_export_vacancies(message: types.Message):
+    await _send_admin_xlsx(
+        message, "Вакансии", "vacancies",
+        build_vacancies_xlsx, get_vacancies_export_rows,
+    )
+
+
+@dp.message(lambda m: m.text == "📥 Excel: заказчики")
+async def admin_export_employers(message: types.Message):
+    await _send_admin_xlsx(
+        message, "Заказчики", "employers",
+        build_employers_xlsx, get_employers_export_rows,
+    )
+
+
+@dp.message(lambda m: m.text == "📥 Excel: не подходит")
+async def admin_export_notfit(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await _send_admin_xlsx(
+        message, "Не подходит", "notfit",
+        build_notfit_xlsx, get_notfit_export_rows,
+    )
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_PARSER)
+async def admin_nav_parser(message: types.Message):
+    await message.answer(
+        "📡 *Парсер* — чаты, прогон, качество ленты.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_parser_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_USERS)
+async def admin_nav_users(message: types.Message):
+    await message.answer(
+        "👥 *Пользователи* — подписчики, Premium, отклики, поддержка.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_users_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_EXPORT)
+async def admin_nav_export(message: types.Message):
+    await message.answer(
+        "📥 *Excel* — выгрузки для анализа.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_export_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_MOD)
+async def admin_nav_mod(message: types.Message):
+    await message.answer(
+        "📝 *Модерация и канал* — очередь заказчиков и ручной кросс-пост.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_mod_keyboard(),
+    )
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_BACK)
+async def admin_nav_back(message: types.Message):
+    await message.answer("🏠 Главное админ-меню", reply_markup=get_admin_hub_keyboard())
+
+
+@dp.message(lambda m: m.text == "📊 Шум по чатам")
+async def admin_chat_noise_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    from parser import LAST_DEBUG_STATS, format_chat_noise_report
+    report = format_chat_noise_report(LAST_DEBUG_STATS)
+    await message.answer(report, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+@dp.message(lambda m: m.text == "📣 В канал")
+async def admin_channel_post_start(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if not CHANNEL_CROSSPOST_ENABLED:
+        await message.answer(
+            "Кросс-пост выключен (`CHANNEL_CROSSPOST_ENABLED=0`).",
+            reply_markup=get_admin_mod_keyboard(),
+        )
+        return
+    await state.set_state(ChannelPostState.waiting_vacancy_id)
+    await message.answer(
+        "📣 Отправьте *ID вакансии* для публикации в @promostaff_agency_job.\n"
+        "Повторная публикация разрешена.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(ChannelPostState.waiting_vacancy_id)
+async def admin_channel_post_vacancy_id(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if message.text == ADMIN_BTN_BACK:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_admin_mod_keyboard())
+        return
+    vacancy_id = (message.text or "").strip()
+    if not vacancy_id:
+        await message.answer("Укажите ID вакансии или «◀️ Назад».")
+        return
+    await state.clear()
+    result = await channel_post_for_vacancy(vacancy_id, force=True)
+    await message.answer(result, parse_mode="Markdown", reply_markup=get_admin_mod_keyboard())
+
+
+@dp.message(lambda m: m.text == "📝 Модерация вакансий")
+async def admin_moderation_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    pending = get_pending_moderation_vacancies(10)
+    if not pending:
+        await message.answer("✅ Очередь модерации пуста.", reply_markup=get_admin_keyboard())
+        return
+    await message.answer(f"📝 *На модерации:* {len(pending)}", parse_mode="Markdown")
+    for v in pending:
+        preview = (v.get("message_text") or "")[:350]
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            _inline_btn("Опубликовать", callback_data=f"mod_ok_{v['id']}", style="success"),
+            _inline_btn("Отклонить", callback_data=f"mod_no_{v['id']}", style="danger"),
+            _inline_btn("📣 Канал", callback_data=f"mod_ch_{v['id']}"),
+        ]])
+        await message.answer(
+            f"*{get_category_name(v['category_code'])}* · `{v['id']}`\n"
+            f"Контакт: {v.get('author_contact') or '—'}\n\n"
+            f"{escape_markdown(preview)}",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+
 
 @dp.message(lambda m: m.text == "❌ Закрыть меню")
 async def admin_close_menu(message: types.Message):

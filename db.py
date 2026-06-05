@@ -124,6 +124,30 @@ def init_db():
             "ALTER TABLE subscribers ADD COLUMN photo_updated_at TIMESTAMP DEFAULT NULL",
             cur=cur,
         )
+        add_column_if_missing(
+            "subscribers", "user_role",
+            "ALTER TABLE subscribers ADD COLUMN user_role TEXT DEFAULT 'candidate'",
+            cur=cur,
+        )
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS employers (
+                id {serial_pk()},
+                telegram_user_id INTEGER UNIQUE,
+                username TEXT,
+                display_name TEXT,
+                contact_text TEXT,
+                contact_source TEXT,
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                vacancies_count INTEGER DEFAULT 0,
+                categories_csv TEXT DEFAULT NULL,
+                bot_user_id INTEGER DEFAULT NULL
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_employers_tg_user ON employers(telegram_user_id)"
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS categories (
@@ -181,7 +205,77 @@ def init_db():
             "ALTER TABLE vacancies ADD COLUMN published_at TEXT DEFAULT NULL",
             cur=cur,
         )
+        for col, ddl in (
+            ("poster_user_id", "ALTER TABLE vacancies ADD COLUMN poster_user_id INTEGER DEFAULT NULL"),
+            ("poster_username", "ALTER TABLE vacancies ADD COLUMN poster_username TEXT DEFAULT NULL"),
+            ("poster_display_name", "ALTER TABLE vacancies ADD COLUMN poster_display_name TEXT DEFAULT NULL"),
+            ("contact_source", "ALTER TABLE vacancies ADD COLUMN contact_source TEXT DEFAULT NULL"),
+            ("employer_id", "ALTER TABLE vacancies ADD COLUMN employer_id INTEGER DEFAULT NULL"),
+            ("posted_by_bot_user_id", "ALTER TABLE vacancies ADD COLUMN posted_by_bot_user_id INTEGER DEFAULT NULL"),
+            ("moderation_status", "ALTER TABLE vacancies ADD COLUMN moderation_status TEXT DEFAULT 'approved'"),
+        ):
+            add_column_if_missing("vacancies", col, ddl, cur=cur)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS vacancy_notfit_feedback (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                vacancy_category TEXT,
+                user_categories TEXT,
+                reason_code TEXT,
+                reason_text TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, vacancy_id)
+            )
+        """)
+        for col, ddl in (
+            ("reason_code", "ALTER TABLE vacancy_notfit_feedback ADD COLUMN reason_code TEXT"),
+            ("reason_text", "ALTER TABLE vacancy_notfit_feedback ADD COLUMN reason_text TEXT"),
+        ):
+            add_column_if_missing("vacancy_notfit_feedback", col, ddl, cur=cur)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS user_forum_topics (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                topic_key TEXT NOT NULL,
+                thread_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, topic_key)
+            )
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS vacancy_channel_posts (
+                vacancy_id TEXT PRIMARY KEY,
+                posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                usage_day TEXT NOT NULL,
+                count INTEGER DEFAULT 0,
+                UNIQUE(user_id, usage_day)
+            )
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS star_purchases (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                stars_amount INTEGER NOT NULL,
+                payload TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, vacancy_id, payload)
+            )
+        """)
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS sent_vacancies (
@@ -215,6 +309,11 @@ def init_db():
         add_column_if_missing(
             "responses", "user_photo_file_id",
             "ALTER TABLE responses ADD COLUMN user_photo_file_id TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "responses", "star_boost",
+            f"ALTER TABLE responses ADD COLUMN star_boost BOOLEAN {bool_default_false()}",
             cur=cur,
         )
 
@@ -261,6 +360,11 @@ def init_db():
                 is_active BOOLEAN {bool_default_true()}
             )
         """)
+        add_column_if_missing(
+            "target_chats", "expected_roles",
+            "ALTER TABLE target_chats ADD COLUMN expected_roles TEXT DEFAULT NULL",
+            cur=cur,
+        )
 
         cur.execute("SELECT COUNT(*) FROM target_chats")
         if cur.fetchone()[0] == 0:
@@ -429,7 +533,7 @@ def get_subscriber_profile(user_id: int) -> dict:
     row = fetchone("""
         SELECT user_id, username, first_name, last_name, full_name, age, phone,
                photo_file_id, questionnaire, is_active, plan, paid_until, metro_zones, trial_used,
-               birth_date, resume_extra, photo_storage_path, photo_updated_at
+               birth_date, resume_extra, photo_storage_path, photo_updated_at, user_role
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     if row:
@@ -440,6 +544,7 @@ def get_subscriber_profile(user_id: int) -> dict:
             "paid_until": row[11], "metro_zones": row[12], "trial_used": bool(row[13]),
             "birth_date": row[14], "resume_extra": row[15],
             "photo_storage_path": row[16], "photo_updated_at": row[17],
+            "user_role": row[18] or "candidate",
         }
     return None
 
@@ -651,14 +756,21 @@ def get_subscribers_by_category(category_code: str) -> list:
 def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  category_code: str, message_text: str, message_link: str,
                  author_contact: str = None, address: str = None, is_closed: bool = False,
-                 dedupe_key: str = None, published_at: str = None):
+                 dedupe_key: str = None, published_at: str = None,
+                 poster_user_id: int = None, poster_username: str = None,
+                 poster_display_name: str = None, contact_source: str = None,
+                 employer_id: int = None, posted_by_bot_user_id: int = None,
+                 moderation_status: str = "approved"):
     # PostgreSQL: в ON CONFLICT нужен префикс vacancies. — иначе ambiguous column
     v = "vacancies." if IS_POSTGRES else ""
+    mod = moderation_status or "approved"
     execute(f"""
         INSERT INTO vacancies
         (id, source_chat, source_chat_title, category_code, message_text, message_link,
-         author_contact, address, is_closed, dedupe_key, published_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         author_contact, address, is_closed, dedupe_key, published_at,
+         poster_user_id, poster_username, poster_display_name, contact_source,
+         employer_id, posted_by_bot_user_id, moderation_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             source_chat_title = excluded.source_chat_title,
             category_code = excluded.category_code,
@@ -667,9 +779,23 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
             author_contact = COALESCE(excluded.author_contact, {v}author_contact),
             address = COALESCE(excluded.address, {v}address),
             dedupe_key = COALESCE(excluded.dedupe_key, {v}dedupe_key),
-            published_at = COALESCE(excluded.published_at, {v}published_at)
-    """, (vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
-          author_contact, address, is_closed, dedupe_key, published_at))
+            published_at = COALESCE(excluded.published_at, {v}published_at),
+            poster_user_id = COALESCE(excluded.poster_user_id, {v}poster_user_id),
+            poster_username = COALESCE(excluded.poster_username, {v}poster_username),
+            poster_display_name = COALESCE(excluded.poster_display_name, {v}poster_display_name),
+            contact_source = COALESCE(excluded.contact_source, {v}contact_source),
+            employer_id = COALESCE(excluded.employer_id, {v}employer_id),
+            posted_by_bot_user_id = COALESCE(excluded.posted_by_bot_user_id, {v}posted_by_bot_user_id),
+            moderation_status = COALESCE(excluded.moderation_status, {v}moderation_status)
+    """, (
+        vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
+        author_contact, address, is_closed, dedupe_key, published_at,
+        poster_user_id, poster_username, poster_display_name, contact_source,
+        employer_id, posted_by_bot_user_id, mod,
+    ))
+
+
+_VACANCY_VISIBLE_SQL = "(moderation_status IS NULL OR moderation_status = 'approved')"
 
 
 def get_vacancy_row(vacancy_id: str):
@@ -677,6 +803,348 @@ def get_vacancy_row(vacancy_id: str):
         "SELECT message_text, message_link, source_chat_title, author_contact, address FROM vacancies WHERE id = ?",
         (vacancy_id,),
     )
+
+
+def get_vacancy_push_row(vacancy_id: str):
+    return fetchone(
+        """SELECT message_text, message_link, source_chat_title, author_contact, address,
+                  category_code, source_chat, dedupe_key, published_at, poster_user_id,
+                  poster_username, moderation_status, posted_by_bot_user_id
+           FROM vacancies WHERE id = ?""",
+        (vacancy_id,),
+    )
+
+
+def get_pending_moderation_vacancies(limit: int = 15) -> list[dict]:
+    rows = fetchall(
+        f"""
+        SELECT id, category_code, source_chat_title, message_text, author_contact,
+               posted_by_bot_user_id, published_at
+        FROM vacancies
+        WHERE moderation_status = 'pending' AND is_closed = {bool_false()}
+        ORDER BY COALESCE(published_at, found_at) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [
+        {
+            "id": r[0], "category_code": r[1], "source_chat_title": r[2], "message_text": r[3],
+            "author_contact": r[4], "posted_by_bot_user_id": r[5], "published_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def set_vacancy_moderation(vacancy_id: str, status: str):
+    execute("UPDATE vacancies SET moderation_status = ? WHERE id = ?", (status, vacancy_id))
+
+
+def record_vacancy_notfit(
+    user_id: int,
+    vacancy_id: str,
+    vacancy_category: str,
+    user_categories: list[str],
+    *,
+    reason_code: str = "",
+    reason_text: str | None = None,
+):
+    cats = ",".join(user_categories) if user_categories else ""
+    execute(
+        """
+        INSERT INTO vacancy_notfit_feedback
+            (user_id, vacancy_id, vacancy_category, user_categories, reason_code, reason_text)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, vacancy_id) DO UPDATE SET
+            vacancy_category = excluded.vacancy_category,
+            user_categories = excluded.user_categories,
+            reason_code = excluded.reason_code,
+            reason_text = excluded.reason_text,
+            created_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, vacancy_id, vacancy_category, cats, reason_code or None, reason_text),
+    )
+
+
+def get_notfit_stats(limit: int = 10) -> list[dict]:
+    rows = fetchall(
+        """
+        SELECT vacancy_category, reason_code, COUNT(*) AS cnt
+        FROM vacancy_notfit_feedback
+        GROUP BY vacancy_category, reason_code
+        ORDER BY cnt DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [{"category": r[0], "reason_code": r[1], "count": r[2]} for r in rows]
+
+
+def get_notfit_export_rows(limit: int = 15000) -> list[dict]:
+    rows = fetchall(q(f"""
+        SELECT
+            f.id, f.user_id, f.vacancy_id, f.vacancy_category, f.user_categories,
+            f.reason_code, f.reason_text, f.created_at,
+            v.message_text, v.source_chat_title, v.message_link, v.category_code,
+            s.username, s.full_name, s.first_name, s.last_name
+        FROM vacancy_notfit_feedback f
+        LEFT JOIN vacancies v ON v.id = f.vacancy_id
+        LEFT JOIN subscribers s ON s.user_id = f.user_id
+        ORDER BY f.created_at DESC
+        LIMIT ?
+    """), (limit,))
+    return [
+        {
+            "id": r[0], "user_id": r[1], "vacancy_id": r[2],
+            "vacancy_category": r[3], "user_categories": r[4],
+            "reason_code": r[5], "reason_text": r[6], "created_at": r[7],
+            "message_text": r[8], "source_chat_title": r[9], "message_link": r[10],
+            "vacancy_category_live": r[11],
+            "username": r[12], "full_name": r[13],
+            "first_name": r[14], "last_name": r[15],
+        }
+        for r in rows
+    ]
+
+
+def get_user_topic_thread_id(user_id: int, topic_key: str) -> int | None:
+    row = fetchone(
+        "SELECT thread_id FROM user_forum_topics WHERE user_id = ? AND topic_key = ?",
+        (user_id, topic_key),
+    )
+    return int(row[0]) if row else None
+
+
+def save_user_topic_thread(user_id: int, topic_key: str, thread_id: int):
+    execute(
+        """
+        INSERT INTO user_forum_topics (user_id, topic_key, thread_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, topic_key) DO UPDATE SET thread_id = excluded.thread_id
+        """,
+        (user_id, topic_key, thread_id),
+    )
+
+
+def is_vacancy_channel_posted(vacancy_id: str) -> bool:
+    row = fetchone("SELECT 1 FROM vacancy_channel_posts WHERE vacancy_id = ?", (vacancy_id,))
+    return bool(row)
+
+
+def mark_vacancy_channel_posted(vacancy_id: str):
+    execute(
+        """
+        INSERT INTO vacancy_channel_posts (vacancy_id) VALUES (?)
+        ON CONFLICT(vacancy_id) DO NOTHING
+        """,
+        (vacancy_id,),
+    )
+
+
+def get_llm_usage_today(user_id: int, usage_day: str) -> int:
+    row = fetchone(
+        "SELECT count FROM llm_usage WHERE user_id = ? AND usage_day = ?",
+        (user_id, usage_day),
+    )
+    return int(row[0]) if row else 0
+
+
+def increment_llm_usage(user_id: int, usage_day: str):
+    execute(
+        """
+        INSERT INTO llm_usage (user_id, usage_day, count) VALUES (?, ?, 1)
+        ON CONFLICT(user_id, usage_day) DO UPDATE SET count = count + 1
+        """,
+        (user_id, usage_day),
+    )
+
+
+def create_star_purchase(user_id: int, vacancy_id: str, stars_amount: int, payload: str):
+    execute(
+        """
+        INSERT INTO star_purchases (user_id, vacancy_id, stars_amount, payload, status)
+        VALUES (?, ?, ?, ?, 'pending')
+        ON CONFLICT(user_id, vacancy_id, payload) DO NOTHING
+        """,
+        (user_id, vacancy_id, stars_amount, payload),
+    )
+
+
+def complete_star_purchase(payload: str) -> dict | None:
+    row = fetchone(
+        "SELECT user_id, vacancy_id, stars_amount FROM star_purchases WHERE payload = ? AND status = 'pending'",
+        (payload,),
+    )
+    if not row:
+        return None
+    execute("UPDATE star_purchases SET status = 'paid' WHERE payload = ?", (payload,))
+    return {"user_id": row[0], "vacancy_id": row[1], "stars_amount": row[2]}
+
+
+def has_star_purchase_for_vacancy(user_id: int, vacancy_id: str) -> bool:
+    row = fetchone(
+        "SELECT 1 FROM star_purchases WHERE user_id = ? AND vacancy_id = ? AND status = 'paid'",
+        (user_id, vacancy_id),
+    )
+    return bool(row)
+
+
+def set_response_star_boost(user_id: int, vacancy_id: str):
+    execute(
+        "UPDATE responses SET star_boost = ? WHERE user_id = ? AND vacancy_id = ?",
+        (True, user_id, vacancy_id),
+    )
+
+
+def set_subscriber_role(user_id: int, role: str):
+    execute("UPDATE subscribers SET user_role = ? WHERE user_id = ?", (role, user_id))
+
+
+def get_subscriber_role(user_id: int) -> str:
+    row = fetchone("SELECT user_role FROM subscribers WHERE user_id = ?", (user_id,))
+    return (row[0] if row and row[0] else "candidate")
+
+
+def _merge_categories_csv(existing: str | None, category_code: str) -> str:
+    parts = [p.strip() for p in (existing or "").split(",") if p.strip()]
+    if category_code and category_code not in parts:
+        parts.append(category_code)
+    return ",".join(sorted(parts))
+
+
+def upsert_employer_from_post(
+    *,
+    telegram_user_id: int | None,
+    username: str | None,
+    display_name: str | None,
+    contact_text: str | None,
+    contact_source: str | None,
+    category_code: str | None,
+    bot_user_id: int | None = None,
+) -> int | None:
+    """CRM заказчиков из парсера или публикации в боте. Возвращает employer.id."""
+    if not telegram_user_id and not contact_text and not username:
+        return None
+    with db_conn() as conn:
+        cur = conn.cursor()
+        row = None
+        if telegram_user_id:
+            cur.execute(q("SELECT id, categories_csv FROM employers WHERE telegram_user_id = ?"), (telegram_user_id,))
+            row = cur.fetchone()
+        if not row and contact_text:
+            cur.execute(q("SELECT id, categories_csv FROM employers WHERE contact_text = ?"), (contact_text,))
+            row = cur.fetchone()
+        cats = _merge_categories_csv(row[1] if row else None, category_code or "")
+        if row:
+            employer_id = row[0]
+            cur.execute(
+                q("""
+                    UPDATE employers SET
+                        username = COALESCE(?, username),
+                        display_name = COALESCE(?, display_name),
+                        contact_text = COALESCE(?, contact_text),
+                        contact_source = COALESCE(?, contact_source),
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        vacancies_count = vacancies_count + 1,
+                        categories_csv = ?,
+                        bot_user_id = COALESCE(?, bot_user_id),
+                        telegram_user_id = COALESCE(telegram_user_id, ?)
+                    WHERE id = ?
+                """),
+                (username, display_name, contact_text, contact_source, cats, bot_user_id, telegram_user_id, employer_id),
+            )
+        else:
+            cur.execute(
+                q("""
+                    INSERT INTO employers
+                    (telegram_user_id, username, display_name, contact_text, contact_source,
+                     vacancies_count, categories_csv, bot_user_id)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                """),
+                (telegram_user_id, username, display_name, contact_text, contact_source, cats, bot_user_id),
+            )
+            if IS_POSTGRES:
+                cur.execute("SELECT lastval()")
+                employer_id = cur.fetchone()[0]
+            else:
+                employer_id = cur.lastrowid
+    return employer_id
+
+
+def link_employer_to_bot_user(telegram_user_id: int, bot_user_id: int):
+    execute(
+        "UPDATE employers SET bot_user_id = ? WHERE telegram_user_id = ?",
+        (bot_user_id, telegram_user_id),
+    )
+
+
+def get_subscribers_export_rows(limit: int = 15000) -> list[dict]:
+    rows = fetchall(q(f"""
+        SELECT s.user_id, s.username, s.full_name, s.first_name, s.last_name, s.phone, s.age,
+               s.birth_date, s.user_role, s.plan, s.paid_until, s.trial_used, s.metro_zones,
+               s.registered_at, s.is_active, s.resume_extra,
+               CASE WHEN s.photo_file_id IS NOT NULL OR s.photo_storage_path IS NOT NULL THEN 1 ELSE 0 END
+        FROM subscribers s
+        ORDER BY s.registered_at DESC
+        LIMIT ?
+    """), (limit,))
+    result = []
+    for row in rows:
+        uid = row[0]
+        cat_rows = fetchall(
+            "SELECT category_code FROM user_categories WHERE user_id = ? ORDER BY category_code",
+            (uid,),
+        )
+        result.append({
+            "user_id": row[0], "username": row[1], "full_name": row[2], "first_name": row[3],
+            "last_name": row[4], "phone": row[5], "age": row[6], "birth_date": row[7],
+            "user_role": row[8] or "candidate", "plan": row[9], "paid_until": row[10],
+            "trial_used": row[11], "metro_zones": row[12], "registered_at": row[13],
+            "is_active": row[14], "resume_extra": row[15],
+            "has_photo": bool(row[16]),
+            "categories": ", ".join(c[0] for c in cat_rows),
+        })
+    return result
+
+
+def get_vacancies_export_rows(limit: int = 15000) -> list[dict]:
+    rows = fetchall(q(f"""
+        SELECT id, category_code, source_chat_title, author_contact, contact_source,
+               poster_user_id, poster_username, poster_display_name, employer_id,
+               posted_by_bot_user_id, address, published_at, found_at, is_closed,
+               message_link, message_text
+        FROM vacancies
+        ORDER BY COALESCE(published_at, found_at) DESC
+        LIMIT ?
+    """), (limit,))
+    return [
+        {
+            "id": r[0], "category_code": r[1], "source_chat_title": r[2], "author_contact": r[3],
+            "contact_source": r[4], "poster_user_id": r[5], "poster_username": r[6],
+            "poster_display_name": r[7], "employer_id": r[8], "posted_by_bot_user_id": r[9],
+            "address": r[10], "published_at": r[11], "found_at": r[12], "is_closed": r[13],
+            "message_link": r[14], "message_text": r[15],
+        }
+        for r in rows
+    ]
+
+
+def get_employers_export_rows(limit: int = 15000) -> list[dict]:
+    rows = fetchall(q(f"""
+        SELECT id, telegram_user_id, username, display_name, contact_text, contact_source,
+               vacancies_count, categories_csv, bot_user_id, first_seen_at, last_seen_at
+        FROM employers
+        ORDER BY vacancies_count DESC, last_seen_at DESC
+        LIMIT ?
+    """), (limit,))
+    return [
+        {
+            "id": r[0], "telegram_user_id": r[1], "username": r[2], "display_name": r[3],
+            "contact_text": r[4], "contact_source": r[5], "vacancies_count": r[6],
+            "categories_csv": r[7], "bot_user_id": r[8], "first_seen_at": r[9], "last_seen_at": r[10],
+        }
+        for r in rows
+    ]
 
 
 def migrate_legacy_vacancy_ids() -> int:
@@ -776,6 +1244,7 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
                v.author_contact, v.address, v.found_at, v.published_at
         FROM vacancies v
         WHERE v.category_code = ? AND v.is_closed = {bool_false()}
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
           AND NOT EXISTS (
             SELECT 1 FROM sent_vacancies sv
             WHERE sv.user_id = ? AND sv.vacancy_id = v.id
@@ -798,6 +1267,7 @@ def count_feed_vacancies_for_user(user_id: int, category_code: str) -> int:
         f"""
         SELECT COUNT(*) FROM vacancies v
         WHERE v.category_code = ? AND v.is_closed = {bool_false()}
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
           AND NOT EXISTS (
             SELECT 1 FROM sent_vacancies sv
             WHERE sv.user_id = ? AND sv.vacancy_id = v.id
@@ -959,9 +1429,31 @@ def list_target_chats() -> list:
     if not table_exists("target_chats"):
         return []
     rows = fetchall(
-        "SELECT chat_link, is_active, added_at FROM target_chats ORDER BY is_active DESC, added_at"
+        "SELECT chat_link, is_active, added_at, expected_roles FROM target_chats ORDER BY is_active DESC, added_at"
     )
-    return [{"chat_link": r[0], "is_active": bool(r[1]), "added_at": r[2]} for r in rows]
+    return [
+        {"chat_link": r[0], "is_active": bool(r[1]), "added_at": r[2], "expected_roles": r[3]}
+        for r in rows
+    ]
+
+
+def set_target_chat_expected_roles(chat_link: str, roles_csv: str) -> bool:
+    if not table_exists("target_chats"):
+        return False
+    cur = execute(
+        "UPDATE target_chats SET expected_roles = ? WHERE chat_link = ?",
+        (roles_csv.strip() or None, chat_link),
+    )
+    return cur is not None
+
+
+def get_target_chat_expected_roles(chat_link: str) -> set[str]:
+    if not table_exists("target_chats"):
+        return set()
+    row = fetchone("SELECT expected_roles FROM target_chats WHERE chat_link = ?", (chat_link,))
+    if not row or not row[0]:
+        return set()
+    return {p.strip() for p in str(row[0]).split(",") if p.strip()}
 
 
 def add_target_chat(chat_link: str) -> bool:
