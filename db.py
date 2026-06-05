@@ -27,6 +27,7 @@ from db_backend import (
     q,
     serial_pk,
     table_exists,
+    vacancy_sort_published_sql,
 )
 
 logger = logging.getLogger(__name__)
@@ -850,9 +851,9 @@ def get_pending_moderation_vacancies(limit: int = 15) -> list[dict]:
                posted_by_bot_user_id, published_at
         FROM vacancies
         WHERE moderation_status = 'pending' AND is_closed = {bool_false()}
-        ORDER BY COALESCE(published_at, found_at) DESC
+        ORDER BY {vacancy_sort_published_sql()} DESC
         LIMIT ?
-        """,
+    """,
         (limit,),
     )
     return [
@@ -1142,7 +1143,7 @@ def get_vacancies_export_rows(limit: int = 15000) -> list[dict]:
                posted_by_bot_user_id, address, published_at, found_at, is_closed,
                message_link, message_text
         FROM vacancies
-        ORDER BY COALESCE(published_at, found_at) DESC
+        ORDER BY {vacancy_sort_published_sql()} DESC
         LIMIT ?
     """), (limit,))
     return [

@@ -150,6 +150,13 @@ def now_minus_days(days: int) -> str:
     return f"datetime('now', '-{days} days')"
 
 
+def vacancy_sort_published_sql() -> str:
+    """published_at хранится как TEXT, found_at — TIMESTAMP; COALESCE только в одном типе."""
+    if IS_POSTGRES:
+        return "COALESCE(NULLIF(published_at, '')::timestamp, found_at)"
+    return "COALESCE(published_at, datetime(found_at))"
+
+
 def serial_pk() -> str:
     return "SERIAL PRIMARY KEY" if IS_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
