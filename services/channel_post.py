@@ -92,7 +92,7 @@ async def post_vacancy_preview_to_channel(
     )
     markup = build_channel_preview_keyboard(vacancy_id)
     try:
-        await bot.send_message(
+        msg = await bot.send_message(
             HUNTER_CHANNEL_ID,
             text,
             parse_mode="HTML",

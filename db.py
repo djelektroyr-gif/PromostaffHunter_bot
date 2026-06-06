@@ -1129,14 +1129,67 @@ def get_user_categories(user_id: int) -> list:
 
 
 def set_user_categories(user_id: int, category_codes: list):
+    codes = list(dict.fromkeys(category_codes))
     with db_conn() as conn:
         cur = conn.cursor()
+        _lock_user_categories(cur, user_id)
         cur.execute(q("DELETE FROM user_categories WHERE user_id = ?"), (user_id,))
-        for code in category_codes:
+        for code in codes:
             cur.execute(
                 q("INSERT INTO user_categories (user_id, category_code) VALUES (?, ?)"),
                 (user_id, code),
             )
+
+
+def _lock_user_categories(cur, user_id: int) -> None:
+    if IS_POSTGRES:
+        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (1, int(user_id)))
+    else:
+        cur.execute("BEGIN IMMEDIATE")
+
+
+def _is_user_premium_cur(cur, user_id: int) -> bool:
+    cur.execute(
+        q(f"""
+        SELECT 1 FROM subscribers
+        WHERE user_id = ? AND plan = 'premium'
+          AND {paid_until_active()}
+        """),
+        (user_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def toggle_user_category(
+    user_id: int,
+    category_code: str,
+    *,
+    free_limit: int,
+) -> tuple[list[str], bool]:
+    """Атомарное вкл/выкл категории. Возвращает (коды, blocked_by_free_limit)."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        _lock_user_categories(cur, user_id)
+        cur.execute(
+            q("SELECT category_code FROM user_categories WHERE user_id = ? ORDER BY category_code"),
+            (user_id,),
+        )
+        current = [r[0] for r in cur.fetchall()]
+        if category_code in current:
+            cur.execute(
+                q("DELETE FROM user_categories WHERE user_id = ? AND category_code = ?"),
+                (user_id, category_code),
+            )
+            current.remove(category_code)
+            return current, False
+        if not _is_user_premium_cur(cur, user_id) and len(current) >= free_limit:
+            return current, True
+        cur.execute(
+            q("INSERT INTO user_categories (user_id, category_code) VALUES (?, ?)"),
+            (user_id, category_code),
+        )
+        current.append(category_code)
+        return current, False
 
 
 def get_subscribers_by_category(category_code: str) -> list:

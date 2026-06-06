@@ -2568,22 +2568,19 @@ async def select_category(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
     user_id = callback.from_user.id
     category_code = callback.data.replace("cat_", "")
-    current_codes = [c["code"] for c in await run_db(get_user_categories, user_id)]
+    current_codes, blocked = await run_db(
+        toggle_user_category,
+        user_id,
+        category_code,
+        free_limit=FREE_CATEGORY_LIMIT,
+    )
     hint = ""
-    if category_code in current_codes:
-        current_codes.remove(category_code)
-    elif not await run_db(is_user_premium, user_id) and len(current_codes) >= FREE_CATEGORY_LIMIT:
+    if blocked:
         hint = (
             f"⚠️ На Free — не больше *{FREE_CATEGORY_LIMIT}* категорий.\n"
             "Нужно больше? Нажмите *💎 Premium* ниже."
         )
-    else:
-        current_codes.append(category_code)
-    if hint:
-        await edit_category_picker(callback.message, current_codes, user_id, hint=hint)
-        return
-    await run_db(set_user_categories, user_id, current_codes)
-    await edit_category_picker(callback.message, current_codes, user_id)
+    await edit_category_picker(callback.message, current_codes, user_id, hint=hint)
 
 
 @dp.callback_query(lambda c: c.data == "back_to_categories")

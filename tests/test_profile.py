@@ -71,6 +71,32 @@ def test_settings_markup_has_disable_feed():
     assert "disable_feed" in callbacks
 
 
+def test_toggle_user_category_atomic():
+    from db import get_user_categories, toggle_user_category
+
+    user_id = 700011
+    _seed_user(user_id)
+    execute("DELETE FROM user_categories WHERE user_id = ?", (user_id,))
+
+    codes, blocked = toggle_user_category(user_id, "helper", free_limit=3)
+    assert not blocked
+    assert codes == ["helper"]
+    assert [c["code"] for c in get_user_categories(user_id)] == ["helper"]
+
+    codes, blocked = toggle_user_category(user_id, "helper", free_limit=3)
+    assert not blocked
+    assert codes == []
+    assert get_user_categories(user_id) == []
+
+    toggle_user_category(user_id, "helper", free_limit=3)
+    toggle_user_category(user_id, "promoter", free_limit=3)
+    toggle_user_category(user_id, "wardrobe", free_limit=3)
+    codes, blocked = toggle_user_category(user_id, "loader", free_limit=3)
+    assert blocked
+    assert len(codes) == 3
+    assert "loader" not in codes
+
+
 def test_main_keyboard_uses_new_button_labels():
     import main as main_module
 
