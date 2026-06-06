@@ -16,7 +16,9 @@
 
 **Premium активен:** `plan = 'premium'` и `paid_until` в будущем (`is_user_premium()`).
 
-**Истечение:** при `/start` — `downgrade_expired_premium()` → Free + сообщение пользователю. Cron массовой проверки пока нет.
+**Истечение:** фоновый cron (`premium_scheduler_loop`, каждый час) — downgrade + сообщение пользователю; дублируется при `/start` через `downgrade_expired_premium()`.
+
+**Напоминание:** за `PREMIUM_RENEWAL_REMIND_DAYS` дней (default 3) до `paid_until` — push в личку (cron, раз в час) и строка на экране «💎 Подписка»; один раз на период (`premium_renewal_warn_for`).
 
 **Продление:** `/setplan` и кнопка «✅ Активировать» **добавляют** дни к текущему `paid_until` (`set_user_plan(..., extend=True)`), не сбрасывают с «сегодня».
 
@@ -106,6 +108,7 @@ SUBSCRIPTION_SUPPORT=@your_support_or_link
 SUBSCRIPTION_PRICE_RUB=299
 SUBSCRIPTION_CARD_HINT=Сбер •••• 1234, получатель Иван И.
 TRIAL_DAYS=7
+PREMIUM_RENEWAL_REMIND_DAYS=3
 # SUBSCRIPTION_PAY_URL=   # опционально — кнопка «Оплатить Premium»
 ```
 
@@ -113,8 +116,8 @@ TRIAL_DAYS=7
 
 ## TODO (не в этом документе как «сделано»)
 
-- [ ] Cron проверки истёкших Premium (сейчас только `/start`)
-- [ ] Напоминание за 3 дня до конца Premium
+- [x] Cron проверки истёкших Premium (`premium_scheduler_loop`, каждый час)
+- [x] Напоминание за 3 дня до конца Premium (`PREMIUM_RENEWAL_REMIND_DAYS`)
 - [ ] Telegram Stars / ЮKassa / webhook
 
 ---

@@ -156,6 +156,11 @@ def init_db():
             "ALTER TABLE subscribers ADD COLUMN user_role TEXT DEFAULT 'candidate'",
             cur=cur,
         )
+        add_column_if_missing(
+            "subscribers", "premium_renewal_warn_for",
+            "ALTER TABLE subscribers ADD COLUMN premium_renewal_warn_for TIMESTAMP DEFAULT NULL",
+            cur=cur,
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS employers (
@@ -1085,6 +1090,21 @@ def grant_trial_if_eligible(user_id: int, trial_days: int) -> bool:
     return True
 
 
+PREMIUM_EXPIRED_USER_MESSAGE = (
+    "⏳ *Premium закончился.*\n\n"
+    "Моментальные push отключены — новые вакансии в ленте «🔍 Посмотреть новые вакансии».\n"
+    "Оформить снова: 💎 Подписка"
+)
+
+
+def _paid_until_key(value) -> str | None:
+    """Ключ периода подписки для dedupe напоминаний."""
+    dt = _parse_paid_until(value)
+    if not dt:
+        return None
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
 def downgrade_expired_premium(user_id: int) -> str | None:
     """Сбрасывает истёкший Premium на free. Возвращает текст уведомления или None."""
     row = fetchone(
@@ -1098,10 +1118,63 @@ def downgrade_expired_premium(user_id: int) -> str | None:
     if not row:
         return None
     execute("UPDATE subscribers SET plan = 'free' WHERE user_id = ?", (user_id,))
-    return (
-        "⏳ *Premium закончился.*\n\n"
-        "Моментальные push отключены — новые вакансии в ленте «🔍 Посмотреть новые вакансии».\n"
-        "Оформить снова: 💎 Подписка"
+    return PREMIUM_EXPIRED_USER_MESSAGE
+
+
+def list_expired_premium_user_ids() -> list[int]:
+    """Активные подписчики с plan=premium и истёкшим paid_until."""
+    rows = fetchall(
+        f"""
+        SELECT user_id FROM subscribers
+        WHERE is_active = {bool_true()} AND plan = 'premium' AND paid_until IS NOT NULL
+          AND {paid_until_expired()}
+        ORDER BY user_id
+        """,
+    )
+    return [r[0] for r in rows]
+
+
+def list_premium_renewal_reminder_candidates(within_days: int) -> list[dict]:
+    """
+    Premium/Trial ещё активен, до конца ≤ within_days, напоминание по этому paid_until ещё не слали.
+    """
+    if within_days <= 0:
+        return []
+    rows = fetchall(
+        f"""
+        SELECT user_id, paid_until, trial_used, premium_renewal_warn_for
+        FROM subscribers
+        WHERE is_active = {bool_true()} AND plan = 'premium' AND paid_until IS NOT NULL
+          AND {paid_until_active()}
+        ORDER BY paid_until ASC
+        """,
+    )
+    now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=within_days)
+    out: list[dict] = []
+    for user_id, paid_until, trial_used, warn_for in rows:
+        until = _parse_paid_until(paid_until)
+        if not until or until <= now or until > horizon:
+            continue
+        period_key = _paid_until_key(paid_until)
+        if period_key and _paid_until_key(warn_for) == period_key:
+            continue
+        days_left = max(0, (until - now).days)
+        if (until - now).total_seconds() > 0 and days_left == 0:
+            days_left = 1
+        out.append({
+            "user_id": user_id,
+            "paid_until": paid_until,
+            "trial_used": bool(trial_used),
+            "days_left": days_left,
+        })
+    return out
+
+
+def mark_premium_renewal_warned(user_id: int, paid_until) -> None:
+    execute(
+        "UPDATE subscribers SET premium_renewal_warn_for = ? WHERE user_id = ?",
+        (paid_until, user_id),
     )
 
 

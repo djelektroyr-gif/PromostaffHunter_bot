@@ -28,6 +28,9 @@ FEED_ARCHIVE_MAX_HOURS = int(os.getenv("FEED_ARCHIVE_MAX_HOURS", "168"))
 # Пробный Premium при первой регистрации (дней, 0 = отключить)
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 
+# За сколько дней до конца Premium/Trial слать напоминание (cron, 0 = отключить)
+PREMIUM_RENEWAL_REMIND_DAYS = int(os.getenv("PREMIUM_RENEWAL_REMIND_DAYS", "3"))
+
 # Forum topics в личке (BotFather → Threaded Mode)
 FORUM_TOPICS_ENABLED = os.getenv("FORUM_TOPICS_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 

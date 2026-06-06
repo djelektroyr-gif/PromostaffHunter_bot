@@ -3,7 +3,7 @@
 > Живой конспект проекта. Обновлять при каждой заметной доработке бота, парсера или продуктовых решений.  
 > Репозиторий: **PromostaffHunter_bot** (не путать с **promostaff-agency-bot** и **promostaff-bot**).
 
-Последнее обновление: **2026-06-05** (сборка **`tool-v4`**, спринт в коде)
+Последнее обновление: **2026-06-07** (сборка **`tool-v4`**, PostgreSQL на Bothost prod)
 
 ### Сделано за сессию (tool-v4)
 
@@ -123,7 +123,7 @@ SQLite bot_database.db  **или** PostgreSQL (`DATABASE_URL`)
 
 ## 4. Админ-меню и команды
 
-### Структура меню (tool-v3)
+### Структура меню (tool-v3 + tool-v4)
 
 Главный экран — **4 раздела** + статистика/рассылка:
 
@@ -131,8 +131,10 @@ SQLite bot_database.db  **или** PostgreSQL (`DATABASE_URL`)
 |--------|----------------|
 | 📡 Парсер | Ручная проверка, отчёт, чаты, шум, добавить чат, отправить вакансию, маппинг |
 | 👥 Пользователи | Подписчики, карточки, Premium, отклики, жалобы, поддержка |
-| 📥 Excel | подписчики, вакансии, заказчики, **не подходит** |
-| 📝 Модерация | Очередь вакансий заказчиков |
+| 📥 Excel | подписчики, вакансии, заказчики, **отклики**, **не подходит** |
+| 📝 Модерация | Очередь вакансий заказчиков, **📺 Канал** (подменю) |
+
+**📺 Канал** (из раздела «📝 Модерация»): статус, статистика, вакансия/новость/промо в канал, тексты промо. См. [`CHANNEL_CROSSPOST_AND_BOTFATHER.md`](CHANNEL_CROSSPOST_AND_BOTFATHER.md).
 
 «◀️ Назад» — в главное админ-меню.
 
@@ -159,7 +161,15 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 | 📥 Excel: подписчики | XLSX: профили, роли, категории, даты регистрации |
 | 📥 Excel: вакансии | XLSX: лента + контакты, poster/employer |
 | 📥 Excel: заказчики | XLSX: CRM из парсера и бота |
+| 📥 Excel: отклики | XLSX: отклики, draft_status, star_boost, контакт заказчика |
 | 📥 Excel: не подходит | XLSX: feedback «👎» с причиной, текст вакансии, пользователь |
+| 📺 Канал | Подменю: статус, статистика, публикации и промо в @promostaff_agency_job |
+| 📺 Статус канала | Лимиты, quiet hours, кросс-пост, промо-слоты |
+| 📊 Статистика канала | Подписчики канала, снимки из `channel_subscriber_snapshots` |
+| 📣 Вакансия в канал | Ручной кросс-пост вакансии из БД |
+| 📝 Новость в канал | Кастом-пост (FSM) |
+| 📢 Промо в канал | Промо «подпишись на бота» вручную |
+| ✏️ Тексты промо | Редактор `data/channel_promo_texts.json` |
 | ❌ Закрыть меню | Убирает клавиатуру |
 
 ### Команды (без кнопки)
@@ -277,7 +287,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 
 - [ ] **Premium-портфолио** — несколько фото + альбом при отклике (как Юду/Авито).
 - [ ] Счётчик на кнопке ленты вакансий.
-- [ ] Напоминание за 3 дня до конца Premium (cron).
+- [x] Напоминание за 3 дня до конца Premium (cron, `PREMIUM_RENEWAL_REMIND_DAYS`).
 - [ ] Статусы отклика (`sent` / `closed`) в UI.
 - [ ] Избранное ⭐, пауза push (Premium).
 
@@ -336,8 +346,8 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 
 ### TODO по подписке (осталось)
 
-- [ ] Cron массовой проверки истёкших Premium (сейчас — при `/start`).
-- [ ] Напоминание за 3 дня до конца Premium.
+- [x] Cron массовой проверки истёкших Premium (`services/premium_scheduler.py`).
+- [x] Напоминание за 3 дня до конца Premium.
 - [ ] Telegram Stars / webhook — когда появится инструмент.
 
 ### Env для ручной оплаты
@@ -422,7 +432,7 @@ VACANCY_MAX_AGE_HOURS=36
 - [x] **FSM чека оплаты** + кнопки ✅/❌ в «💎 Запросы Premium» ([SUBSCRIPTION.md](SUBSCRIPTION.md), 2026-06-04).
 - [x] **Мои отклики**, **единый экран категорий**, **продление Premium** (§6, 2026-06-04).
 - [x] Фильтр **метро/район** (Premium).
-- [x] Уведомление при **истечении Premium** (при `/start`).
+- [x] Уведомление при **истечении Premium** (cron `premium_scheduler_loop` + дубль при `/start`).
 - [x] Алерт админу если парсер offline / `monitored < active_chats`.
 
 ### Средний
@@ -437,8 +447,8 @@ VACANCY_MAX_AGE_HOURS=36
 ### Низкий
 
 - [ ] Inline «Ответить» на жалобы/поддержку.
-- [x] Экспорт подписчиков / вакансий / заказчиков — Excel из админки (`admin_exports.py`).
-- [ ] PostgreSQL вместо SQLite при росте — **реализовано** (`db_backend.py`, env `DATABASE_URL`); включить на Bothost prod при готовности managed DB.
+- [x] Экспорт подписчиков / вакансий / заказчиков / откликов — Excel из админки (`admin_exports.py`).
+- [x] **PostgreSQL на Bothost prod** — `DATABASE_URL` + `db_backend.py` (с ~2026-06-05); локально по-прежнему SQLite без env.
 
 ---
 
@@ -454,8 +464,8 @@ VACANCY_MAX_AGE_HOURS=36
    - Без `.session` парсер не стартует (бот для пользователей работает)
 3. **База данных:**
    - **Локально / dev:** SQLite (`bot_database.db` в корне проекта или `DATABASE_PATH`).
-   - **Bothost prod (рекомендуется):** **PostgreSQL** через managed DB на тарифе Basic/Pro+ — устойчивее при redeploy и росте подписчиков.
-   - **Bothost prod (SQLite):** «Общее хранилище» включено → БД в `/app/shared/bot_database.db` (не затирается при git-deploy).
+   - **Bothost prod:** **PostgreSQL** через `DATABASE_URL` (managed DB) — **текущий прод с 2026-06-05**.
+   - **Bothost prod (legacy SQLite):** «Общее хранилище» → `/app/shared/bot_database.db` — только если PostgreSQL не используется.
    - Перед деплоем: бэкап БД (файл или pg_dump).
    - Env SQLite: `DATABASE_PATH=/app/shared/bot_database.db`
    - Env PostgreSQL:
@@ -473,8 +483,8 @@ VACANCY_MAX_AGE_HOURS=36
 | | SQLite в `/app/shared` | PostgreSQL (`DATABASE_URL`) |
 |---|------------------------|----------------------------|
 | Сложность | Работает из коробки | Managed DB на Bothost + env |
-| Bothost | Общее хранилище на тарифе | Managed PostgreSQL (Basic/Pro+) |
-| Масштаб | До тысяч подписчиков — норм | **Рекомендуется для prod Bothost** — не теряется при redeploy, проще бэкапы |
+| Bothost prod | SQLite legacy в shared | **PostgreSQL** (`DATABASE_URL`, текущий прод) |
+| Масштаб | Dev / fallback | Prod Bothost с 2026-06-05 |
 | Локально | **По умолчанию** (без `DATABASE_URL`) | Опционально для проверки prod-схемы |
 
 Код поддерживает оба бэкенда через `db_backend.py`. Без `DATABASE_URL` — SQLite как раньше.
@@ -495,6 +505,7 @@ VACANCY_MAX_AGE_HOURS=36
 
 | Дата | Что добавлено |
 |------|----------------|
+| 2026-06-07 | Premium cron, Excel отклики и 📺 Канал в §4, PostgreSQL prod, единый `PREMIUM_RENEWAL_REMIND_DAYS` |
 | 2026-06-05 | **tool-v4:** темы в личке, кросс-пост канал, LLM-черновик, Stars «Расширенный отклик»; 64 pytest |
 | 2026-06-05 | **Канал:** `CHANNEL_CROSSPOST_AND_BOTFATHER.md` — @promostaff_agency_job, BotFather |
 | 2026-06-03 | **Спринт tool-v4:** `SPRINT_MODERN_UX_LLM_STARS.md` — темы, LLM, Stars (10–12 дн.) |

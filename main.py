@@ -30,7 +30,8 @@ from admin_exports import (
 )
 from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
-    SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, VACANCY_MAX_AGE_HOURS,
+    SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, PREMIUM_RENEWAL_REMIND_DAYS,
+    VACANCY_MAX_AGE_HOURS,
     FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS,
     FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID,
     LLM_ENABLED, LLM_DAILY_LIMIT_PREMIUM, STARS_ENABLED, STARS_EXTENDED_RESPONSE_PRICE,
@@ -263,7 +264,6 @@ _vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллель
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 FREE_CATEGORY_LIMIT = 3
 RESPONSES_PAGE_SIZE = 5
-PREMIUM_RENEWAL_WARN_DAYS = 7
 PREMIUM_DEFAULT_DAYS = 30
 _processing_finish: set[int] = set()
 
@@ -818,8 +818,11 @@ def format_subscription_screen(user_id: int) -> str:
         until_dt = _coerce_db_datetime(paid_until)
         if until_dt:
             days_left = (until_dt - datetime.now(timezone.utc)).days
-            if days_left <= PREMIUM_RENEWAL_WARN_DAYS:
-                status += f"\n⏳ Осталось <b>{max(days_left, 0)}</b> дн. — продлите кнопками ниже."
+            if PREMIUM_RENEWAL_REMIND_DAYS > 0 and days_left <= PREMIUM_RENEWAL_REMIND_DAYS:
+                status += (
+                    f"\n⏳ Осталось <b>{max(days_left, 0)}</b> дн. — "
+                    "продлите кнопками ниже."
+                )
     else:
         status = (
             "🆓 <b>Бесплатный доступ</b>\n"
@@ -2237,8 +2240,9 @@ async def start_cmd(message: types.Message, state: FSMContext):
         return
 
     await message.answer(
-        "👋 *Добро пожаловать!*\n\n"
-        "Выберите, как будете пользоваться ботом:",
+        "👋 *Добро пожаловать в PromoStaff Hunter!*\n\n"
+        "Бот присылает вакансии из Telegram-групп: промо, хелперы, грузчики и др.\n\n"
+        "Выберите, как будете пользоваться:",
         parse_mode="Markdown",
         reply_markup=build_role_picker_markup(),
     )
@@ -2251,7 +2255,11 @@ async def role_candidate_pick(callback: types.CallbackQuery, state: FSMContext):
     set_subscriber_role(user_id, "candidate")
     await callback.message.edit_text(
         "👷 *Режим исполнителя*\n\n"
-        "Я помогу найти подходящие вакансии.\n\n"
+        "Помогу находить вакансии и откликаться в один клик.\n\n"
+        "*Зачем анкета:* ФИО, возраст и телефон уходят работодателю при отклике — "
+        "без этого «✋ Откликнуться» не сработает.\n\n"
+        f"После выбора категорий — *пробный Premium {TRIAL_DAYS} дн.* "
+        "(push вакансий в личку и фильтр по метро).\n\n"
         "Как вас зовут? (ФИО полностью)\n\nПример: *Иван Петров*",
         parse_mode="Markdown",
     )
@@ -5548,6 +5556,14 @@ async def on_startup():
     from services.channel_promo import channel_promo_scheduler_loop
     spawn_background_task(channel_promo_scheduler_loop(bot))
     logger.info("📺 Планировщик промо канала: 09:00, 14:00, 20:00 МСК")
+
+    from services.premium_scheduler import premium_scheduler_loop
+    from config import PREMIUM_RENEWAL_REMIND_DAYS
+    spawn_background_task(premium_scheduler_loop(bot))
+    logger.info(
+        "💎 Планировщик Premium: истечение + напоминание за %s дн. (каждый час)",
+        PREMIUM_RENEWAL_REMIND_DAYS,
+    )
 
     async def channel_snapshot_loop():
         import asyncio
