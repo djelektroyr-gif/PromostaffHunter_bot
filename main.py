@@ -1485,15 +1485,21 @@ async def finish_profile_field_edit(message: types.Message, state: FSMContext, u
     await message.answer(notice, parse_mode="Markdown", reply_markup=keyboard)
     await send_profile_data_screen(message.chat.id, user_id)
 
-def build_contact_link(contact: str, text: str) -> str:
+def build_contact_link(contact: str, text: str) -> str | None:
+    """URL для inline-кнопки «Открыть чат». tg://user?id= Bot API отклоняет (BUTTON_USER_INVALID)."""
     if not contact:
         return None
     contact = contact.strip()
     if contact.startswith("@"):
-        username = contact[1:]
+        username = contact[1:].strip()
+        if not re.fullmatch(r"[a-zA-Z0-9_]{5,32}", username):
+            return None
         return f"https://t.me/{username}?text={quote(text)}"
     if contact.startswith("tg://user?id="):
-        return f"{contact}&text={quote(text)}"
+        return None
+    if contact.startswith("https://t.me/") or contact.startswith("http://t.me/"):
+        base = contact.split("?", 1)[0]
+        return f"{base}?text={quote(text)}"
     if contact.startswith("https://wa.me/") or contact.startswith("http://wa.me/"):
         return contact
     digits = re.sub(r"\D", "", contact)
@@ -1503,6 +1509,75 @@ def build_contact_link(contact: str, text: str) -> str:
         if len(digits) == 11 and digits.startswith("7"):
             return f"tel:+{digits}"
     return None
+
+
+def manual_contact_hint(contact: str | None, draft_text: str) -> str:
+    """Подсказка, если кнопку deeplink к заказчику собрать нельзя."""
+    if not contact:
+        return ""
+    if contact.startswith("tg://user?id="):
+        uid = contact.split("=", 1)[-1].split("&", 1)[0]
+        return (
+            f"\n\n_Контакт без @username (ID `{uid}`). Telegram не даёт кнопку «Открыть чат» — "
+            f"скопируйте черновик ниже и найдите заказчика вручную._\n\n"
+            f"```\n{draft_text}\n```"
+        )
+    if contact.startswith("@"):
+        return (
+            f"\n\nЕсли кнопка не открылась — напишите {escape_markdown(contact)} вручную "
+            f"и вставьте черновик:\n\n```\n{draft_text}\n```"
+        )
+    return (
+        f"\n\nКонтакт: `{escape_markdown(contact)}`. Скопируйте черновик:\n\n"
+        f"```\n{draft_text}\n```"
+    )
+
+
+async def send_user_message_safe_buttons(
+    user_id: int,
+    *,
+    topic_key: str | None = None,
+    text: str,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    """send_user_message; при BUTTON_USER_INVALID убирает url-кнопки и шлёт снова."""
+    try:
+        return await send_user_message(
+            user_id,
+            topic_key=topic_key,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if "button_user_invalid" not in err and "button_url_invalid" not in err:
+            raise
+        logger.warning("Bad inline url button for user %s: %s", user_id, e)
+        safe_rows = []
+        if reply_markup and reply_markup.inline_keyboard:
+            for row in reply_markup.inline_keyboard:
+                if all(getattr(btn, "url", None) is None for btn in row):
+                    safe_rows.append(row)
+        safe_markup = InlineKeyboardMarkup(inline_keyboard=safe_rows) if safe_rows else None
+        extra = (
+            "\n\n_Не удалось добавить кнопку «Открыть чат» — используйте контакт из сообщения "
+            "и скопируйте черновик вручную._"
+        )
+        plain_parse = parse_mode
+        if parse_mode == "Markdown":
+            text = text + extra
+        else:
+            text = text + re.sub(r"[*_`]", "", extra)
+            plain_parse = None
+        return await send_user_message(
+            user_id,
+            topic_key=topic_key,
+            text=text,
+            parse_mode=plain_parse,
+            reply_markup=safe_markup,
+        )
 
 # ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
 
@@ -3664,9 +3739,14 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
         f"📌 Источник: {escape_markdown(source_chat or '—')}\n"
         f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
-        "Нажмите кнопку ниже, откроется личный чат с заказчиком и готовым текстом анкеты.\n"
-        "Перед отправкой можно отредактировать сообщение вручную."
     )
+    if contact_link:
+        msg += (
+            "Нажмите кнопку ниже, откроется личный чат с заказчиком и готовым текстом анкеты.\n"
+            "Перед отправкой можно отредактировать сообщение вручную."
+        )
+    else:
+        msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
     buttons = []
     if contact_link:
         buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
@@ -3678,7 +3758,13 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
     add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, profile.get('photo_file_id'))
     from services.forum_topics import TOPIC_RESPONSES
-    await send_user_message(user_id, topic_key=TOPIC_RESPONSES, text=msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await send_user_message_safe_buttons(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
+        text=msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
     await send_user_message(
         user_id,
         topic_key=TOPIC_RESPONSES,
@@ -3726,9 +3812,12 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     increment_llm_usage(user_id, usage_day)
     link = build_contact_link(employer_contact, draft) if employer_contact else None
     lines = ["✨ *Улучшенный черновик:*", "", draft]
+    if not link and employer_contact:
+        lines.append(manual_contact_hint(employer_contact, draft).lstrip("\n"))
     kb = [[_inline_btn("Открыть чат", url=link, style="success")]] if link else []
-    await send_user_message(
-        user_id, topic_key=TOPIC_RESPONSES,
+    await send_user_message_safe_buttons(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
         text="\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None,
@@ -3801,11 +3890,14 @@ async def successful_payment_handler(message: types.Message):
     draft = prefix + draft
     link = build_contact_link(employer_contact, draft) if employer_contact else None
     from services.forum_topics import TOPIC_RESPONSES
+    body = "✅ *Расширенный отклик активирован!*\n\n" + draft
+    if not link and employer_contact:
+        body += manual_contact_hint(employer_contact, draft)
     kb = [[_inline_btn("Открыть чат и отправить", url=link, style="success")]] if link else []
-    await send_user_message(
+    await send_user_message_safe_buttons(
         user_id,
         topic_key=TOPIC_RESPONSES,
-        text="✅ *Расширенный отклик активирован!*\n\n" + draft,
+        text=body,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None,
     )
@@ -3881,17 +3973,28 @@ async def respond_comment_received(message: types.Message, state: FSMContext):
     link = build_contact_link(contact, draft_text)
     if not link:
         await message.answer(
-            f"⚠️ Не удалось собрать ссылку для чата. Контакт: {contact or 'не найден'}\n\n"
-            f"Скопируйте и отправьте вручную:\n\n{draft_text}"
+            "✅ Обновил черновик."
+            + manual_contact_hint(contact, draft_text),
+            parse_mode="Markdown",
         )
         await state.clear()
         return
-    await message.answer(
-        "✅ Обновил черновик. Откройте чат с заказчиком:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="✅ Открыть чат и отправить", url=link)]]
+    try:
+        await message.answer(
+            "✅ Обновил черновик. Откройте чат с заказчиком:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✅ Открыть чат и отправить", url=link)]]
+            ),
         )
-    )
+    except TelegramBadRequest as e:
+        if "button_user_invalid" in str(e).lower() or "button_url_invalid" in str(e).lower():
+            await message.answer(
+                "✅ Обновил черновик."
+                + manual_contact_hint(contact, draft_text),
+                parse_mode="Markdown",
+            )
+        else:
+            raise
     await state.clear()
 
 @dp.message(RespondWithPhotoState.waiting_for_photo)
