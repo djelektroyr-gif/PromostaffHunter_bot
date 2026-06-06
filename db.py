@@ -1092,9 +1092,41 @@ def grant_trial_if_eligible(user_id: int, trial_days: int) -> bool:
 
 PREMIUM_EXPIRED_USER_MESSAGE = (
     "⏳ *Premium закончился.*\n\n"
-    "Моментальные push отключены — новые вакансии в ленте «🔍 Посмотреть новые вакансии».\n"
-    "Оформить снова: 💎 Подписка"
+    "• Push отключён\n"
+    "• Категории сброшены — в «⚙️ Настройки» выберите *одну* бесплатную\n"
+    "• Несколько категорий и push снова — «💎 Подписка»"
 )
+
+
+def reset_premium_feed_settings(user_id: int) -> int:
+    """Сброс категорий и фильтра метро при переходе на Free. Возвращает число снятых категорий."""
+    cats = get_user_categories(user_id)
+    n = len(cats)
+    if n:
+        set_user_categories(user_id, [])
+    set_user_metro_zones(user_id, None)
+    return n
+
+
+def enforce_free_category_limit(user_id: int, free_limit: int) -> bool:
+    """
+    Если не Premium — не больше free_limit категорий; метро только у Premium.
+    Возвращает True, если что-то изменили.
+    """
+    if is_user_premium(user_id):
+        return False
+    changed = False
+    cats = get_user_categories(user_id)
+    codes = [c["code"] for c in cats]
+    if len(codes) > free_limit:
+        keep = codes[:free_limit] if free_limit > 0 else []
+        set_user_categories(user_id, keep)
+        changed = True
+    profile = get_subscriber_profile(user_id)
+    if profile and profile.get("metro_zones"):
+        set_user_metro_zones(user_id, None)
+        changed = True
+    return changed
 
 
 def _paid_until_key(value) -> str | None:
@@ -1118,6 +1150,7 @@ def downgrade_expired_premium(user_id: int) -> str | None:
     if not row:
         return None
     execute("UPDATE subscribers SET plan = 'free' WHERE user_id = ?", (user_id,))
+    reset_premium_feed_settings(user_id)
     return PREMIUM_EXPIRED_USER_MESSAGE
 
 

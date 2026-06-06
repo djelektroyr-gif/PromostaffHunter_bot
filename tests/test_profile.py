@@ -78,23 +78,21 @@ def test_toggle_user_category_atomic():
     _seed_user(user_id)
     execute("DELETE FROM user_categories WHERE user_id = ?", (user_id,))
 
-    codes, blocked = toggle_user_category(user_id, "helper", free_limit=3)
+    codes, blocked = toggle_user_category(user_id, "helper", free_limit=1)
     assert not blocked
     assert codes == ["helper"]
     assert [c["code"] for c in get_user_categories(user_id)] == ["helper"]
 
-    codes, blocked = toggle_user_category(user_id, "helper", free_limit=3)
+    codes, blocked = toggle_user_category(user_id, "helper", free_limit=1)
     assert not blocked
     assert codes == []
     assert get_user_categories(user_id) == []
 
-    toggle_user_category(user_id, "helper", free_limit=3)
-    toggle_user_category(user_id, "promoter", free_limit=3)
-    toggle_user_category(user_id, "wardrobe", free_limit=3)
-    codes, blocked = toggle_user_category(user_id, "loader", free_limit=3)
+    toggle_user_category(user_id, "helper", free_limit=1)
+    codes, blocked = toggle_user_category(user_id, "promoter", free_limit=1)
     assert blocked
-    assert len(codes) == 3
-    assert "loader" not in codes
+    assert codes == ["helper"]
+    assert "promoter" not in codes
 
 
 def test_main_keyboard_uses_new_button_labels():

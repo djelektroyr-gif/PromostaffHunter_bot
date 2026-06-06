@@ -31,6 +31,7 @@ from admin_exports import (
 from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
     SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, PREMIUM_RENEWAL_REMIND_DAYS,
+    FREE_CATEGORY_LIMIT,
     VACANCY_MAX_AGE_HOURS,
     FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS,
     FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID,
@@ -262,7 +263,6 @@ SEND_DELAY = 1  # секунда между push-вакансиями одном
 MSK_TZ = timezone(timedelta(hours=3))
 _vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллельных push-рассылок
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
-FREE_CATEGORY_LIMIT = 3
 RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
 _processing_finish: set[int] = set()
@@ -423,12 +423,28 @@ async def send_vacancy_card(
         raise
 
 
+def _free_category_hint_short() -> str:
+    if FREE_CATEGORY_LIMIT == 1:
+        return "1 категория бесплатно"
+    return f"до {FREE_CATEGORY_LIMIT} категорий на Free"
+
+
 def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> str:
+    profile = get_subscriber_profile(user_id)
+    trial_used = bool(profile and profile.get("trial_used"))
     if is_user_premium(user_id):
-        limit_line = f"💎 Premium: без лимита. Выбрано: *{selected_count}*."
+        limit_line = f"💎 Premium: все категории и push. Выбрано: *{selected_count}*."
     else:
+        trial_line = ""
+        if not trial_used and TRIAL_DAYS > 0:
+            trial_line = (
+                f"\n🎁 Пробный Premium *{TRIAL_DAYS} дн.* — все категории и push "
+                f"(один раз после «✅ Завершить выбор»)."
+            )
         limit_line = (
-            f"🆓 Free: до *{FREE_CATEGORY_LIMIT}* категорий (push — только Premium).\n"
+            f"🆓 *Free:* {_free_category_hint_short()} — только лента «🔍 Посмотреть…», без push.\n"
+            f"💎 *2 категории и больше* + моментальные push — Premium "
+            f"({escape_markdown(SUBSCRIPTION_PRICE_RUB)} ₽/мес).{trial_line}\n"
             f"Выбрано: *{selected_count}*."
         )
     hint_line = f"\n\n{hint}" if hint else ""
@@ -454,7 +470,7 @@ def build_categories_markup(selected_codes: list, user_id: int) -> InlineKeyboar
             row = []
     if not is_user_premium(user_id):
         buttons.append([InlineKeyboardButton(
-            text="💎 Premium — больше категорий и push",
+            text="💎 Premium — несколько категорий и push",
             callback_data="subscription_from_categories",
         )])
     buttons.append([InlineKeyboardButton(text="🔕 Отключить рассылку", callback_data="disable_feed")])
@@ -855,7 +871,7 @@ def format_subscription_screen(user_id: int) -> str:
         f"• моментальные push-уведомления\n"
         f"• все категории без лимита\n"
         f"• фильтр по метро/району (⚙️ Настройки → 📍 Станции метро)\n\n"
-        f"<b>Free:</b> до {FREE_CATEGORY_LIMIT} категорий, только лента без push\n\n"
+        f"<b>Free:</b> {_free_category_hint_short()}, только лента без push\n\n"
         f"{pay_heading}\n{pay_block}{trial_hint}"
     )
 
@@ -1036,7 +1052,8 @@ def build_user_help_html(user_id: int) -> str:
         "и показывает только те роли, которые вы выбрали.\n\n"
         "<b>1. Настройки</b>\n"
         f"Кнопка «⚙️ Настройки» — категории вакансий "
-        f"(хелпер, промо, грузчик…). Free: до {FREE_CATEGORY_LIMIT}, Premium: без лимита.\n"
+        f"(хелпер, промо, грузчик…). Free: {_free_category_hint_short()}, "
+        f"2+ категории — Premium.\n"
         "Нажмите «✅ Завершить выбор». Отключить рассылку — «🔕 Отключить рассылку».\n\n"
         "<b>2. Смотреть вакансии</b>\n"
         "«🔍 Посмотреть новые вакансии» — лента по вашим категориям. "
@@ -1918,6 +1935,9 @@ USER_MENU_BUTTONS = {
     "📋 Мои категории", "✏️ Изменить категории",
 }
 
+from services.ux_middleware import ChatActivityMiddleware
+dp.update.outer_middleware(ChatActivityMiddleware(USER_MENU_BUTTONS, YOUR_USER_ID))
+
 ADMIN_BTN_HUB_PARSER = "📡 Парсер"
 ADMIN_BTN_HUB_USERS = "👥 Пользователи"
 ADMIN_BTN_HUB_EXPORT = "📥 Excel"
@@ -2203,6 +2223,12 @@ async def start_cmd(message: types.Message, state: FSMContext):
     expired_msg = downgrade_expired_premium(user_id)
     if expired_msg:
         await message.answer(expired_msg, parse_mode="Markdown")
+    elif enforce_free_category_limit(user_id, FREE_CATEGORY_LIMIT):
+        await message.answer(
+            f"ℹ️ На Free доступна *{_free_category_hint_short()}*. "
+            "Лишние категории сняты — проверьте «⚙️ Настройки».",
+            parse_mode="Markdown",
+        )
 
     profile = get_subscriber_profile(user_id)
     role = get_subscriber_role(user_id)
@@ -2260,8 +2286,10 @@ async def role_candidate_pick(callback: types.CallbackQuery, state: FSMContext):
         "Помогу находить вакансии и откликаться в один клик.\n\n"
         "*Зачем анкета:* ФИО, возраст и телефон уходят работодателю при отклике — "
         "без этого «✋ Откликнуться» не сработает.\n\n"
-        f"После выбора категорий — *пробный Premium {TRIAL_DAYS} дн.* "
-        "(push вакансий в личку и фильтр по метро).\n\n"
+        f"*Тариф:* бесплатно — *1 категория* (лента без push). "
+        f"*2 категории и больше* + push — Premium ({escape_markdown(SUBSCRIPTION_PRICE_RUB)} ₽/мес).\n"
+        f"🎁 Один раз — пробный Premium *{TRIAL_DAYS} дн.* после выбора категорий "
+        "(все роли + push + метро).\n\n"
         "Как вас зовут? (ФИО полностью)\n\nПример: *Иван Петров*",
         parse_mode="Markdown",
     )
@@ -2569,7 +2597,6 @@ async def process_photo(message: types.Message, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("cat_"))
 async def select_category(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
     user_id = callback.from_user.id
     category_code = callback.data.replace("cat_", "")
     current_codes, blocked = await run_db(
@@ -2578,10 +2605,21 @@ async def select_category(callback: types.CallbackQuery):
         category_code,
         free_limit=FREE_CATEGORY_LIMIT,
     )
+    cat_name = get_category_name(category_code)
+    if blocked:
+        await safe_callback_answer(
+            callback,
+            f"На Free — {_free_category_hint_short()}. Нужно больше — Premium.",
+            show_alert=True,
+        )
+    elif category_code in current_codes:
+        await safe_callback_answer(callback, f"✅ {cat_name}")
+    else:
+        await safe_callback_answer(callback, f"− {cat_name}")
     hint = ""
     if blocked:
         hint = (
-            f"⚠️ На Free — не больше *{FREE_CATEGORY_LIMIT}* категорий.\n"
+            f"⚠️ На Free — {_free_category_hint_short()}.\n"
             "Нужно больше? Нажмите *💎 Premium* ниже."
         )
     await edit_category_picker(callback.message, current_codes, user_id, hint=hint)
@@ -2666,18 +2704,24 @@ async def finish_categories(callback: types.CallbackQuery):
         if not await run_db(is_user_premium, user_id) and len(categories) > FREE_CATEGORY_LIMIT:
             await safe_callback_answer(
                 callback,
-                f"🆓 На Free — до {FREE_CATEGORY_LIMIT} категорий. Оформите Premium.",
+                f"На Free — {_free_category_hint_short()}. Оформите Premium.",
                 show_alert=True,
             )
             return
-        await safe_callback_answer(callback)
+        await safe_callback_answer(callback, "⏳ Оформляем…")
         categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
         keyboard, _ = get_main_keyboard(user_id)
-        trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
-        await setup_forum_topics_for_user(user_id)
+        from services.chat_feedback import typing_keepalive
+        async with typing_keepalive(bot, callback.message.chat.id):
+            trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
+            await setup_forum_topics_for_user(user_id)
         trial_line = ""
         if trial_granted:
-            trial_line = f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — push и фильтр по метро!"
+            trial_line = (
+                f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — все категории, push и фильтр по метро!\n"
+                f"_После trial без оплаты останется {_free_category_hint_short()} — оформите Premium, "
+                "чтобы сохранить несколько категорий._"
+            )
         title = "✅ *Вы подписались на вакансии!*" if trial_granted else "✅ *Категории сохранены!*"
         try:
             await callback.message.delete()
@@ -2710,7 +2754,9 @@ def _response_status_label(is_closed: bool) -> str:
 
 async def send_responses_page(message: types.Message, user_id: int, page: int = 0):
     from services.response_cards import format_response_list_row, response_short_title
+    from services.chat_feedback import send_typing
 
+    await send_typing(bot, message.chat.id)
     total = count_user_responses(user_id)
     if total == 0:
         await message.answer(
@@ -2835,7 +2881,7 @@ async def show_my_responses(message: types.Message):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("resp_page_"))
 async def responses_page_callback(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Открываю…")
     try:
         page = int(callback.data.replace("resp_page_", ""))
     except ValueError:
@@ -2845,7 +2891,7 @@ async def responses_page_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("resp_list_"))
 async def responses_list_callback(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Открываю…")
     try:
         page = int(callback.data.replace("resp_list_", ""))
     except ValueError:
@@ -2855,7 +2901,7 @@ async def responses_list_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("resp_card_"))
 async def response_card_callback(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Загружаю карточку…")
     try:
         response_id = int(callback.data.replace("resp_card_", ""))
     except ValueError:
@@ -3086,7 +3132,10 @@ async def open_feed_vacancies(
     feed_mode: str,
     category_codes: list[str] | None = None,
 ):
-    all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
+    from services.chat_feedback import typing_keepalive
+
+    async with typing_keepalive(bot, message.chat.id):
+        all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
     if not all_vacancies:
         apply_metro, _ = _feed_metro_context(user_id)
         hint = "\n\nПопробуйте расширить список станций в ⚙️ Настройки → 📍 Станции метро." if apply_metro else ""
@@ -3122,7 +3171,7 @@ async def feed_mode_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("feed_fresh_"))
 async def feed_fresh_routes(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Загружаю ленту…")
     suffix = callback.data.replace("feed_fresh_", "", 1)
     if suffix == "all":
         await open_feed_vacancies(callback.message, callback.from_user.id, "fresh", None)
@@ -3132,7 +3181,7 @@ async def feed_fresh_routes(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("feed_archive_"))
 async def feed_archive_routes(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Загружаю архив…")
     suffix = callback.data.replace("feed_archive_", "", 1)
     if suffix == "all":
         await open_feed_vacancies(callback.message, callback.from_user.id, "archive", None)
@@ -3149,6 +3198,8 @@ async def feed_menu_callback(callback: types.CallbackQuery):
 
 
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
+    from services.chat_feedback import typing_keepalive
+
     data = user_pages.get(user_id)
     if not data:
         return
@@ -3161,25 +3212,26 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         return
 
     await message.answer(f"📬 *Вакансии (страница {page+1} из {(total-1)//10 + 1})*", parse_mode="Markdown")
-    for vac in vacancies[start:end]:
-        raw_pub = vac.get('published_at') or vac.get('found_at')
-        emoji, cat_name = _detected_category_display(vac.get("text") or "")
-        text = format_vacancy_card_html(
-            category_emoji=emoji,
-            category_name=cat_name,
-            freshness=get_freshness_label(raw_pub),
-            published_at=format_publication_time(raw_pub),
-            body=vac.get("text") or "",
-            source=vac.get("source") or "—",
-            message_link=vac.get("link"),
-        )
-        keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
-        try:
-            await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
-            mark_vacancy_sent_to_user(vac["id"], user_id)
-            await asyncio.sleep(0.3)
-        except Exception as e:
-            logger.error(f"Ошибка отправки вакансии: {e}")
+    async with typing_keepalive(bot, message.chat.id):
+        for vac in vacancies[start:end]:
+            raw_pub = vac.get('published_at') or vac.get('found_at')
+            emoji, cat_name = _detected_category_display(vac.get("text") or "")
+            text = format_vacancy_card_html(
+                category_emoji=emoji,
+                category_name=cat_name,
+                freshness=get_freshness_label(raw_pub),
+                published_at=format_publication_time(raw_pub),
+                body=vac.get("text") or "",
+                source=vac.get("source") or "—",
+                message_link=vac.get("link"),
+            )
+            keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
+            try:
+                await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
+                mark_vacancy_sent_to_user(vac["id"], user_id)
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"Ошибка отправки вакансии: {e}")
 
     nav_rows = []
     pager = []
@@ -3204,8 +3256,8 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
 async def vacancy_page_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     page = int(callback.data.split("_")[2])
+    await safe_callback_answer(callback, "Загружаю страницу…")
     await send_vacancy_page(callback.message, user_id, page)
-    await callback.answer()
 
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ПОЛЬЗОВАТЕЛЯ ==========
@@ -3447,6 +3499,8 @@ async def metro_zones_menu(message: types.Message, state: FSMContext):
 
 @dp.message(MetroState.waiting_for_zones)
 async def metro_zones_save(message: types.Message, state: FSMContext):
+    from services.chat_feedback import send_typing
+    await send_typing(bot, message.chat.id)
     user_id = message.from_user.id
     text = (message.text or "").strip()
     if text in USER_MENU_BUTTONS:
@@ -3590,6 +3644,8 @@ async def profile_edit_name(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ProfileEditState.waiting_for_name)
 async def profile_name_received(message: types.Message, state: FSMContext):
+    from services.chat_feedback import send_typing
+    await send_typing(bot, message.chat.id)
     full_name = (message.text or "").strip()
     if len(full_name.split()) < 2:
         await message.answer("❌ Введите полное имя и фамилию (минимум 2 слова).")
@@ -3971,7 +4027,7 @@ async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
         ])
     )
     await state.set_state(ComplaintState.waiting_for_reason)
-    await callback.answer()
+    await safe_callback_answer(callback, "Выберите причину")
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("complaint_reason_"))
 async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
@@ -3986,6 +4042,7 @@ async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "complaint_reason_other":
         await callback.message.answer("Напишите подробности жалобы (текст):")
         await state.set_state(ComplaintState.waiting_for_text)
+        await safe_callback_answer(callback, "Жду текст…")
     else:
         data = await state.get_data()
         vacancy_id = data.get("vacancy_id")
@@ -3993,7 +4050,7 @@ async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
         add_complaint(user_id, vacancy_id, reason)
         await callback.message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
         await state.clear()
-    await callback.answer()
+        await safe_callback_answer(callback, "Жалоба принята")
 
 @dp.message(ComplaintState.waiting_for_text)
 async def complaint_text(message: types.Message, state: FSMContext):
@@ -4040,26 +4097,28 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
     await callback.answer("Готовлю черновик…")
     from services.forum_topics import TOPIC_RESPONSES
+    from services.chat_feedback import typing_keepalive
     draft_status = "failed"
     try:
-        draft_status = await deliver_response_draft(
-            user_id,
-            employer_contact=employer_contact,
-            source_chat=source_chat,
-            required_fields=required_fields,
-            draft_text=draft_text,
-            vacancy_id=vacancy_id,
-        )
-        add_response(
-            user_id,
-            vacancy_id,
-            vacancy_text[:200] if vacancy_text else None,
-            vacancy_link,
-            profile.get("photo_file_id"),
-            employer_contact=employer_contact,
-            source_chat_title=source_chat,
-            draft_status=draft_status,
-        )
+        async with typing_keepalive(bot, callback.message.chat.id):
+            draft_status = await deliver_response_draft(
+                user_id,
+                employer_contact=employer_contact,
+                source_chat=source_chat,
+                required_fields=required_fields,
+                draft_text=draft_text,
+                vacancy_id=vacancy_id,
+            )
+            add_response(
+                user_id,
+                vacancy_id,
+                vacancy_text[:200] if vacancy_text else None,
+                vacancy_link,
+                profile.get("photo_file_id"),
+                employer_contact=employer_contact,
+                source_chat_title=source_chat,
+                draft_status=draft_status,
+            )
     except Exception as e:
         logger.exception("handle_response user=%s vac=%s: %s", user_id, vacancy_id, e)
         try:
@@ -4144,7 +4203,7 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     vacancy_text = row[0] or ""
     employer_contact = row[3] or extract_contact_from_text(vacancy_text)
     await callback.answer("Составляю текст…")
-    await bot.send_chat_action(callback.message.chat.id, "typing")
+    from services.chat_feedback import typing_keepalive
     from services.llm_client import ask_llm
     from services.llm_prompts import build_response_draft_prompt
     from services.forum_topics import TOPIC_RESPONSES
@@ -4155,7 +4214,8 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         category_name=get_category_name(cat_code),
         profile_summary=build_candidate_profile_text(profile),
     )
-    draft = await ask_llm(prompt)
+    async with typing_keepalive(bot, callback.message.chat.id):
+        draft = await ask_llm(prompt)
     if not draft:
         await send_user_message(
             user_id, topic_key=TOPIC_RESPONSES,
@@ -4303,7 +4363,7 @@ async def respond_add_comment(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(vacancy_id=vacancy_id)
     await callback.message.answer("✏️ Напишите, что добавить в отклик одним сообщением:")
     await state.set_state(ResponseDraftState.waiting_for_comment)
-    await callback.answer()
+    await safe_callback_answer(callback, "Жду ваш текст…")
 
 @dp.callback_query(lambda c: c.data == "respond_cancel")
 async def respond_cancel(callback: types.CallbackQuery, state: FSMContext):

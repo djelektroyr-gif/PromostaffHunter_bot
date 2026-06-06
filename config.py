@@ -28,6 +28,9 @@ FEED_ARCHIVE_MAX_HOURS = int(os.getenv("FEED_ARCHIVE_MAX_HOURS", "168"))
 # Пробный Premium при первой регистрации (дней, 0 = отключить)
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 
+# Free: сколько категорий без Premium (1 = одна бесплатно, 2+ только Premium)
+FREE_CATEGORY_LIMIT = int(os.getenv("FREE_CATEGORY_LIMIT", "1"))
+
 # За сколько дней до конца Premium/Trial слать напоминание (cron, 0 = отключить)
 PREMIUM_RENEWAL_REMIND_DAYS = int(os.getenv("PREMIUM_RENEWAL_REMIND_DAYS", "3"))
 

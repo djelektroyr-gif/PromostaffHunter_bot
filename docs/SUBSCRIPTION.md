@@ -10,13 +10,15 @@
 
 | Тариф | Как получить | Категории | Push | Метро | Срок |
 |-------|--------------|-----------|------|-------|------|
-| **Free** | по умолчанию | до 3 | нет | нет | — |
+| **Free** | по умолчанию | **1** | нет | нет | — |
 | **Trial** | один раз при «✅ Завершить выбор» категорий (`grant_trial_if_eligible`) | все | да | да | `TRIAL_DAYS` (env, default 7) |
 | **Premium** | оплата + одобрение админа или `/setplan` | все | да | да | `paid_until` в БД |
 
+**Лимит Free:** `FREE_CATEGORY_LIMIT` (env, default **1**). Вторая категория и дальше — только Premium.
+
 **Premium активен:** `plan = 'premium'` и `paid_until` в будущем (`is_user_premium()`).
 
-**Истечение:** фоновый cron (`premium_scheduler_loop`, каждый час) — downgrade + сообщение пользователю; дублируется при `/start` через `downgrade_expired_premium()`.
+**Истечение:** cron + `/start` — plan → free, **категории и метро сбрасываются** (`reset_premium_feed_settings`); на Free нужно снова выбрать одну категорию.
 
 **Напоминание:** за `PREMIUM_RENEWAL_REMIND_DAYS` дней (default 3) до `paid_until` — push в личку (cron, раз в час) и строка на экране «💎 Подписка»; один раз на период (`premium_renewal_warn_for`).
 

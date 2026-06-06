@@ -3,12 +3,15 @@ from datetime import datetime, timedelta, timezone
 
 from db import (
     downgrade_expired_premium,
+    enforce_free_category_limit,
+    get_user_categories,
     grant_trial_if_eligible,
     init_db,
     is_user_premium,
     list_expired_premium_user_ids,
     list_premium_renewal_reminder_candidates,
     mark_premium_renewal_warned,
+    set_user_categories,
 )
 from db_backend import execute, fetchone
 from services.premium_scheduler import format_premium_renewal_reminder
@@ -69,12 +72,27 @@ def test_expired_premium_list_and_downgrade(monkeypatch, tmp_path):
         (user_id, "u", "Test", until.isoformat()),
     )
     assert user_id in list_expired_premium_user_ids()
-    assert not is_user_premium(user_id)
+    set_user_categories(user_id, ["helper", "promoter"])
     msg = downgrade_expired_premium(user_id)
     assert msg is not None
+    assert get_user_categories(user_id) == []
     row = fetchone("SELECT plan FROM subscribers WHERE user_id = ?", (user_id,))
     assert row[0] == "free"
     assert downgrade_expired_premium(user_id) is None
+
+
+def test_enforce_free_category_limit_trims_excess(monkeypatch, tmp_path):
+    _setup_db(monkeypatch, tmp_path)
+    user_id = 810004
+    execute(
+        "INSERT INTO subscribers (user_id, username, first_name, is_active, plan) "
+        "VALUES (?, ?, ?, 1, 'free')",
+        (user_id, "u", "Test"),
+    )
+    set_user_categories(user_id, ["helper", "promoter", "loader"])
+    assert enforce_free_category_limit(user_id, 1)
+    codes = [c["code"] for c in get_user_categories(user_id)]
+    assert codes == ["helper"]
 
 
 def test_format_reminder_mentions_trial(monkeypatch):
