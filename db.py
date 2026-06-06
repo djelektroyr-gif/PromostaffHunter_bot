@@ -385,6 +385,21 @@ def init_db():
             f"ALTER TABLE responses ADD COLUMN star_boost BOOLEAN {bool_default_false()}",
             cur=cur,
         )
+        add_column_if_missing(
+            "responses", "employer_contact",
+            "ALTER TABLE responses ADD COLUMN employer_contact TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "responses", "source_chat_title",
+            "ALTER TABLE responses ADD COLUMN source_chat_title TEXT DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "responses", "draft_status",
+            "ALTER TABLE responses ADD COLUMN draft_status TEXT DEFAULT 'delivered'",
+            cur=cur,
+        )
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
@@ -1713,6 +1728,10 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
         vacancy_id = row[0]
         cur.execute(q("SELECT user_id FROM sent_vacancies WHERE vacancy_id = ?"), (vacancy_id,))
         users = [r[0] for r in cur.fetchall()]
+        cur.execute(q("SELECT user_id FROM responses WHERE vacancy_id = ?"), (vacancy_id,))
+        for r in cur.fetchall():
+            if r[0] not in users:
+                users.append(r[0])
         cur.execute(
             q(f"UPDATE vacancies SET is_closed = {bool_true()} WHERE id = ? OR id = ?"),
             (vacancy_id, legacy_id),
@@ -1721,11 +1740,154 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
 
 
 # ========== ОТКЛИКИ ==========
-def add_response(user_id: int, vacancy_id: str, vacancy_text: str = None, vacancy_link: str = None, user_photo_file_id: str = None):
-    execute("""
-        INSERT INTO responses (user_id, vacancy_id, vacancy_text, vacancy_link, user_photo_file_id, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-    """, (user_id, vacancy_id, vacancy_text, vacancy_link, user_photo_file_id))
+def add_response(
+    user_id: int,
+    vacancy_id: str,
+    vacancy_text: str = None,
+    vacancy_link: str = None,
+    user_photo_file_id: str = None,
+    *,
+    employer_contact: str | None = None,
+    source_chat_title: str | None = None,
+    draft_status: str = "delivered",
+):
+    execute(
+        """
+        INSERT INTO responses (
+            user_id, vacancy_id, vacancy_text, vacancy_link, user_photo_file_id,
+            status, employer_contact, source_chat_title, draft_status
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        """,
+        (
+            user_id,
+            vacancy_id,
+            vacancy_text,
+            vacancy_link,
+            user_photo_file_id,
+            employer_contact,
+            source_chat_title,
+            draft_status,
+        ),
+    )
+
+
+def delete_response(user_id: int, vacancy_id: str):
+    execute(
+        "DELETE FROM responses WHERE user_id = ? AND vacancy_id = ?",
+        (user_id, vacancy_id),
+    )
+
+
+def get_response_record(user_id: int, vacancy_id: str) -> dict | None:
+    row = fetchone(
+        """
+        SELECT r.id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
+               r.status, r.employer_contact, r.source_chat_title, r.draft_status,
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title
+        FROM responses r
+        LEFT JOIN vacancies v ON r.vacancy_id = v.id
+        WHERE r.user_id = ? AND r.vacancy_id = ?
+        """,
+        (user_id, vacancy_id),
+    )
+    return _map_response_row(row, user_id=user_id) if row else None
+
+
+def get_response_by_id(response_id: int) -> dict | None:
+    row = fetchone(
+        """
+        SELECT r.id, r.user_id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
+               r.status, r.employer_contact, r.source_chat_title, r.draft_status,
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               s.full_name, s.username, s.first_name
+        FROM responses r
+        LEFT JOIN vacancies v ON r.vacancy_id = v.id
+        LEFT JOIN subscribers s ON r.user_id = s.user_id
+        WHERE r.id = ?
+        """,
+        (response_id,),
+    )
+    if not row:
+        return None
+    resp = _map_response_row(row[2:14], user_id=row[1], response_id=row[0])
+    resp["user_full_name"] = row[14]
+    resp["user_username"] = row[15]
+    resp["user_first_name"] = row[16]
+    return resp
+
+
+def _map_response_row(row, *, user_id: int, response_id: int | None = None) -> dict:
+    if response_id is None:
+        response_id = row[0]
+        responded_at = row[1]
+        vacancy_id = row[2]
+        vacancy_text = row[3]
+        vacancy_link = row[4]
+        status = row[5]
+        employer_contact = row[6]
+        source_chat_title = row[7]
+        draft_status = row[8]
+        is_closed = row[9]
+        author_contact = row[10]
+        message_link = row[11]
+        vac_source = row[12] if len(row) > 12 else None
+    else:
+        responded_at = row[0]
+        vacancy_id = row[1]
+        vacancy_text = row[2]
+        vacancy_link = row[3]
+        status = row[4]
+        employer_contact = row[5]
+        source_chat_title = row[6]
+        draft_status = row[7]
+        is_closed = row[8]
+        author_contact = row[9]
+        message_link = row[10]
+        vac_source = row[11] if len(row) > 11 else None
+    return {
+        "id": response_id,
+        "user_id": user_id,
+        "responded_at": responded_at,
+        "vacancy_id": vacancy_id,
+        "vacancy_text": vacancy_text or "",
+        "vacancy_link": vacancy_link or message_link,
+        "status": status or "pending",
+        "employer_contact": employer_contact,
+        "source_chat_title": source_chat_title or vac_source,
+        "draft_status": draft_status or "delivered",
+        "is_closed": bool(is_closed) if is_closed is not None else False,
+        "author_contact": author_contact,
+    }
+
+
+def count_admin_responses() -> int:
+    return fetchval("SELECT COUNT(*) FROM responses", default=0)
+
+
+def get_admin_responses(limit: int = 5, offset: int = 0) -> list:
+    rows = fetchall(
+        """
+        SELECT r.id, r.user_id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
+               r.status, r.employer_contact, r.source_chat_title, r.draft_status,
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               s.full_name, s.username, s.first_name
+        FROM responses r
+        LEFT JOIN vacancies v ON r.vacancy_id = v.id
+        LEFT JOIN subscribers s ON r.user_id = s.user_id
+        ORDER BY r.responded_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    )
+    out = []
+    for row in rows:
+        resp = _map_response_row(row[2:14], user_id=row[1], response_id=row[0])
+        resp["user_full_name"] = row[14]
+        resp["user_username"] = row[15]
+        resp["user_first_name"] = row[16]
+        out.append(resp)
+    return out
 
 
 def is_already_responded(user_id: int, vacancy_id: str) -> bool:
@@ -1900,8 +2062,9 @@ def get_subscriber_registered_at(user_id: int):
 def get_user_responses(user_id: int, limit: int = 5, offset: int = 0) -> list:
     rows = fetchall(
         """
-        SELECT r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link, r.status,
-               v.is_closed, v.source_chat_title, v.author_contact, v.message_link
+        SELECT r.id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
+               r.status, r.employer_contact, r.source_chat_title, r.draft_status,
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title
         FROM responses r
         LEFT JOIN vacancies v ON r.vacancy_id = v.id
         WHERE r.user_id = ?
@@ -1910,21 +2073,7 @@ def get_user_responses(user_id: int, limit: int = 5, offset: int = 0) -> list:
         """,
         (user_id, limit, offset),
     )
-    result = []
-    for row in rows:
-        is_closed = bool(row[5]) if row[5] is not None else False
-        link = row[3] or row[8]
-        result.append({
-            "responded_at": row[0],
-            "vacancy_id": row[1],
-            "vacancy_text": row[2] or "",
-            "vacancy_link": link,
-            "status": row[4] or "pending",
-            "is_closed": is_closed,
-            "source_chat_title": row[6],
-            "author_contact": row[7],
-        })
-    return result
+    return [_map_response_row(row, user_id=user_id) for row in rows]
 
 
 def get_subscriber_by_id(user_id: int) -> dict:

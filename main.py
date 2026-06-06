@@ -355,14 +355,18 @@ def format_vacancy_card_html(
     source: str,
     message_link: str | None = None,
 ) -> str:
-    del published_at, source, message_link  # публичная карточка — без источника и ссылки на чужую группу
+    del source, message_link  # в боте не показываем группу-источник и ссылку на чужой чат
     from services.vacancy_public_text import sanitize_vacancy_public_body
 
     description = sanitize_vacancy_public_body(body or "", max_len=500)
     if not description:
         description = "Откройте карточку в боте — там кнопка «Отклик»."
+    pub_line = ""
+    if published_at and published_at not in ("сейчас", "—"):
+        pub_line = f"🕐 <i>Опубликовано: {escape_html(published_at)}</i>\n\n"
     return (
-        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n\n"
+        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n"
+        f"{pub_line}"
         f"{escape_html(description)}"
     )
 
@@ -1579,6 +1583,136 @@ async def send_user_message_safe_buttons(
             reply_markup=safe_markup,
         )
 
+
+def build_response_draft_message(
+    *,
+    employer_contact: str,
+    source_chat: str | None,
+    required_fields: list,
+    draft_text: str,
+    contact_link: str | None,
+) -> str:
+    req_line = ", ".join(required_fields) if required_fields else "явных требований не найдено"
+    msg = (
+        "📨 *Черновик отклика готов*\n\n"
+        f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
+        f"📌 Источник: {escape_markdown(source_chat or '—')}\n"
+        f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
+    )
+    if contact_link:
+        msg += (
+            "Нажмите кнопку ниже — откроется чат с заказчиком и готовым текстом.\n"
+            "Перед отправкой можно отредактировать сообщение."
+        )
+    else:
+        msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
+    return msg
+
+
+def build_response_action_keyboard(
+    user_id: int,
+    vacancy_id: str,
+    *,
+    contact_link: str | None,
+    include_stars: bool = True,
+) -> InlineKeyboardMarkup:
+    buttons = []
+    if contact_link:
+        buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
+    buttons.append([InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data=f"respond_add_{vacancy_id}")])
+    if LLM_ENABLED and is_user_premium(user_id):
+        buttons.append([_inline_btn("✨ Улучшить текст", callback_data=f"respond_llm_{vacancy_id}", style="primary")])
+    if include_stars and STARS_ENABLED and not has_star_purchase_for_vacancy(user_id, vacancy_id):
+        buttons.append([_inline_btn("⭐ Расширенный отклик", callback_data=f"star_resp_{vacancy_id}")])
+    buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def deliver_response_draft(
+    user_id: int,
+    *,
+    employer_contact: str,
+    source_chat: str | None,
+    required_fields: list,
+    draft_text: str,
+    vacancy_id: str,
+) -> str:
+    """Отправить черновик пользователю. Возвращает draft_status: delivered | manual."""
+    from services.forum_topics import TOPIC_RESPONSES
+
+    contact_link = build_contact_link(employer_contact, draft_text)
+    msg = build_response_draft_message(
+        employer_contact=employer_contact,
+        source_chat=source_chat,
+        required_fields=required_fields,
+        draft_text=draft_text,
+        contact_link=contact_link,
+    )
+    markup = build_response_action_keyboard(user_id, vacancy_id, contact_link=contact_link)
+    await send_user_message_safe_buttons(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
+        text=msg,
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    return "manual" if not contact_link else "delivered"
+
+
+async def notify_admin_response_issue(
+    user_id: int,
+    vacancy_id: str,
+    *,
+    source_chat: str | None,
+    employer_contact: str | None,
+    reason: str,
+):
+    profile = get_subscriber_profile(user_id)
+    name = (profile or {}).get("full_name") or (profile or {}).get("first_name") or str(user_id)
+    text = (
+        "⚠️ *Проблема с откликом*\n\n"
+        f"👤 {escape_markdown(name)} · `{user_id}`\n"
+        f"🆔 вакансия: `{escape_markdown(vacancy_id)}`\n"
+        f"📢 {escape_markdown(source_chat or '—')}\n"
+        f"👨‍💼 {escape_markdown(employer_contact or '—')}\n\n"
+        f"_{escape_markdown(reason)}_\n\n"
+        f"Команда: `/user {user_id}` · карточка отклика в «📋 Список откликов»"
+    )
+    try:
+        await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning("notify_admin_response_issue: %s", e)
+
+
+def _admin_response_user_label(resp: dict) -> str:
+    return resp.get("user_full_name") or resp.get("user_first_name") or resp.get("user_username") or str(resp.get("user_id"))
+
+
+def build_user_response_card_keyboard(resp: dict, *, for_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    contact = resp.get("employer_contact") or resp.get("author_contact")
+    profile = get_subscriber_profile(resp["user_id"]) if resp.get("user_id") else None
+    draft_text = build_candidate_profile_text(profile) if profile else ""
+    contact_link = build_contact_link(contact, draft_text) if contact and draft_text else None
+    if resp.get("vacancy_link"):
+        rows.append([InlineKeyboardButton(text="🔗 Вакансия", url=resp["vacancy_link"])])
+    if contact_link:
+        rows.append([InlineKeyboardButton(text="💬 Заказчик", url=contact_link)])
+    if resp.get("vacancy_id") and not for_admin:
+        rows.append([InlineKeyboardButton(text="⚠️ Пожаловаться", callback_data=f"complain_{resp['vacancy_id']}")])
+    if for_admin:
+        uid = resp["user_id"]
+        rid = resp["id"]
+        rows.append([
+            InlineKeyboardButton(text="👤 Пользователь", callback_data=f"adm_u_{uid}_0"),
+            InlineKeyboardButton(text="🔄 Черновик", callback_data=f"adm_resp_resend_{rid}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🗑 Сбросить отклик", callback_data=f"adm_resp_reset_{rid}"),
+        ])
+    rows.append([InlineKeyboardButton(text="◀️ К списку", callback_data="resp_list_0" if not for_admin else "adm_resp_list_0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 # ========== РАССЫЛКА ВАКАНСИЙ ПОДПИСЧИКАМ (без глобальных счётчиков) ==========
 
 async def dispatch_vacancy_push(order: dict):
@@ -1682,13 +1816,54 @@ async def send_vacancy_to_subscribers(order: dict):
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
+def build_closed_vacancy_markup(message_link: str | None) -> InlineKeyboardMarkup:
+    rows = []
+    if message_link:
+        rows.append([InlineKeyboardButton(text="🔗 Оригинал в группе", url=message_link)])
+    rows.append([InlineKeyboardButton(text="📨 Мои отклики", callback_data="resp_list_0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    from services.vacancy_closed_notice import format_closed_vacancy_notice_html
+
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        text = (
+            "🔒 <b>Вакансия закрыта</b>\n\n"
+            "Смена, на которую вы откликались или получали push, больше не актуальна.\n"
+            "Подробности — в «📨 Мои отклики»."
+        )
+        return text, build_closed_vacancy_markup(None)
+    message_text = row[0]
+    message_link = row[1]
+    source_chat = row[2]
+    address = row[4]
+    category_code = row[5] or "promoter"
+    text = format_closed_vacancy_notice_html(
+        category_emoji=get_category_emoji(category_code),
+        category_name=get_category_name(category_code),
+        source_chat=source_chat,
+        body=message_text,
+        address=address,
+    )
+    return text, build_closed_vacancy_markup(message_link)
+
+
 async def notify_closed_vacancies(closed_data: list):
     for vacancy_id, user_ids in closed_data:
         if not vacancy_id or not user_ids:
             continue
+        text, markup = build_closed_vacancy_notice(vacancy_id)
         for uid in user_ids:
             try:
-                await bot.send_message(uid, f"🔒 *Вакансия, на которую вы откликались или получали, больше не актуальна (закрыта).*\nID вакансии: `{vacancy_id}`", parse_mode="Markdown")
+                await bot.send_message(
+                    uid,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
             except Exception as e:
                 logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
 
@@ -2533,6 +2708,8 @@ def _response_status_label(is_closed: bool) -> str:
 
 
 async def send_responses_page(message: types.Message, user_id: int, page: int = 0):
+    from services.response_cards import format_response_list_row
+
     total = count_user_responses(user_id)
     if total == 0:
         await message.answer(
@@ -2547,65 +2724,110 @@ async def send_responses_page(message: types.Message, user_id: int, page: int = 
     pages_total = (total - 1) // RESPONSES_PAGE_SIZE + 1
     user_response_pages[user_id] = {"page": page, "total": total}
 
-    await message.answer(
-        f"📨 *Мои отклики* — страница {page + 1}/{pages_total} (всего {total})",
-        parse_mode="Markdown",
-    )
-
-    profile = get_subscriber_profile(user_id)
-    draft_text = build_candidate_profile_text(profile) if profile else ""
-
+    lines = [f"📨 *Мои отклики* — {page + 1}/{pages_total} (всего {total})", "", "Выберите карточку:"]
+    rows = []
     for i, resp in enumerate(responses, start=start + 1):
-        preview = (resp.get("vacancy_text") or "—").strip()
-        if len(preview) > 160:
-            preview = preview[:160] + "…"
-        source = resp.get("source_chat_title") or "—"
-        responded = format_db_datetime_short(resp.get("responded_at"))
-        text = (
-            f"<b>{i}.</b> {escape_html(responded)} · "
-            f"{escape_html(_response_status_label(resp.get('is_closed')))}\n"
-            f"📢 {escape_html(source)}\n\n"
-            f"{escape_html(preview)}"
-        )
-        buttons = []
-        if resp.get("vacancy_link"):
-            buttons.append([InlineKeyboardButton(text="🔗 Вакансия", url=resp["vacancy_link"])])
-        contact = resp.get("author_contact")
-        if contact and draft_text:
-            contact_link = build_contact_link(contact, draft_text)
-            if contact_link:
-                buttons.append([InlineKeyboardButton(text="💬 Заказчик", url=contact_link)])
-        if resp.get("vacancy_id"):
-            buttons.append([
-                InlineKeyboardButton(
-                    text="⚠️ Пожаловаться",
-                    callback_data=f"complain_{resp['vacancy_id']}",
-                )
-            ])
-        markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-        try:
-            await message.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
-            await asyncio.sleep(0.2)
-        except TelegramBadRequest as e:
-            logger.warning(f"send_responses_page item {i}: {e}")
-            plain = re.sub(r"<[^>]*>", "", text)
-            try:
-                await message.answer(plain, reply_markup=markup, disable_web_page_preview=True)
-            except Exception as e2:
-                logger.warning(f"send_responses_page item {i} fallback: {e2}")
-        except Exception as e:
-            logger.warning(f"send_responses_page item {i}: {e}")
-
+        lines.append(format_response_list_row(resp, i))
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📋 {i}. {(resp.get('source_chat_title') or '—')[:24]}",
+                callback_data=f"resp_card_{resp['id']}",
+            )
+        ])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"resp_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"resp_list_{page - 1}"))
     if start + len(responses) < total:
-        nav.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"resp_page_{page + 1}"))
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"resp_list_{page + 1}"))
     if nav:
-        await message.answer(
-            "Навигация:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[nav]),
-        )
+        rows.append(nav)
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def show_response_card(message: types.Message, response_id: int, *, user_id: int, for_admin: bool = False, edit: bool = False):
+    from services.response_cards import format_admin_response_card, format_user_response_card
+
+    resp = get_response_by_id(response_id)
+    if not resp:
+        text = "❌ Отклик не найден."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
+        return
+    if not for_admin and resp.get("user_id") != user_id:
+        if edit:
+            await message.edit_text("❌ Нет доступа.")
+        else:
+            await message.answer("❌ Нет доступа.")
+        return
+    if for_admin:
+        text = format_admin_response_card(resp, _admin_response_user_label(resp))
+    else:
+        text = format_user_response_card(resp)
+    markup = build_user_response_card_keyboard(resp, for_admin=for_admin)
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                await message.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+
+
+async def send_admin_responses_page(message: types.Message, page: int = 0, *, edit: bool = False):
+    from services.response_cards import format_response_list_row
+
+    total = count_admin_responses()
+    if total == 0:
+        text = "📭 Нет откликов."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
+        return
+    start = page * RESPONSES_PAGE_SIZE
+    responses = get_admin_responses(limit=RESPONSES_PAGE_SIZE, offset=start)
+    pages_total = (total - 1) // RESPONSES_PAGE_SIZE + 1
+    lines = [
+        f"📋 *Отклики* — {page + 1}/{pages_total} (всего {total})",
+        "",
+        "Карточка: вакансия · группа · заказчик · статус черновика",
+    ]
+    rows = []
+    for i, resp in enumerate(responses, start=start + 1):
+        label = _admin_response_user_label(resp)
+        if len(label) > 12:
+            label = label[:12] + "…"
+        source = (resp.get("source_chat_title") or "—")[:18]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{i}. {label} · {source}",
+                callback_data=f"adm_resp_{resp['id']}",
+            )
+        ])
+        lines.append(format_response_list_row(resp, i) + f" · 👤 {label}")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_resp_list_{page - 1}"))
+    if start + len(responses) < total:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm_resp_list_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    body = "\n".join(lines)
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
+    if edit:
+        try:
+            await message.edit_text(body, parse_mode="Markdown", reply_markup=markup)
+        except TelegramBadRequest:
+            await message.answer(body, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await message.answer(body, parse_mode="Markdown", reply_markup=markup)
 
 
 @dp.message(lambda m: m.text == "📨 Мои отклики")
@@ -2621,6 +2843,92 @@ async def responses_page_callback(callback: types.CallbackQuery):
     except ValueError:
         return
     await send_responses_page(callback.message, callback.from_user.id, page=page)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("resp_list_"))
+async def responses_list_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    try:
+        page = int(callback.data.replace("resp_list_", ""))
+    except ValueError:
+        return
+    await send_responses_page(callback.message, callback.from_user.id, page=page)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("resp_card_"))
+async def response_card_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    try:
+        response_id = int(callback.data.replace("resp_card_", ""))
+    except ValueError:
+        return
+    await show_response_card(
+        callback.message, response_id, user_id=callback.from_user.id, edit=True,
+    )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_resp_list_"))
+async def admin_responses_list_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await safe_callback_answer(callback)
+    page = int(callback.data.replace("adm_resp_list_", ""))
+    await send_admin_responses_page(callback.message, page=page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_resp_resend_"))
+async def admin_response_resend_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    resp = get_response_by_id(int(callback.data.replace("adm_resp_resend_", "")))
+    if not resp:
+        await callback.answer("Не найден", show_alert=True)
+        return
+    profile = get_subscriber_profile(resp["user_id"])
+    if not profile:
+        await callback.answer("Нет профиля", show_alert=True)
+        return
+    contact = resp.get("employer_contact") or resp.get("author_contact")
+    draft_text = build_candidate_profile_text(profile)
+    try:
+        await deliver_response_draft(
+            resp["user_id"],
+            employer_contact=contact or "—",
+            source_chat=resp.get("source_chat_title"),
+            required_fields=extract_required_fields_from_vacancy(resp.get("vacancy_text") or ""),
+            draft_text=draft_text,
+            vacancy_id=resp["vacancy_id"],
+        )
+        await callback.answer("Черновик отправлен пользователю", show_alert=True)
+    except Exception as e:
+        logger.exception("adm_resp_resend: %s", e)
+        await callback.answer(f"Ошибка: {str(e)[:80]}", show_alert=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_resp_reset_"))
+async def admin_response_reset_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    resp = get_response_by_id(int(callback.data.replace("adm_resp_reset_", "")))
+    if not resp:
+        await callback.answer("Не найден", show_alert=True)
+        return
+    delete_response(resp["user_id"], resp["vacancy_id"])
+    await safe_callback_answer(callback, "Отклик сброшен — пользователь может откликнуться снова")
+    await send_admin_responses_page(callback.message, page=0, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_resp_") and not c.data.startswith("adm_resp_list_") and not c.data.startswith("adm_resp_resend_") and not c.data.startswith("adm_resp_reset_"))
+async def admin_response_card_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await safe_callback_answer(callback)
+    response_id = int(callback.data.replace("adm_resp_", ""))
+    await show_response_card(callback.message, response_id, user_id=callback.from_user.id, for_admin=True, edit=True)
 
 
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
@@ -3731,46 +4039,99 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         return
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
-    contact_link = build_contact_link(employer_contact, draft_text)
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
-    req_line = ", ".join(required_fields) if required_fields else "явных требований не найдено"
-    msg = (
-        "📨 *Черновик отклика готов*\n\n"
-        f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
-        f"📌 Источник: {escape_markdown(source_chat or '—')}\n"
-        f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
-    )
-    if contact_link:
-        msg += (
-            "Нажмите кнопку ниже, откроется личный чат с заказчиком и готовым текстом анкеты.\n"
-            "Перед отправкой можно отредактировать сообщение вручную."
-        )
-    else:
-        msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
-    buttons = []
-    if contact_link:
-        buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
-    buttons.append([InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data=f"respond_add_{vacancy_id}")])
-    if LLM_ENABLED and is_user_premium(user_id):
-        buttons.append([_inline_btn("✨ Улучшить текст", callback_data=f"respond_llm_{vacancy_id}", style="primary")])
-    if STARS_ENABLED and not has_star_purchase_for_vacancy(user_id, vacancy_id):
-        buttons.append([_inline_btn("⭐ Расширенный отклик", callback_data=f"star_resp_{vacancy_id}")])
-    buttons.append([InlineKeyboardButton(text="🚫 Отмена", callback_data="respond_cancel")])
-    add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, profile.get('photo_file_id'))
+    await callback.answer("Готовлю черновик…")
     from services.forum_topics import TOPIC_RESPONSES
-    await send_user_message_safe_buttons(
-        user_id,
-        topic_key=TOPIC_RESPONSES,
-        text=msg,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
-    await send_user_message(
-        user_id,
-        topic_key=TOPIC_RESPONSES,
-        text="📨 Отклик сохранён — смотрите в «📨 Мои отклики».",
-    )
-    await callback.answer()
+    draft_status = "failed"
+    try:
+        draft_status = await deliver_response_draft(
+            user_id,
+            employer_contact=employer_contact,
+            source_chat=source_chat,
+            required_fields=required_fields,
+            draft_text=draft_text,
+            vacancy_id=vacancy_id,
+        )
+        add_response(
+            user_id,
+            vacancy_id,
+            vacancy_text[:200] if vacancy_text else None,
+            vacancy_link,
+            profile.get("photo_file_id"),
+            employer_contact=employer_contact,
+            source_chat_title=source_chat,
+            draft_status=draft_status,
+        )
+        await send_user_message(
+            user_id,
+            topic_key=TOPIC_RESPONSES,
+            text="📨 Отклик сохранён — карточка в «📨 Мои отклики».",
+        )
+    except Exception as e:
+        logger.exception("handle_response user=%s vac=%s: %s", user_id, vacancy_id, e)
+        try:
+            plain = build_response_draft_message(
+                employer_contact=employer_contact,
+                source_chat=source_chat,
+                required_fields=required_fields,
+                draft_text=draft_text,
+                contact_link=None,
+            )
+            await send_user_message(
+                user_id,
+                topic_key=TOPIC_RESPONSES,
+                text=plain + "\n\n_Черновик сохранён текстом — кнопка чата недоступна._",
+                parse_mode="Markdown",
+            )
+            add_response(
+                user_id,
+                vacancy_id,
+                vacancy_text[:200] if vacancy_text else None,
+                vacancy_link,
+                profile.get("photo_file_id"),
+                employer_contact=employer_contact,
+                source_chat_title=source_chat,
+                draft_status="manual",
+            )
+            await send_user_message(
+                user_id,
+                topic_key=TOPIC_RESPONSES,
+                text="📨 Отклик сохранён — «📨 Мои отклики».",
+            )
+        except Exception as e2:
+            logger.exception("handle_response fallback failed: %s", e2)
+            await notify_admin_response_issue(
+                user_id,
+                vacancy_id,
+                source_chat=source_chat,
+                employer_contact=employer_contact,
+                reason=f"Не удалось доставить черновик: {e2}",
+            )
+            try:
+                await send_user_message(
+                    user_id,
+                    topic_key=TOPIC_RESPONSES,
+                    text=(
+                        "⚠️ Не удалось отправить черновик автоматически.\n"
+                        "Напишите в «❓ Поддержка» — администратор поможет.\n\n"
+                        f"Скопируйте текст:\n\n```\n{draft_text}\n```"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+            await callback.answer(
+                "Ошибка отправки. Напишите в поддержку — мы поможем.",
+                show_alert=True,
+            )
+            return
+        await notify_admin_response_issue(
+            user_id,
+            vacancy_id,
+            source_chat=source_chat,
+            employer_contact=employer_contact,
+            reason=f"Первичная ошибка ({e}), черновик доставлен текстом.",
+        )
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_llm_"))
 async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
@@ -4394,17 +4755,7 @@ async def admin_check_button(message: types.Message):
 async def admin_responses_button(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    recent = get_recent_responses(10)
-    if not recent:
-        await message.answer("📭 Нет откликов.")
-        return
-    text = "📋 *Последние отклики:*\n\n"
-    for resp in recent:
-        time = escape_markdown(format_db_datetime_short(resp[0]))
-        name = resp[3] or resp[2] or "Пользователь"
-        preview = (resp[1][:50] + "...") if resp[1] and len(resp[1]) > 50 else (resp[1] or "—")
-        text += f"• {time} — {escape_markdown(name)}: {escape_markdown(preview)}\n"
-    await message.answer(text, parse_mode="MarkdownV2")
+    await send_admin_responses_page(message, page=0)
 
 @dp.message(lambda m: m.text == "📝 Отчёт парсера")
 async def admin_debug_button(message: types.Message):

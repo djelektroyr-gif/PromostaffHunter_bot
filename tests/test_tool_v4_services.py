@@ -39,3 +39,27 @@ def test_channel_preview_text_truncates():
     assert "@" not in text
     assert "boss123" not in text
     assert "·" in text
+
+
+def test_bot_vacancy_card_shows_publication_time():
+    import importlib.util
+    from pathlib import Path
+
+    main_path = Path(__file__).resolve().parents[1] / "main.py"
+    spec = importlib.util.spec_from_file_location("hunter_main_card", main_path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    text = mod.format_vacancy_card_html(
+        category_emoji="📦",
+        category_name="Грузчик",
+        freshness="🟢 Свежая: только что",
+        published_at="06.06.2026 16:52 МСК",
+        body="Разгрузка машины, 400 р/ч",
+        source="Secret Group",
+        message_link="https://t.me/c/123/456",
+    )
+    assert "06.06.2026 16:52 МСК" in text
+    assert "Опубликовано" in text
+    assert "Secret Group" not in text
+    assert "t.me/c" not in text
