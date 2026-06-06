@@ -408,6 +408,7 @@ VACANCY_MAX_AGE_HOURS=36
 | «Только сегодня» отсекало вечер | `is_message_recent` 36 ч |
 | Нет фильтра метро | `metro_zones` + 📍 Мои районы |
 | Telethon EOF на сервере | `create_authorized_client()` — connect без input(); алерт если нет `.session` |
+| `TypeNotFoundError` / Constructor ID | Обновить `telethon` в `requirements.txt`; один `.session` на один процесс; авто-reconnect 30 с |
 | Конфликт `cat_` postvacancy vs регистрация | Префикс `postcat_` для админ-публикации |
 
 ---

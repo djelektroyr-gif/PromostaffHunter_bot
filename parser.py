@@ -5,6 +5,7 @@ import hashlib
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon import errors
+from telethon.errors.common import TypeNotFoundError
 import asyncio
 from datetime import datetime, timezone, timedelta
 from config import (
@@ -732,6 +733,14 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                     await health_notify_callback(f"❌ *{PARSER_LABEL}*\n\n{msg}")
                 except Exception:
                     pass
+        except TypeNotFoundError as e:
+            logger.error(
+                "%s: Telegram прислал тип, неизвестный этой версии Telethon (%s). "
+                "Обычно помогает обновление telethon и перезапуск; "
+                "если повторяется — не используйте один .session файл в двух процессах.",
+                PARSER_LABEL,
+                e,
+            )
         except Exception as e:
             logger.error(f"Парсер отключился: {e}", exc_info=True)
         finally:
