@@ -1572,6 +1572,44 @@ def get_vacancies_export_rows(limit: int = 15000) -> list[dict]:
     ]
 
 
+def get_responses_export_rows(limit: int = 15000) -> list[dict]:
+    rows = fetchall(
+        q("""
+        SELECT r.id, r.responded_at, r.user_id, s.username, s.full_name, s.phone,
+               r.vacancy_id, v.category_code, r.source_chat_title, r.employer_contact,
+               r.draft_status, r.status, v.is_closed, r.star_boost, r.vacancy_link,
+               r.vacancy_text
+        FROM responses r
+        LEFT JOIN vacancies v ON r.vacancy_id = v.id
+        LEFT JOIN subscribers s ON r.user_id = s.user_id
+        ORDER BY r.responded_at DESC
+        LIMIT ?
+        """),
+        (limit,),
+    )
+    return [
+        {
+            "id": r[0],
+            "responded_at": r[1],
+            "user_id": r[2],
+            "username": r[3],
+            "full_name": r[4],
+            "phone": r[5],
+            "vacancy_id": r[6],
+            "category_code": r[7],
+            "source_chat_title": r[8],
+            "employer_contact": r[9],
+            "draft_status": r[10] or "pending",
+            "response_status": r[11] or "pending",
+            "vacancy_closed": bool(r[12]) if r[12] is not None else False,
+            "star_boost": bool(r[13]) if r[13] is not None else False,
+            "vacancy_link": r[14],
+            "vacancy_text": r[15],
+        }
+        for r in rows
+    ]
+
+
 def get_employers_export_rows(limit: int = 15000) -> list[dict]:
     rows = fetchall(q(f"""
         SELECT id, telegram_user_id, username, display_name, contact_text, contact_source,
@@ -1837,7 +1875,8 @@ def get_response_record(user_id: int, vacancy_id: str) -> dict | None:
         """
         SELECT r.id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
                r.status, r.employer_contact, r.source_chat_title, r.draft_status,
-               v.is_closed, v.author_contact, v.message_link, v.source_chat_title
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               v.category_code
         FROM responses r
         LEFT JOIN vacancies v ON r.vacancy_id = v.id
         WHERE r.user_id = ? AND r.vacancy_id = ?
@@ -1853,6 +1892,7 @@ def get_response_by_id(response_id: int) -> dict | None:
         SELECT r.id, r.user_id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
                r.status, r.employer_contact, r.source_chat_title, r.draft_status,
                v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               v.category_code,
                s.full_name, s.username, s.first_name
         FROM responses r
         LEFT JOIN vacancies v ON r.vacancy_id = v.id
@@ -1863,10 +1903,10 @@ def get_response_by_id(response_id: int) -> dict | None:
     )
     if not row:
         return None
-    resp = _map_response_row(row[2:14], user_id=row[1], response_id=row[0])
-    resp["user_full_name"] = row[14]
-    resp["user_username"] = row[15]
-    resp["user_first_name"] = row[16]
+    resp = _map_response_row(row[2:15], user_id=row[1], response_id=row[0])
+    resp["user_full_name"] = row[15]
+    resp["user_username"] = row[16]
+    resp["user_first_name"] = row[17]
     return resp
 
 
@@ -1885,6 +1925,7 @@ def _map_response_row(row, *, user_id: int, response_id: int | None = None) -> d
         author_contact = row[10]
         message_link = row[11]
         vac_source = row[12] if len(row) > 12 else None
+        category_code = row[13] if len(row) > 13 else None
     else:
         responded_at = row[0]
         vacancy_id = row[1]
@@ -1898,6 +1939,7 @@ def _map_response_row(row, *, user_id: int, response_id: int | None = None) -> d
         author_contact = row[9]
         message_link = row[10]
         vac_source = row[11] if len(row) > 11 else None
+        category_code = row[12] if len(row) > 12 else None
     return {
         "id": response_id,
         "user_id": user_id,
@@ -1908,9 +1950,10 @@ def _map_response_row(row, *, user_id: int, response_id: int | None = None) -> d
         "status": status or "pending",
         "employer_contact": employer_contact,
         "source_chat_title": source_chat_title or vac_source,
-        "draft_status": draft_status or "delivered",
+        "draft_status": draft_status or "pending",
         "is_closed": bool(is_closed) if is_closed is not None else False,
         "author_contact": author_contact,
+        "category_code": category_code,
     }
 
 
@@ -1924,6 +1967,7 @@ def get_admin_responses(limit: int = 5, offset: int = 0) -> list:
         SELECT r.id, r.user_id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
                r.status, r.employer_contact, r.source_chat_title, r.draft_status,
                v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               v.category_code,
                s.full_name, s.username, s.first_name
         FROM responses r
         LEFT JOIN vacancies v ON r.vacancy_id = v.id
@@ -1935,10 +1979,10 @@ def get_admin_responses(limit: int = 5, offset: int = 0) -> list:
     )
     out = []
     for row in rows:
-        resp = _map_response_row(row[2:14], user_id=row[1], response_id=row[0])
-        resp["user_full_name"] = row[14]
-        resp["user_username"] = row[15]
-        resp["user_first_name"] = row[16]
+        resp = _map_response_row(row[2:15], user_id=row[1], response_id=row[0])
+        resp["user_full_name"] = row[15]
+        resp["user_username"] = row[16]
+        resp["user_first_name"] = row[17]
         out.append(resp)
     return out
 
@@ -2117,7 +2161,8 @@ def get_user_responses(user_id: int, limit: int = 5, offset: int = 0) -> list:
         """
         SELECT r.id, r.responded_at, r.vacancy_id, r.vacancy_text, r.vacancy_link,
                r.status, r.employer_contact, r.source_chat_title, r.draft_status,
-               v.is_closed, v.author_contact, v.message_link, v.source_chat_title
+               v.is_closed, v.author_contact, v.message_link, v.source_chat_title,
+               v.category_code
         FROM responses r
         LEFT JOIN vacancies v ON r.vacancy_id = v.id
         WHERE r.user_id = ?

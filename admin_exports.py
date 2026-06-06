@@ -144,6 +144,50 @@ def build_notfit_xlsx(rows: list[dict]) -> bytes:
     return _workbook_to_bytes(wb)
 
 
+DRAFT_STATUS_EXPORT_LABELS = {
+    "delivered": "Черновик готов (кнопка в боте)",
+    "manual": "Вручную (без кнопки чата)",
+    "failed": "Сбой доставки черновика",
+    "pending": "В обработке",
+}
+
+
+def build_responses_xlsx(rows: list[dict]) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Отклики"
+    columns = [
+        ("id", "ID отклика"),
+        ("responded_at", "Дата отклика"),
+        ("user_id", "ID пользователя"),
+        ("username", "Username"),
+        ("full_name", "ФИО"),
+        ("phone", "Телефон"),
+        ("vacancy_id", "ID вакансии"),
+        ("category_code", "Категория"),
+        ("source_chat_title", "Чат-источник"),
+        ("employer_contact", "Контакт заказчика"),
+        ("draft_status", "Код статуса черновика"),
+        ("draft_status_label", "Статус черновика"),
+        ("response_status", "Статус отклика"),
+        ("vacancy_closed", "Вакансия закрыта"),
+        ("star_boost", "Расширенный отклик (Stars)"),
+        ("vacancy_link", "Ссылка на пост"),
+        ("vacancy_text", "Текст вакансии (фрагмент)"),
+    ]
+    enriched = []
+    for r in rows:
+        code = r.get("draft_status") or "pending"
+        enriched.append({
+            **r,
+            "draft_status_label": DRAFT_STATUS_EXPORT_LABELS.get(code, code),
+            "vacancy_closed": "да" if r.get("vacancy_closed") else "нет",
+            "star_boost": "да" if r.get("star_boost") else "нет",
+        })
+    _write_sheet(ws, columns, enriched)
+    return _workbook_to_bytes(wb)
+
+
 def build_employers_xlsx(rows: list[dict]) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active

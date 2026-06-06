@@ -11,7 +11,6 @@ def format_closed_vacancy_notice_html(
     *,
     category_emoji: str,
     category_name: str,
-    source_chat: str | None,
     body: str | None,
     address: str | None = None,
 ) -> str:
@@ -22,7 +21,6 @@ def format_closed_vacancy_notice_html(
         "Смена, на которую вы <b>откликались</b> или получали push, больше не актуальна.",
         "",
         f"{category_emoji} <b>{escape_html(category_name)}</b>",
-        f"📢 {escape_html(source_chat or '—')}",
     ]
     if address and str(address).strip():
         lines.append(f"📍 {escape_html(str(address).strip())}")

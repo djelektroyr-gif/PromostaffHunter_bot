@@ -26,7 +26,7 @@ from parser import (
 )
 from admin_exports import (
     build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
-    build_notfit_xlsx, export_filename,
+    build_notfit_xlsx, build_responses_xlsx, export_filename,
 )
 from config import (
     BOT_TOKEN, YOUR_USER_ID, SUBSCRIPTION_PAY_URL, SUBSCRIPTION_SUPPORT,
@@ -1587,7 +1587,6 @@ async def send_user_message_safe_buttons(
 def build_response_draft_message(
     *,
     employer_contact: str,
-    source_chat: str | None,
     required_fields: list,
     draft_text: str,
     contact_link: str | None,
@@ -1596,13 +1595,13 @@ def build_response_draft_message(
     msg = (
         "📨 *Черновик отклика готов*\n\n"
         f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
-        f"📌 Источник: {escape_markdown(source_chat or '—')}\n"
         f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
     )
     if contact_link:
         msg += (
             "Нажмите кнопку ниже — откроется чат с заказчиком и готовым текстом.\n"
-            "Перед отправкой можно отредактировать сообщение."
+            "Перед отправкой можно отредактировать сообщение.\n\n"
+            "_Карточка отклика — в «📨 Мои отклики». Заказчику нужно отправить сообщение вручную кнопкой выше._"
         )
     else:
         msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
@@ -1643,7 +1642,6 @@ async def deliver_response_draft(
     contact_link = build_contact_link(employer_contact, draft_text)
     msg = build_response_draft_message(
         employer_contact=employer_contact,
-        source_chat=source_chat,
         required_fields=required_fields,
         draft_text=draft_text,
         contact_link=contact_link,
@@ -1694,8 +1692,8 @@ def build_user_response_card_keyboard(resp: dict, *, for_admin: bool = False) ->
     profile = get_subscriber_profile(resp["user_id"]) if resp.get("user_id") else None
     draft_text = build_candidate_profile_text(profile) if profile else ""
     contact_link = build_contact_link(contact, draft_text) if contact and draft_text else None
-    if resp.get("vacancy_link"):
-        rows.append([InlineKeyboardButton(text="🔗 Вакансия", url=resp["vacancy_link"])])
+    if for_admin and resp.get("vacancy_link"):
+        rows.append([InlineKeyboardButton(text="🔗 Оригинал в группе", url=resp["vacancy_link"])])
     if contact_link:
         rows.append([InlineKeyboardButton(text="💬 Заказчик", url=contact_link)])
     if resp.get("vacancy_id") and not for_admin:
@@ -1816,12 +1814,10 @@ async def send_vacancy_to_subscribers(order: dict):
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
-def build_closed_vacancy_markup(message_link: str | None) -> InlineKeyboardMarkup:
-    rows = []
-    if message_link:
-        rows.append([InlineKeyboardButton(text="🔗 Оригинал в группе", url=message_link)])
-    rows.append([InlineKeyboardButton(text="📨 Мои отклики", callback_data="resp_list_0")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def build_closed_vacancy_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Мои отклики", callback_data="resp_list_0")],
+    ])
 
 
 def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1834,20 +1830,17 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
             "Смена, на которую вы откликались или получали push, больше не актуальна.\n"
             "Подробности — в «📨 Мои отклики»."
         )
-        return text, build_closed_vacancy_markup(None)
+        return text, build_closed_vacancy_markup()
     message_text = row[0]
-    message_link = row[1]
-    source_chat = row[2]
     address = row[4]
     category_code = row[5] or "promoter"
     text = format_closed_vacancy_notice_html(
         category_emoji=get_category_emoji(category_code),
         category_name=get_category_name(category_code),
-        source_chat=source_chat,
         body=message_text,
         address=address,
     )
-    return text, build_closed_vacancy_markup(message_link)
+    return text, build_closed_vacancy_markup()
 
 
 async def notify_closed_vacancies(closed_data: list):
@@ -1968,7 +1961,8 @@ def get_admin_export_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📥 Excel: подписчики"), KeyboardButton(text="📥 Excel: вакансии")],
-            [KeyboardButton(text="📥 Excel: заказчики"), KeyboardButton(text="📥 Excel: не подходит")],
+            [KeyboardButton(text="📥 Excel: заказчики"), KeyboardButton(text="📥 Excel: отклики")],
+            [KeyboardButton(text="📥 Excel: не подходит")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
         resize_keyboard=True,
@@ -2144,7 +2138,7 @@ ADMIN_MENU_BUTTONS = {
     "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат",
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
-    "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
+    "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
     "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
     "📣 Вакансия в канал", "📣 В канал", "📝 Новость в канал", "📢 Промо в канал",
     "✏️ Тексты промо",
@@ -2705,7 +2699,7 @@ def _response_status_label(is_closed: bool) -> str:
 
 
 async def send_responses_page(message: types.Message, user_id: int, page: int = 0):
-    from services.response_cards import format_response_list_row
+    from services.response_cards import format_response_list_row, response_short_title
 
     total = count_user_responses(user_id)
     if total == 0:
@@ -2727,7 +2721,7 @@ async def send_responses_page(message: types.Message, user_id: int, page: int = 
         lines.append(format_response_list_row(resp, i))
         rows.append([
             InlineKeyboardButton(
-                text=f"📋 {i}. {(resp.get('source_chat_title') or '—')[:24]}",
+                text=f"📋 {i}. {response_short_title(resp, max_len=24)}",
                 callback_data=f"resp_card_{resp['id']}",
             )
         ])
@@ -2778,7 +2772,7 @@ async def show_response_card(message: types.Message, response_id: int, *, user_i
 
 
 async def send_admin_responses_page(message: types.Message, page: int = 0, *, edit: bool = False):
-    from services.response_cards import format_response_list_row
+    from services.response_cards import format_admin_response_list_row
 
     total = count_admin_responses()
     if total == 0:
@@ -2794,21 +2788,18 @@ async def send_admin_responses_page(message: types.Message, page: int = 0, *, ed
     lines = [
         f"📋 *Отклики* — {page + 1}/{pages_total} (всего {total})",
         "",
-        "Карточка: вакансия · группа · заказчик · статус черновика",
+        "Строка: группа · статус черновика · кандидат",
     ]
     rows = []
     for i, resp in enumerate(responses, start=start + 1):
         label = _admin_response_user_label(resp)
-        if len(label) > 12:
-            label = label[:12] + "…"
-        source = (resp.get("source_chat_title") or "—")[:18]
         rows.append([
             InlineKeyboardButton(
-                text=f"{i}. {label} · {source}",
+                text=f"{i}. {label[:14]}{'…' if len(label) > 14 else ''}",
                 callback_data=f"adm_resp_{resp['id']}",
             )
         ])
-        lines.append(format_response_list_row(resp, i) + f" · 👤 {label}")
+        lines.append(format_admin_response_list_row(resp, i, label))
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_resp_list_{page - 1}"))
@@ -4059,17 +4050,11 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             source_chat_title=source_chat,
             draft_status=draft_status,
         )
-        await send_user_message(
-            user_id,
-            topic_key=TOPIC_RESPONSES,
-            text="📨 Отклик сохранён — карточка в «📨 Мои отклики».",
-        )
     except Exception as e:
         logger.exception("handle_response user=%s vac=%s: %s", user_id, vacancy_id, e)
         try:
             plain = build_response_draft_message(
                 employer_contact=employer_contact,
-                source_chat=source_chat,
                 required_fields=required_fields,
                 draft_text=draft_text,
                 contact_link=None,
@@ -4093,7 +4078,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             await send_user_message(
                 user_id,
                 topic_key=TOPIC_RESPONSES,
-                text="📨 Отклик сохранён — «📨 Мои отклики».",
+                text="📨 Отклик сохранён — «📨 Мои отклики». Отправьте сообщение заказчику вручную.",
             )
         except Exception as e2:
             logger.exception("handle_response fallback failed: %s", e2)
@@ -5073,6 +5058,14 @@ async def admin_export_employers(message: types.Message):
     await _send_admin_xlsx(
         message, "Заказчики", "employers",
         build_employers_xlsx, get_employers_export_rows,
+    )
+
+
+@dp.message(lambda m: m.text == "📥 Excel: отклики")
+async def admin_export_responses(message: types.Message):
+    await _send_admin_xlsx(
+        message, "📥 *Отклики* — Excel",
+        "responses", build_responses_xlsx, get_responses_export_rows,
     )
 
 
