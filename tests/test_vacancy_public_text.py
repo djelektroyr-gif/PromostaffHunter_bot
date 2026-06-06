@@ -26,6 +26,19 @@ def test_sanitize_strips_group_bot_header_and_contacts():
     assert "2000" in out
 
 
+def test_sanitize_strips_source_channel_header_line():
+    raw = (
+        "📢 Грузчики МОСКВА\n"
+        "Москва, Волгоградский проспект, 42\n"
+        "07.06 к 10:00 4 человека\n"
+        "500/4/2000, оплата после смены"
+    )
+    out = sanitize_vacancy_public_body(raw, source_chat_title="Грузчики МОСКВА")
+    assert "Грузчики МОСКВА" not in out
+    assert "Волгоградский" in out
+    assert "500" in out
+
+
 def test_sanitize_keeps_job_details():
     raw = (
         "⚡️ РАЗНОРАБОЧИЕ ЗАВТРА СРОЧНО ⚡️\n"

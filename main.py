@@ -1835,6 +1835,7 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
         )
         return text, build_closed_vacancy_markup()
     message_text = row[0]
+    source_chat_title = row[2]
     address = row[4]
     category_code = row[5] or "promoter"
     text = format_closed_vacancy_notice_html(
@@ -1842,6 +1843,7 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
         category_name=get_category_name(category_code),
         body=message_text,
         address=address,
+        source_chat_title=source_chat_title,
     )
     return text, build_closed_vacancy_markup()
 

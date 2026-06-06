@@ -16,6 +16,18 @@ def test_closed_notice_has_category_and_preview():
     assert "ID вакансии" not in text
 
 
+def test_closed_notice_strips_source_from_body():
+    text = format_closed_vacancy_notice_html(
+        category_emoji="📦",
+        category_name="Грузчик",
+        body="📢 Грузчики МОСКВА\nМосква, ул. Пример, 1\n500/4/2000",
+        address="Москва",
+        source_chat_title="Грузчики МОСКВА",
+    )
+    assert "Грузчики МОСКВА" not in text
+    assert "Пример" in text
+
+
 def test_closed_notice_without_body():
     text = format_closed_vacancy_notice_html(
         category_emoji="📦",

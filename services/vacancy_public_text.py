@@ -12,6 +12,8 @@ _BOILERPLATE_LINE_RES = (
     re.compile(r"^\s*зарегистрирован\s*:", re.I),
     re.compile(r"^\s*бот для отправки", re.I),
     re.compile(r"^\s*https?://t\.me/\S+\s*$", re.I),
+    # Шапка «название группы-источника» в тексте парсера (📢 Грузчики МОСКВА и т.п.)
+    re.compile(r"^\s*📢\s+\S", re.I),
 )
 
 _CONTACT_PATTERNS = (
@@ -72,14 +74,28 @@ def _line_is_contact_only(line: str) -> bool:
     return len(cleaned) < 3
 
 
-def sanitize_vacancy_public_body(text: str, *, max_len: int = 500) -> str:
+def _matches_source_title(line: str, source_chat_title: str | None) -> bool:
+    title = (source_chat_title or "").strip()
+    if not title:
+        return False
+    stripped = line.strip()
+    bare = re.sub(r"^\s*📢\s*", "", stripped, flags=re.I).strip()
+    return bare == title or title in stripped
+
+
+def sanitize_vacancy_public_body(
+    text: str,
+    *,
+    max_len: int = 500,
+    source_chat_title: str | None = None,
+) -> str:
     """Описание для канала и push-карточек: без контактов и шапки группы."""
     if not text:
         return ""
     kept: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or _is_boilerplate_line(line):
+        if not line or _is_boilerplate_line(line) or _matches_source_title(line, source_chat_title):
             continue
         cleaned = _strip_contacts_from_line(line)
         if _line_is_contact_only(cleaned):

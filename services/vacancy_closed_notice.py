@@ -13,8 +13,13 @@ def format_closed_vacancy_notice_html(
     category_name: str,
     body: str | None,
     address: str | None = None,
+    source_chat_title: str | None = None,
 ) -> str:
-    preview = sanitize_vacancy_public_body(body or "", max_len=280)
+    preview = sanitize_vacancy_public_body(
+        body or "",
+        max_len=280,
+        source_chat_title=source_chat_title,
+    )
     lines = [
         "🔒 <b>Вакансия закрыта</b>",
         "",
