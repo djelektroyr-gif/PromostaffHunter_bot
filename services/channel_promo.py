@@ -11,31 +11,13 @@ from aiogram.types import InlineKeyboardMarkup
 from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
 from db import get_channel_promo_times, is_channel_promo_enabled, is_promo_sent_for_msk_date, mark_promo_sent, record_channel_post
 from services.channel_policy import msk_now
+from services.channel_promo_texts import pick_promo_text
 from services.telegram_buttons import styled_inline_button
 
 if TYPE_CHECKING:
     from aiogram import Bot
 
 logger = logging.getLogger(__name__)
-
-PROMO_VARIANTS = [
-    (
-        "<b>🎯 Вакансии под вашу роль — в боте</b>\n\n"
-        "Выберите категорию (промо, хелпер, грузчик…), получайте push и "
-        "откликайтесь в один тап — без лишних чатов."
-    ),
-    (
-        "<b>📬 PromoStaff Hunter</b>\n\n"
-        "Подпишитесь на бота — целевые вакансии по вашим категориям и метро. "
-        "Отклик с анкетой прямо из Telegram."
-    ),
-    (
-        "<b>👷 Ищете смену?</b>\n\n"
-        "В канале — превью. В боте — полные карточки, фильтры и отклики. "
-        "Premium: моментальный push по выбранным станциям метро."
-    ),
-]
-
 
 def build_channel_promo_keyboard() -> InlineKeyboardMarkup:
     bot_user = (BOT_USERNAME or "PromostaffHunter_bot").lstrip("@")
@@ -57,10 +39,6 @@ def build_channel_promo_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def pick_promo_text(slot_index: int) -> str:
-    return PROMO_VARIANTS[slot_index % len(PROMO_VARIANTS)]
-
-
 async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index: int | None = None, manual: bool = False) -> bool:
     if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
         return False
@@ -78,7 +56,7 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
     text = pick_promo_text(idx)
     markup = build_channel_promo_keyboard()
     try:
-        await bot.send_message(
+        msg = await bot.send_message(
             HUNTER_CHANNEL_ID,
             text,
             parse_mode="HTML",
@@ -87,7 +65,11 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
         )
         if slot and not manual:
             mark_promo_sent(promo_slot, sent_date)
-        post_key = f"promo:manual:{msg.message_id}" if manual else f"promo:{sent_date}:{promo_slot}"
+        post_key = (
+            f"promo:manual:{msg.message_id}"
+            if manual
+            else f"promo:{sent_date}:{promo_slot}"
+        )
         record_channel_post(
             post_key,
             post_kind="promo",

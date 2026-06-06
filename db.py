@@ -559,6 +559,41 @@ def set_channel_setting(key: str, value: str):
     )
 
 
+def delete_channel_setting(key: str):
+    execute("DELETE FROM channel_settings WHERE key = ?", (key,))
+
+
+def get_channel_promo_texts_from_db() -> list[str] | None:
+    import json
+
+    raw = get_channel_setting("promo_texts")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        variants = [str(x).strip() for x in data if str(x).strip()]
+    elif isinstance(data, dict):
+        items = data.get("variants")
+        variants = [str(x).strip() for x in (items or []) if str(x).strip()] if isinstance(items, list) else []
+    else:
+        return None
+    return variants or None
+
+
+def set_channel_promo_texts_in_db(variants: list[str]):
+    import json
+
+    payload = json.dumps({"variants": variants}, ensure_ascii=False)
+    set_channel_setting("promo_texts", payload)
+
+
+def clear_channel_promo_texts_override():
+    delete_channel_setting("promo_texts")
+
+
 def get_channel_settings_dict() -> dict:
     rows = fetchall("SELECT key, value FROM channel_settings")
     merged = dict(CHANNEL_SETTING_DEFAULTS)

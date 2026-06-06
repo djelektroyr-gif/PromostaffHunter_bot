@@ -690,6 +690,70 @@ async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown
         start += chunk_size
         await asyncio.sleep(0.2)
 
+
+async def answer_admin_report(message: types.Message, text: str):
+    """Отчёт админу: Markdown, при ошибке разметки — plain text."""
+    try:
+        if len(text) > 3800:
+            await send_long_message(message.chat.id, text, parse_mode="Markdown")
+        else:
+            await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+    except TelegramBadRequest as e:
+        logger.warning("answer_admin_report Markdown failed: %s", e)
+        plain = re.sub(r"[*_`]", "", text)
+        if len(plain) > 3800:
+            await send_long_message(message.chat.id, plain, parse_mode=None)
+        else:
+            await message.answer(plain, disable_web_page_preview=True)
+
+
+async def admin_fsm_menu_escape(message: types.Message, state: FSMContext) -> bool:
+    """Выход из FSM по кнопке админ-меню + сразу выполнить действие."""
+    if message.from_user.id != YOUR_USER_ID or message.text not in ADMIN_MENU_BUTTONS:
+        return False
+    await state.clear()
+    text = message.text
+    if text == ADMIN_BTN_BACK:
+        await message.answer("🏠 Главное админ-меню", reply_markup=get_admin_hub_keyboard())
+    elif text == "📝 Отчёт парсера":
+        await send_parser_debug_report(message)
+    elif text == "📊 Шум по чатам":
+        await send_chat_noise_report(message)
+    elif text == "📡 Парсер":
+        await message.answer(
+            "📡 *Парсер* — чаты, прогон, качество ленты.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_parser_keyboard(),
+        )
+    elif text == "📺 Канал":
+        await message.answer(
+            "📺 *Канал* — лимиты, промо, новости и статистика.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_channel_keyboard(),
+        )
+    elif text == "✏️ Тексты промо":
+        await message.answer("✏️ Редактор текстов автопромо.", reply_markup=get_admin_channel_keyboard())
+        await send_promo_texts_admin_screen(message)
+    else:
+        await message.answer(
+            f"Сценарий отменён. Нажмите «{text}» ещё раз, если нужно.",
+            reply_markup=get_admin_hub_keyboard(),
+        )
+    return True
+
+
+async def send_parser_debug_report(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await answer_admin_report(message, get_last_debug_report())
+
+
+async def send_chat_noise_report(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    from parser import LAST_DEBUG_STATS, format_chat_noise_report
+    await answer_admin_report(message, format_chat_noise_report(LAST_DEBUG_STATS))
+
 def build_admin_dashboard_text() -> str:
     stats = get_admin_stats()
     parser = get_parser_status_snapshot()
@@ -908,6 +972,10 @@ class ChannelPostState(StatesGroup):
 
 class ChannelCustomPostState(StatesGroup):
     waiting_content = State()
+
+
+class ChannelPromoTextState(StatesGroup):
+    waiting_text = State()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
@@ -1672,7 +1740,7 @@ def get_admin_channel_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="📺 Статус канала"), KeyboardButton(text="📊 Статистика канала")],
             [KeyboardButton(text="📣 Вакансия в канал"), KeyboardButton(text="📝 Новость в канал")],
-            [KeyboardButton(text="📢 Промо в канал")],
+            [KeyboardButton(text="📢 Промо в канал"), KeyboardButton(text="✏️ Тексты промо")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
         resize_keyboard=True,
@@ -1758,6 +1826,36 @@ async def send_channel_admin_status(message: types.Message, *, edit: bool = Fals
         await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
 
+def build_promo_texts_inline_keyboard() -> InlineKeyboardMarkup:
+    from db import get_channel_promo_times
+
+    times = get_channel_promo_times()
+    rows = []
+    for i, slot_time in enumerate(times[:6]):
+        rows.append([_inline_btn(f"✏️ Слот {i + 1} ({slot_time})", callback_data=f"ch_promo_edit_{i}")])
+    rows.append([
+        _inline_btn("📂 Из файла", callback_data="ch_promo_file"),
+        _inline_btn("🗑 Сброс", callback_data="ch_promo_reset"),
+    ])
+    rows.append([_inline_btn("👁 Превью всех", callback_data="ch_promo_preview")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_promo_texts_admin_screen(message: types.Message, *, edit: bool = False):
+    from services.channel_promo_texts import format_promo_texts_admin_summary
+
+    text = format_promo_texts_admin_summary()
+    markup = build_promo_texts_inline_keyboard()
+    if edit:
+        try:
+            await message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest as e:
+            if "message is not modified" not in str(e).lower():
+                raise
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+
 def build_custom_post_confirm_keyboard(with_bot_button: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_inline_btn("✅ Опубликовать", callback_data="ch_custom_pub", style="success")],
@@ -1798,6 +1896,8 @@ ADMIN_MENU_BUTTONS = {
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
     "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
+    "📣 Вакансия в канал", "📣 В канал", "📝 Новость в канал", "📢 Промо в канал",
+    "✏️ Тексты промо",
     "📣 В канал", "📣 Вакансия в канал", "📝 Новость в канал", "📢 Промо в канал",
     "📖 Как пользоваться", "📖 Справка", "❌ Закрыть меню",
 }
@@ -3928,9 +4028,7 @@ async def check_now_cmd(message: types.Message):
 
 @dp.message(Command("debug_last"))
 async def debug_last_cmd(message: types.Message):
-    if message.from_user.id != YOUR_USER_ID:
-        return
-    await message.answer(get_last_debug_report(), parse_mode="Markdown")
+    await send_parser_debug_report(message)
 
 @dp.message(Command("usercards"))
 async def usercards_cmd(message: types.Message):
@@ -3982,8 +4080,7 @@ async def broadcast_cmd(message: types.Message, state: FSMContext):
 async def broadcast_text_received(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
         return
-    if message.text in ADMIN_MENU_BUTTONS:
-        await state.clear()
+    if await admin_fsm_menu_escape(message, state):
         return
     preview = message.text[:500]
     await state.update_data(broadcast_text=message.text)
@@ -4049,8 +4146,7 @@ async def add_chat_cmd(message: types.Message, state: FSMContext):
 
 @dp.message(AddChatState.waiting_for_link)
 async def process_add_chat(message: types.Message, state: FSMContext):
-    if message.from_user.id == YOUR_USER_ID and message.text in ADMIN_MENU_BUTTONS:
-        await state.clear()
+    if await admin_fsm_menu_escape(message, state):
         return
     chat_link = normalize_chat_link(message.text)
     if not chat_link:
@@ -4209,8 +4305,7 @@ async def admin_responses_button(message: types.Message):
 
 @dp.message(lambda m: m.text == "📝 Отчёт парсера")
 async def admin_debug_button(message: types.Message):
-    if message.from_user.id == YOUR_USER_ID:
-        await debug_last_cmd(message)
+    await send_parser_debug_report(message)
 
 @dp.message(lambda m: m.text == "👥 Список подписчиков")
 async def admin_subscribers_button(message: types.Message):
@@ -4583,11 +4678,7 @@ async def admin_nav_back(message: types.Message):
 
 @dp.message(lambda m: m.text == "📊 Шум по чатам")
 async def admin_chat_noise_button(message: types.Message):
-    if message.from_user.id != YOUR_USER_ID:
-        return
-    from parser import LAST_DEBUG_STATS, format_chat_noise_report
-    report = format_chat_noise_report(LAST_DEBUG_STATS)
-    await message.answer(report, parse_mode="Markdown", disable_web_page_preview=True)
+    await send_chat_noise_report(message)
 
 
 @dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == "📺 Канал")
@@ -4641,6 +4732,102 @@ async def admin_channel_promo_now(message: types.Message):
         await message.answer("❌ Не удалось опубликовать промо.", reply_markup=get_admin_channel_keyboard())
 
 
+@dp.message(lambda m: m.text == "✏️ Тексты промо")
+async def admin_channel_promo_texts_button(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await state.clear()
+    await send_promo_texts_admin_screen(message)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("ch_promo_"))
+async def admin_channel_promo_texts_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    data = callback.data
+    from services.channel_promo_texts import (
+        get_promo_variants,
+        import_promo_from_file_to_db,
+        pick_promo_text,
+        reset_promo_texts_to_file_or_defaults,
+    )
+    from db import get_channel_promo_times
+
+    if data == "ch_promo_file":
+        variants, err = import_promo_from_file_to_db()
+        if err:
+            await safe_callback_answer(callback, err, show_alert=True)
+            return
+        await safe_callback_answer(callback, f"Загружено {len(variants)} текст(ов) из файла")
+        await send_promo_texts_admin_screen(callback.message, edit=True)
+        return
+    if data == "ch_promo_reset":
+        variants, source = reset_promo_texts_to_file_or_defaults()
+        await safe_callback_answer(callback, f"Сброшено → {source}, слотов: {len(variants)}")
+        await send_promo_texts_admin_screen(callback.message, edit=True)
+        return
+    if data == "ch_promo_preview":
+        times = get_channel_promo_times()
+        parts = ["<b>👁 Превью автопромо</b>", ""]
+        for i, slot_time in enumerate(times):
+            parts.append(f"<b>—— {i + 1}. {slot_time} ——</b>")
+            parts.append(pick_promo_text(i))
+            parts.append("")
+        await callback.message.answer("\n".join(parts), parse_mode="HTML", disable_web_page_preview=True)
+        await safe_callback_answer(callback, "Превью отправлено")
+        return
+    if data.startswith("ch_promo_edit_"):
+        try:
+            idx = int(data.replace("ch_promo_edit_", "", 1))
+        except ValueError:
+            await safe_callback_answer(callback, "Ошибка слота", show_alert=True)
+            return
+        times = get_channel_promo_times()
+        slot_label = times[idx] if idx < len(times) else str(idx + 1)
+        current = pick_promo_text(idx)
+        await state.update_data(promo_text_slot=idx)
+        await state.set_state(ChannelPromoTextState.waiting_text)
+        await callback.message.answer(
+            f"<b>✏️ Слот {idx + 1} ({slot_label})</b>\n\n"
+            f"Текущий текст:\n{current}\n\n"
+            "Отправьте новый текст (HTML: <code>&lt;b&gt;</code>, "
+            "<code>&lt;a href=\"…\"&gt;</code>). «◀️ Назад» — отмена.",
+            parse_mode="HTML",
+            reply_markup=get_admin_channel_keyboard(),
+        )
+        await safe_callback_answer(callback)
+        return
+    await safe_callback_answer(callback)
+
+
+@dp.message(ChannelPromoTextState.waiting_text)
+async def admin_channel_promo_text_save(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    if message.text == ADMIN_BTN_BACK:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_admin_channel_keyboard())
+        return
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        await message.answer("Отправьте текст или «◀️ Назад».")
+        return
+    data = await state.get_data()
+    idx = int(data.get("promo_text_slot", 0))
+    from services.channel_promo_texts import update_promo_variant_at
+
+    update_promo_variant_at(idx, text)
+    await state.clear()
+    await message.answer(
+        f"✅ Слот {idx + 1} сохранён в БД. Следующий автопромо возьмёт этот текст.",
+        reply_markup=get_admin_channel_keyboard(),
+    )
+    await send_promo_texts_admin_screen(message)
+
+
 @dp.message(lambda m: m.text == "📊 Статистика канала")
 async def admin_channel_stats_button(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -4677,6 +4864,8 @@ async def admin_channel_custom_post_start(message: types.Message, state: FSMCont
 @dp.message(ChannelCustomPostState.waiting_content)
 async def admin_channel_custom_post_content(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
         return
     if message.text == ADMIN_BTN_BACK:
         await state.clear()
@@ -4767,7 +4956,7 @@ async def admin_channel_stats_refresh(callback: types.CallbackQuery):
     await safe_callback_answer(callback, "Обновлено")
 
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("ch_") and not c.data.startswith("ch_custom") and c.data != "ch_stats_refresh")
+@dp.callback_query(lambda c: c.data and c.data.startswith("ch_") and not c.data.startswith("ch_custom") and not c.data.startswith("ch_promo_") and c.data != "ch_stats_refresh")
 async def admin_channel_settings_callback(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_USER_ID:
         await callback.answer("Недоступно", show_alert=True)
@@ -4802,6 +4991,8 @@ async def admin_channel_settings_callback(callback: types.CallbackQuery):
 @dp.message(ChannelPostState.waiting_vacancy_id)
 async def admin_channel_post_vacancy_id(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
         return
     if message.text == ADMIN_BTN_BACK:
         await state.clear()
