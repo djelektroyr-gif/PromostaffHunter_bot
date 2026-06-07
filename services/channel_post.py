@@ -15,6 +15,7 @@ from db import (
     release_vacancy_channel_post,
     try_reserve_vacancy_channel_post,
 )
+from parser import evaluate_vacancy
 from services.channel_images import resolve_vacancy_image_path, send_channel_post
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
@@ -92,6 +93,26 @@ async def post_vacancy_preview_to_channel(
     if not force and not try_reserve_vacancy_channel_post(vacancy_id, category_code):
         logger.info("Channel skip vacancy_id=%s — slot reserved or already posted", vacancy_id)
         return False
+    if not force:
+        accepted, detected_cat, gate_reason, _ = evaluate_vacancy(body or "")
+        if not accepted:
+            logger.info(
+                "Channel skip vacancy_id=%s cat=%s revalidate=%s",
+                vacancy_id,
+                category_code,
+                gate_reason,
+            )
+            release_vacancy_channel_post(vacancy_id)
+            return False
+        if detected_cat and detected_cat != category_code:
+            logger.info(
+                "Channel skip vacancy_id=%s stored_cat=%s detected=%s",
+                vacancy_id,
+                category_code,
+                detected_cat,
+            )
+            release_vacancy_channel_post(vacancy_id)
+            return False
     text = build_channel_preview_text(
         category_name=category_name,
         category_emoji=category_emoji,

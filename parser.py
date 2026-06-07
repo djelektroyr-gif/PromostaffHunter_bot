@@ -1660,9 +1660,12 @@ def format_parser_chats_report(chats: list, parser_status: str) -> str:
     return "\n".join(lines)
 
 def _keyword_in_text(keyword: str, text_lower: str) -> bool:
-    """Проверка ключевого слова с границами — чтобы «паковщик» не ловил «упаковщик»."""
+    """Проверка ключевого слова с границами — «helpers» не в HelpersTeam, «паковщик» не в упаковщик."""
     kw = keyword.lower()
-    if len(kw) <= 5 or kw in ("промо", "склад", "сервис", "промо"):
+    if kw in ("промо", "склад", "сервис", "helper", "helpers", "staff"):
+        pattern = rf'(?<![a-zа-яё0-9]){re.escape(kw)}(?![a-zа-яё0-9])'
+        return bool(re.search(pattern, text_lower, re.IGNORECASE))
+    if len(kw) <= 5:
         pattern = rf'(?<![a-zа-яё0-9]){re.escape(kw)}(?![a-zа-яё0-9])'
         return bool(re.search(pattern, text_lower, re.IGNORECASE))
     return kw in text_lower
@@ -1842,6 +1845,28 @@ _SERVICE_REQUEST_RES = (
     re.compile(r"ищу\s+#\w+\s+на\s+\d", re.I),
 )
 
+_ACADEMIC_WRITING_MARKERS = (
+    "курсовая", "курсовые", "курсовой", "курсовую",
+    "дипломная", "дипломные", "дипломную", "диплом ",
+    "диссертац", "магистерск",
+    "отчёт по практике", "отчет по практике",
+    "типографическ", "переплёт", "переплет", "прошивка", "ламинция",
+    "заказать работу", "написание работ", "научная работа",
+)
+
+
+def is_academic_writing_spam(text: str) -> bool:
+    """Реклама написания курсовых/дипломов — не вакансия персонала."""
+    if not text:
+        return False
+    tl = text.lower()
+    hits = sum(1 for m in _ACADEMIC_WRITING_MARKERS if m in tl)
+    if hits >= 2:
+        return True
+    if hits >= 1 and any(w in tl for w in ("скидка", "новых клиентов", "реферальн", "под ключ")):
+        return True
+    return False
+
 
 def _detect_category_scored(text: str) -> str | None:
     if not text:
@@ -1999,6 +2024,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
     tl = text.lower()
     if is_unpaid_vacancy(text):
         return False, "unpaid", []
+    if is_academic_writing_spam(text):
+        return False, "academic_writing_spam", []
     for phrase in STOP_PHRASES:
         if phrase.lower() in tl:
             return False, f"stop_phrase: {phrase}", []
@@ -2047,11 +2074,12 @@ def passes_quality_gate(category: str, text: str) -> bool:
 
     if category == "helper":
         helper_markers = (
-            "хелпер", "хэлпер", "helper", "помощник на мероприят", "помощник организатора",
+            "хелпер", "хэлпер", "помощник на мероприят", "помощник организатора",
             "помощь на площадке", "принеси", "подай", "бекфотограф", "бэкстейдж", "ассистент по акт",
         )
         if not any(m in tl for m in helper_markers):
-            return False
+            if not (_keyword_in_text("helper", tl) or _keyword_in_text("helpers", tl)):
+                return False
         if any(w in tl for w in _PROMO_HINTS) and "промоутер" not in tl and "позиция: промо" not in tl:
             if not any(m in tl for m in ("хелпер", "хэлпер", "helper")):
                 return False
