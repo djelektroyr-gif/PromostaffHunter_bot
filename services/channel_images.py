@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -14,7 +15,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CHANNEL_IMAGES_DIR = Path(__file__).resolve().parent.parent / "data" / "channel_images"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Bothost: /app/data — persistent volume, NOT from git. Static PNG live in assets/.
+_DEFAULT_CHANNEL_IMAGES_DIR = _PROJECT_ROOT / "assets" / "channel_images"
+
+
+def get_channel_images_dir() -> Path:
+    override = os.getenv("CHANNEL_IMAGES_DIR", "").strip()
+    if override:
+        return Path(override)
+    return _DEFAULT_CHANNEL_IMAGES_DIR
+
 
 VACANCY_IMAGE_BY_CATEGORY: dict[str, str] = {
     "loader": "vacancy-loader.png",
@@ -35,7 +46,7 @@ PROMO_IMAGE_BY_VARIANT: list[str] = [
 
 
 def _resolve_image(filename: str) -> Path | None:
-    path = CHANNEL_IMAGES_DIR / filename
+    path = get_channel_images_dir() / filename
     if path.is_file():
         return path
     logger.warning("Channel image missing: %s", path)
@@ -59,6 +70,29 @@ def resolve_promo_image_path(variant_index: int) -> Path | None:
     return _resolve_image(filename)
 
 
+def log_channel_images_status() -> None:
+    """Стартовая диагностика: на Bothost data/ не синхронизируется с git."""
+    images_dir = get_channel_images_dir()
+    if not images_dir.is_dir():
+        logger.warning(
+            "Channel images dir missing: %s (posts will be text-only)",
+            images_dir,
+        )
+        return
+    pngs = sorted(images_dir.glob("*.png"))
+    logger.info(
+        "Channel images: %s (%d png)",
+        images_dir,
+        len(pngs),
+    )
+    if len(pngs) < len(VACANCY_IMAGE_BY_CATEGORY) + len(PROMO_IMAGE_BY_VARIANT):
+        logger.warning(
+            "Channel images incomplete: expected at least %d files, found %d",
+            len(VACANCY_IMAGE_BY_CATEGORY) + 1 + len(PROMO_IMAGE_BY_VARIANT),
+            len(pngs),
+        )
+
+
 async def send_channel_post(
     bot: Bot,
     chat_id: int | str,
@@ -69,6 +103,7 @@ async def send_channel_post(
 ) -> Message:
     """Фото + caption или текст, если файла нет."""
     if photo_path and photo_path.is_file():
+        logger.debug("Channel post with photo: %s", photo_path.name)
         return await bot.send_photo(
             chat_id,
             FSInputFile(photo_path),
@@ -76,6 +111,8 @@ async def send_channel_post(
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+    if photo_path:
+        logger.warning("Channel post fallback to text — photo not found: %s", photo_path)
     return await bot.send_message(
         chat_id,
         text,

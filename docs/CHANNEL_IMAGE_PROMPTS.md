@@ -1,7 +1,7 @@
 # Промпты для картинок канала @promostaff_agency_job
 
 Единый стиль для вакансий и промо-постов **Promostaff Hunter**.  
-Файлы лежат в `data/channel_images/`; маппинг — `services/channel_images.py`.
+Файлы лежат в `assets/channel_images/` (не в `data/` — на Bothost `data/` persistent и не из git). Маппинг — `services/channel_images.py`.
 
 Формат: **1080×1080**, квадрат 1:1 для Telegram.
 
@@ -21,7 +21,7 @@ role title. Small green or role-colored pill button ОТКРЫТО at bottom for
 cards. Marketing quality, readable at phone size.
 ```
 
-**Reference для новых картинок:** `data/channel_images/vacancy-default.png` (маскот) или ближайшая карточка той же серии.
+**Reference для новых картинок:** `assets/channel_images/vacancy-default.png` (маскот) или ближайшая карточка той же серии.
 
 ---
 
@@ -107,7 +107,7 @@ only near magnifying glass.
 
 ## Промо (`variant_index` → файл)
 
-Соответствие текстам в `data/channel_promo_texts.json` (слот 0 → 09:00, 1 → 14:00, 2 → 20:00).
+Соответствие текстам в `assets/channel_promo_texts.json` (слот 0 → 09:00, 1 → 14:00, 2 → 20:00).
 
 | index | Файл | Тема поста |
 |-------|------|------------|
@@ -150,4 +150,4 @@ near phone, tiny sparkles only there.
 2. Логотип **PROMOSTAFF** на форме (если уместно).
 3. Персонаж **в действии** по роли, не абстрактный маскот (кроме дефолта и промо).
 4. Без лишнего конфетти; без узких подписей «только на мероприятиях» для универсальных ролей.
-5. Сохранить в `data/channel_images/` и добавить строку в `VACANCY_IMAGE_BY_CATEGORY` или `PROMO_IMAGE_BY_VARIANT` в `services/channel_images.py`.
+5. Сохранить в `assets/channel_images/` и добавить строку в `VACANCY_IMAGE_BY_CATEGORY` или `PROMO_IMAGE_BY_VARIANT` в `services/channel_images.py`.

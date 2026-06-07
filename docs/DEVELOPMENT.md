@@ -118,6 +118,8 @@ SQLite bot_database.db  **или** PostgreSQL (`DATABASE_URL`)
 | `DATABASE_URL` | PostgreSQL (прод Bothost): `postgresql://user:pass@host:5432/dbname` — если задан, SQLite не используется |
 | `DATABASE_PATH` | Явный путь к SQLite (Bothost shared: `/app/shared/bot_database.db`) |
 | `SHARED_DIR` | Каталог shared volume (Bothost: `/app/shared`) |
+| `USER_PHOTOS_DIR` | Опционально: каталог jpg профилей (иначе shared → data → cwd) |
+| `CHANNEL_IMAGES_DIR` | Опционально: каталог PNG для канала (по умолчанию `assets/channel_images/`) |
 | `SUBSCRIPTION_SUPPORT` | Контакт для оплаты подписки (например `@username`) |
 | `SUBSCRIPTION_PAY_URL` | Опционально: ссылка на оплату (когда появится) |
 
@@ -179,7 +181,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 | 📣 Вакансия в канал | Ручной кросс-пост вакансии из БД |
 | 📝 Новость в канал | Кастом-пост (FSM) |
 | 📢 Промо в канал | Промо «подпишись на бота» вручную |
-| ✏️ Тексты промо | Редактор `data/channel_promo_texts.json` |
+| ✏️ Тексты промо | Редактор `assets/channel_promo_texts.json` (в git) |
 | ❌ Закрыть меню | Убирает клавиатуру |
 
 ### Команды (без кнопки)
@@ -244,6 +246,12 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 
 **Bothost / session:** без `user_session.session` парсер **не работает** (бот отвечает, вакансии не копятся). Файл: `/app/shared/user_session.session` или `/app/user_session.session`. Первая строка в логах: `Telethon session: …` — путь должен существовать.
 
+**Bothost / картинки канала:** папка `/app/data` — **persistent volume**, не подтягивается из git ([док Bothost](https://bothost.ru/docs/database-storage)). Статические PNG для канала лежат в **`assets/channel_images/`** (из репозитория). При старте в логах: `Channel images: /app/assets/channel_images (10 png)`. Если `0 png` или `dir missing` — посты уходят текстом без обложки.
+
+**Bothost / тексты промо:** версионируемый файл — **`assets/channel_promo_texts.json`**. `data/` на Bothost — persistent volume, не из git. Приоритет: БД (админка) → assets → дефолты в коде.
+
+**Bothost / фото профилей:** jpg в **`/app/shared/user_photos`** (если «Общее хранилище») или **`/app/data/user_photos`**. Не в git. В логах при старте: `User photos dir: … (N jpg)`.
+
 ### Фильтр метро (Premium)
 
 - Поле `subscribers.metro_zones` (через запятую).
@@ -292,7 +300,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 
 1. **⚙️ Настройки** вместо «Категории»; отключение рассылки — inline «🔕 Отключить рассылку» (сброс категорий, профиль сохраняется).
 2. **👤 Мои данные** — редактирование полей, `resume_extra`, пересборка `questionnaire`.
-3. **Фото на диске** — `profile_photos.py`, `SHARED_DIR/user_photos/{user_id}.jpg`, фоновая проверка `file_id`.
+3. **Фото на диске** — `profile_photos.py`, persistent `shared/user_photos` или `data/user_photos`, фоновая проверка `file_id`.
 
 ### UX — следующий этап
 

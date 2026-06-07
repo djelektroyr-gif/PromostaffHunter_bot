@@ -5943,6 +5943,16 @@ async def on_startup():
         logger.info(f"🔄 Миграция ID вакансий: обновлено {migrated} записей")
     logger.info("📁 База данных инициализирована")
 
+    from services.channel_images import log_channel_images_status
+    from services.channel_promo_texts import log_promo_texts_status
+
+    log_channel_images_status()
+    log_promo_texts_status()
+
+    from profile_photos import prepare_user_photos_storage
+
+    prepare_user_photos_storage()
+
     from config import get_shared_dir
     from parser import session_file_path
 
@@ -5968,8 +5978,6 @@ async def on_startup():
         )
     )
     logger.info(f"📡 {PARSER_LABEL} запущен (резервный опрос каждые 5 мин)")
-
-    logger.info("📷 Фото профилей: %s", get_user_photos_dir())
 
     async def notify_photo_issue(user_id: int, text: str):
         try:

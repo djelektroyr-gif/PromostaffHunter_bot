@@ -1,9 +1,10 @@
-"""Тексты автопромо: файл data/channel_promo_texts.json, правки в БД или дефолты."""
+"""Тексты автопромo: bundle в assets/, правки в БД или дефолты."""
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from db import (
@@ -14,7 +15,10 @@ from db import (
 
 logger = logging.getLogger(__name__)
 
-PROMO_TEXTS_FILE = Path(__file__).resolve().parent.parent / "data" / "channel_promo_texts.json"
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Bothost: /app/data не из git. Тексты версионируем в assets/.
+BUNDLE_PROMO_TEXTS_FILE = _PROJECT_ROOT / "assets" / "channel_promo_texts.json"
+LEGACY_PROMO_TEXTS_FILE = _PROJECT_ROOT / "data" / "channel_promo_texts.json"
 
 DEFAULT_PROMO_VARIANTS: list[str] = [
     (
@@ -35,6 +39,22 @@ DEFAULT_PROMO_VARIANTS: list[str] = [
 ]
 
 
+def get_promo_texts_file_candidates() -> list[Path]:
+    override = os.getenv("CHANNEL_PROMO_TEXTS_FILE", "").strip()
+    paths: list[Path] = []
+    if override:
+        paths.append(Path(override))
+    paths.extend([BUNDLE_PROMO_TEXTS_FILE, LEGACY_PROMO_TEXTS_FILE])
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(path)
+    return out
+
+
 def _normalize_variants(raw: list) -> list[str]:
     out = [str(x).strip() for x in raw if str(x).strip()]
     return out or list(DEFAULT_PROMO_VARIANTS)
@@ -50,20 +70,28 @@ def _parse_variants_payload(data) -> list[str] | None:
     return None
 
 
-def load_promo_variants_from_file() -> list[str] | None:
-    if not PROMO_TEXTS_FILE.is_file():
+def _load_promo_variants_from_path(path: Path) -> list[str] | None:
+    if not path.is_file():
         return None
     try:
-        raw = PROMO_TEXTS_FILE.read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
         parsed = json.loads(raw)
     except (OSError, json.JSONDecodeError) as e:
-        logger.warning("channel_promo_texts file read failed: %s", e)
+        logger.warning("channel_promo_texts file read failed (%s): %s", path, e)
         return None
     variants = _parse_variants_payload(parsed)
     if not variants:
-        logger.warning("channel_promo_texts file: empty or invalid structure")
+        logger.warning("channel_promo_texts file empty or invalid: %s", path)
         return None
     return variants
+
+
+def load_promo_variants_from_file() -> list[str] | None:
+    for path in get_promo_texts_file_candidates():
+        variants = _load_promo_variants_from_path(path)
+        if variants:
+            return variants
+    return None
 
 
 def get_promo_texts_source() -> str:
@@ -105,22 +133,39 @@ def update_promo_variant_at(index: int, text: str) -> list[str]:
 
 
 def import_promo_from_file_to_db() -> tuple[list[str] | None, str]:
-    """Прочитать JSON-файл и сохранить в БД. Возвращает (variants, error_message)."""
+    """Прочитать JSON из assets/data и сохранить в БД."""
     variants = load_promo_variants_from_file()
     if not variants:
-        return None, f"Файл не найден или пуст: {PROMO_TEXTS_FILE.name}"
+        return None, "Файл не найден или пуст (assets/channel_promo_texts.json)"
     return save_promo_variants_to_db(variants), ""
 
 
 def reset_promo_texts_to_file_or_defaults() -> tuple[list[str], str]:
-    """Убрать правки из БД — дальше файл или встроенные дефолты."""
+    """Убрать правки из БД — дальше bundle-файл или встроенные дефолты."""
     clear_channel_promo_texts_override()
     source = get_promo_texts_source()
     return get_promo_variants(), source
 
 
 def promo_texts_file_hint() -> str:
-    return f"data/{PROMO_TEXTS_FILE.name}"
+    return "assets/channel_promo_texts.json"
+
+
+def log_promo_texts_status() -> None:
+    source = get_promo_texts_source()
+    variants = get_promo_variants()
+    bundle_exists = BUNDLE_PROMO_TEXTS_FILE.is_file()
+    logger.info(
+        "Channel promo texts: source=%s variants=%d bundle=%s",
+        source,
+        len(variants),
+        bundle_exists,
+    )
+    if source == "default" and not bundle_exists:
+        logger.warning(
+            "Channel promo texts: bundle missing at %s — using built-in defaults",
+            BUNDLE_PROMO_TEXTS_FILE,
+        )
 
 
 def format_promo_texts_admin_summary() -> str:
@@ -150,7 +195,8 @@ def format_promo_texts_admin_summary() -> str:
         lines.append(f"<b>{i + 1}. {slot_time}</b> — {preview}")
     lines.append("")
     lines.append(
-        f"<i>Файл без деплоя кода: отредактируйте {promo_texts_file_hint()} "
-        f"и нажмите «📂 Из файла». HTML: &lt;b&gt;, &lt;a href=\"…\"&gt;.</i>"
+        f"<i>Тексты из git: `{promo_texts_file_hint()}`. "
+        f"На Bothost `data/` не подтягивается — правьте assets в репо или админку. "
+        f"HTML: &lt;b&gt;, &lt;a href=\"…\"&gt;.</i>"
     )
     return "\n".join(lines)

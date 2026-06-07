@@ -9,9 +9,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.channel_images import (
-    CHANNEL_IMAGES_DIR,
     PROMO_IMAGE_BY_VARIANT,
     VACANCY_IMAGE_BY_CATEGORY,
+    get_channel_images_dir,
     resolve_promo_image_path,
     resolve_vacancy_image_path,
     send_channel_post,
@@ -55,11 +55,12 @@ def test_resolve_promo_image_path(variant_index, expected_name):
 
 
 def test_channel_images_dir_has_all_mapped_files():
+    images_dir = get_channel_images_dir()
     for filename in VACANCY_IMAGE_BY_CATEGORY.values():
-        assert (CHANNEL_IMAGES_DIR / filename).is_file(), filename
-    assert (CHANNEL_IMAGES_DIR / "vacancy-default.png").is_file()
+        assert (images_dir / filename).is_file(), filename
+    assert (images_dir / "vacancy-default.png").is_file()
     for filename in PROMO_IMAGE_BY_VARIANT:
-        assert (CHANNEL_IMAGES_DIR / filename).is_file(), filename
+        assert (images_dir / filename).is_file(), filename
 
 
 def test_send_channel_post_with_photo(tmp_path):

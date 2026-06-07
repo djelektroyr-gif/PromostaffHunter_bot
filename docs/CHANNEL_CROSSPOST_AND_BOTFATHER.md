@@ -31,7 +31,7 @@
 
 Короткая **HTML-карточка** (до ~900 символов) **с обложкой-картинкой** по категории вакансии или промо-варианту:
 
-- **Вакансии:** `send_photo` + caption; файл из `data/channel_images/` по `category_code` (см. `services/channel_images.py`).
+- **Вакансии:** `send_photo` + caption; файл из `assets/channel_images/` по `category_code` (см. `services/channel_images.py`).
 - **Автопромо:** картинка по индексу варианта текста (0 → categories, 1 → subscribe, 2 → premium).
 - **Промпты для единого стиля:** [`CHANNEL_IMAGE_PROMPTS.md`](CHANNEL_IMAGE_PROMPTS.md).
 
@@ -77,7 +77,7 @@
 - `services/channel_post.py` → `post_vacancy_preview_to_channel()` — **photo + caption**
 - `services/channel_promo.py` → `post_channel_promo()` — **photo по variant_index**
 - `services/channel_images.py` — маппинг `category_code` / промо-индекс → PNG
-- `data/channel_images/` — ассеты; промпты — `docs/CHANNEL_IMAGE_PROMPTS.md`
+- `assets/channel_images/` — ассеты из git; промпты — `docs/CHANNEL_IMAGE_PROMPTS.md`
 - Вызов после `send_vacancy_to_subscribers` или из админки
 - `main.py`: handler `/start vac_<id>` — показать карточку даже если пользователь не в Premium push
 
@@ -292,7 +292,7 @@ List: **Default** — для всех; отдельный scope для адми�
 
 | Способ | Как |
 |--------|-----|
-| **Файл** | `data/channel_promo_texts.json` — массив `variants` (HTML). После правки на сервере: **📺 Канал → ✏️ Тексты промо → 📂 Из файла** |
+| **Файл** | `assets/channel_promo_texts.json` — массив `variants` (HTML). Редактируется в git; на Bothost `data/` не подтягивается из репозитория |
 | **Бот** | **📺 Канал → ✏️ Тексты промо** — правка слотов 1/2/3 (сохраняется в БД, приоритет над файлом) |
 | **Сброс** | **🗑 Сброс** — убрать правки из БД, снова файл или встроенные дефолты |
 

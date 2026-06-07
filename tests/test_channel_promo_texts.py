@@ -9,7 +9,7 @@ from services import channel_promo_texts as cpt
 @pytest.fixture
 def promo_file(tmp_path, monkeypatch):
     path = tmp_path / "channel_promo_texts.json"
-    monkeypatch.setattr(cpt, "PROMO_TEXTS_FILE", path)
+    monkeypatch.setattr(cpt, "get_promo_texts_file_candidates", lambda: [path])
     return path
 
 
@@ -65,3 +65,10 @@ def test_import_and_reset(monkeypatch, promo_file):
     out, source = cpt.reset_promo_texts_to_file_or_defaults()
     assert source == "file"
     assert out == ["x", "y", "z"]
+
+
+def test_bundle_file_in_repo():
+    assert cpt.BUNDLE_PROMO_TEXTS_FILE.is_file()
+    variants = cpt._load_promo_variants_from_path(cpt.BUNDLE_PROMO_TEXTS_FILE)
+    assert variants
+    assert len(variants) >= 3
