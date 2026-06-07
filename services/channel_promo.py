@@ -17,6 +17,7 @@ from db import (
     release_promo_slot,
     try_reserve_promo_slot,
 )
+from services.channel_images import resolve_promo_image_path, send_channel_post
 from services.channel_policy import msk_now
 from services.channel_promo_texts import pick_promo_text
 from services.telegram_buttons import styled_inline_button
@@ -67,13 +68,14 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
         idx = times.index(promo_slot) if promo_slot in times else 0
     text = pick_promo_text(idx)
     markup = build_channel_promo_keyboard()
+    photo_path = resolve_promo_image_path(idx)
     try:
-        msg = await bot.send_message(
+        msg = await send_channel_post(
+            bot,
             HUNTER_CHANNEL_ID,
-            text,
-            parse_mode="HTML",
+            text=text,
             reply_markup=markup,
-            disable_web_page_preview=True,
+            photo_path=photo_path,
         )
         if slot and not manual and reserved:
             pass  # already reserved before send

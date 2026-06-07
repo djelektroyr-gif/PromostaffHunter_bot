@@ -15,6 +15,7 @@ from db import (
     release_vacancy_channel_post,
     try_reserve_vacancy_channel_post,
 )
+from services.channel_images import resolve_vacancy_image_path, send_channel_post
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
 from services.vacancy_public_text import sanitize_vacancy_public_body
@@ -99,13 +100,14 @@ async def post_vacancy_preview_to_channel(
         freshness=freshness,
     )
     markup = build_channel_preview_keyboard(vacancy_id)
+    photo_path = resolve_vacancy_image_path(category_code)
     try:
-        msg = await bot.send_message(
+        msg = await send_channel_post(
+            bot,
             HUNTER_CHANNEL_ID,
-            text,
-            parse_mode="HTML",
+            text=text,
             reply_markup=markup,
-            disable_web_page_preview=True,
+            photo_path=photo_path,
         )
         snippet = sanitize_vacancy_public_body(body or "", max_len=120)
         mark_vacancy_channel_posted(

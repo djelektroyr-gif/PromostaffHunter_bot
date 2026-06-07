@@ -10,7 +10,7 @@
 | Область | Что |
 |---------|-----|
 | **Темы** | Forum topics в личке: «📬 Вакансии», «📨 Отклики», «❓ Поддержка» |
-| **Канал** | Кросс-пост в @promostaff_agency_job, `?start=vac_{id}`, админ «📣 В канал» |
+| **Канал** | Кросс-пост в @promostaff_agency_job с **обложкой по категории**, `?start=vac_{id}`, админ «📣 В канал» |
 | **LLM** | «✨ Улучшить текст» для Premium (`services/llm_client.py`) |
 | **Stars** | Пилот «⭐ Расширенный отклик» — [`STARS_EXTENDED_RESPONSE.md`](STARS_EXTENDED_RESPONSE.md) |
 

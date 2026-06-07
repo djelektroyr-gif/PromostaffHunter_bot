@@ -29,7 +29,11 @@
 
 ### Что постим в канал
 
-Короткая **HTML-карточка** (до ~900 символов), без лишнего шума:
+Короткая **HTML-карточка** (до ~900 символов) **с обложкой-картинкой** по категории вакансии или промо-варианту:
+
+- **Вакансии:** `send_photo` + caption; файл из `data/channel_images/` по `category_code` (см. `services/channel_images.py`).
+- **Автопромо:** картинка по индексу варианта текста (0 → categories, 1 → subscribe, 2 → premium).
+- **Промпты для единого стиля:** [`CHANNEL_IMAGE_PROMPTS.md`](CHANNEL_IMAGE_PROMPTS.md).
 
 ```
 📢 Промоутер · Москва · от 3500 ₽/смена
@@ -70,7 +74,10 @@
 
 ### Код (план реализации)
 
-- `services/channel_post.py` → `post_vacancy_preview(vacancy_id)`
+- `services/channel_post.py` → `post_vacancy_preview_to_channel()` — **photo + caption**
+- `services/channel_promo.py` → `post_channel_promo()` — **photo по variant_index**
+- `services/channel_images.py` — маппинг `category_code` / промо-индекс → PNG
+- `data/channel_images/` — ассеты; промпты — `docs/CHANNEL_IMAGE_PROMPTS.md`
 - Вызов после `send_vacancy_to_subscribers` или из админки
 - `main.py`: handler `/start vac_<id>` — показать карточку даже если пользователь не в Premium push
 
