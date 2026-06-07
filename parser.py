@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _realtime_client = None
 _chat_expected_roles: dict[str, set[str]] = {}
 _monitored_chat_ids = set()
+_resolved_chats_count = 0
 _parser_lock = asyncio.Lock()
 _last_health_alert = {}
 _background_tasks: set[asyncio.Task] = set()
@@ -36,6 +37,8 @@ PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
 AUDIT_SCAN_LIMIT = 20
 REJECT_SAMPLES_MAX = 12
+PARSER_SCAN_TIMEOUT_SEC = 1200
+ENTITY_RESOLVE_TIMEOUT_SEC = 45
 PARSER_LABEL = "Парсер групп (Telethon)"
 MOSCOW_TZ = timezone(timedelta(hours=3))
 _session_config_alert_sent = False
@@ -103,17 +106,32 @@ def chat_id_aliases(chat_id) -> set:
 
 async def refresh_monitored_chat_ids(client) -> set:
     """Резолвит ссылки из БД в numeric chat_id — без этого Telethon-парсер не видит группы."""
-    global _monitored_chat_ids
+    global _monitored_chat_ids, _resolved_chats_count
     ids = set()
-    for link in await run_db(get_target_chats):
+    resolved = 0
+    links = await run_db(get_target_chats)
+    for link in links:
         try:
-            entity = await client.get_entity(link)
+            entity = await asyncio.wait_for(
+                client.get_entity(link),
+                timeout=ENTITY_RESOLVE_TIMEOUT_SEC,
+            )
             ids.update(chat_id_aliases(entity.id))
-            await asyncio.sleep(1.2)
+            resolved += 1
+            await asyncio.sleep(0.4)
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут резолва чата %s (%ss)", link, ENTITY_RESOLVE_TIMEOUT_SEC)
         except Exception as e:
             logger.warning(f"Не удалось резолвить чат {link}: {e}")
     _monitored_chat_ids = ids
-    logger.info(f"📡 Мониторинг {len(await run_db(get_target_chats))} чатов ({len(_monitored_chat_ids)} id-алиасов)")
+    _resolved_chats_count = resolved
+    logger.info(
+        "📡 Мониторинг %s чатов (%s id-алиасов, резолв %s/%s)",
+        len(links),
+        len(_monitored_chat_ids),
+        resolved,
+        len(links),
+    )
     return ids
 
 
@@ -344,8 +362,10 @@ def format_scan_finished_summary(stats: dict | None = None) -> str:
         "manual": "Ручная проверка",
     }
     label = labels.get(kind, "Прогон парсера")
+    err = s.get("error")
+    err_line = f"\n❌ Ошибка: {err}" if err else ""
     return (
-        f"✅ *{label} завершена*\n\n"
+        f"✅ *{label} завершена*{err_line}\n\n"
         f"Просмотрено сообщений: {s.get('messages_scanned', 0)}\n"
         f"В ленту: {s.get('matched', 0)} | отсеяно: {s.get('non_relevant', 0)}\n"
         f"Уже в БД: {s.get('already_sent', 0)} | закрыто: {s.get('closed_vacancies', 0)}\n\n"
@@ -626,6 +646,20 @@ async def _save_parsed_vacancy_block(
     }
 
 
+async def _mark_scanned_message(
+    message,
+    chat_id: str,
+    *,
+    allow_reprocess: bool = False,
+) -> None:
+    """Помечает сообщение просмотренным и монотонно двигает курсор incremental-скана."""
+    if allow_reprocess or message is None:
+        return
+    message_id = str(message.id)
+    await run_db(mark_message_processed, message_id, chat_id)
+    await run_db(update_last_processed_id, chat_id, int(message.id))
+
+
 async def _process_single_message(
     message, chat, chat_id: str, chat_title: str, stats: dict = None, *, allow_reprocess: bool = False,
 ):
@@ -634,6 +668,7 @@ async def _process_single_message(
         if stats is not None:
             stats["no_text"] += 1
             _bump_chat_stat(stats, chat_title, "no_text")
+        await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return None
     message_id = str(message.id)
     if not allow_reprocess and await run_db(is_message_processed, message_id, chat_id):
@@ -645,6 +680,7 @@ async def _process_single_message(
         if stats is not None:
             stats["old_messages"] += 1
             _bump_chat_stat(stats, chat_title, "old")
+        await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return None
 
     entities = getattr(message, "entities", None)
@@ -660,13 +696,13 @@ async def _process_single_message(
     if is_strikethrough_closure(message.text, entities):
         closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
         if not allow_reprocess:
-            await run_db(mark_message_processed, message_id, chat_id)
+            await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return closed
 
     if is_vacancy_closed_text(message.text):
         closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
         if not allow_reprocess:
-            await run_db(mark_message_processed, message_id, chat_id)
+            await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return closed
 
     if allow_reprocess:
@@ -693,8 +729,7 @@ async def _process_single_message(
             )
             if order:
                 orders.append(order)
-        await run_db(mark_message_processed, message_id, chat_id)
-        await run_db(update_last_processed_id, chat_id, message.id)
+        await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         if stats is not None:
             stats["digest_blocks_saved"] = stats.get("digest_blocks_saved", 0) + len(orders)
             if not orders:
@@ -717,10 +752,10 @@ async def _process_single_message(
     if not order:
         if stats is not None:
             stats["non_relevant"] += 1
+        await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return None
 
-    await run_db(mark_message_processed, message_id, chat_id)
-    await run_db(update_last_processed_id, chat_id, message.id)
+    await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
     return order
 
 
@@ -774,8 +809,8 @@ async def _scan_all_chats(
     if not target_chats:
         return [], []
 
-    await refresh_monitored_chat_ids(client)
-    await refresh_chat_expected_roles_cache(client)
+    if stats is not None:
+        stats["phase"] = "scan"
 
     for i, chat_link in enumerate(target_chats, 1):
         entity = await safe_get_entity(client, chat_link)
@@ -842,17 +877,20 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
     await asyncio.sleep(90)
     while _realtime_client and _realtime_client.is_connected():
         stats = _new_stats("periodic")
-        _publish_debug_stats(stats)
         try:
             async with _parser_lock:
+                _publish_debug_stats(stats)
                 logger.info("🔄 Плановая проверка новых вакансий (incremental)...")
-                orders, closed_data = await _scan_all_chats(
-                    _realtime_client,
-                    limit_per_chat=PER_CHAT_SCAN_LIMIT,
-                    stats=stats,
-                    incremental=True,
+                orders, closed_data = await asyncio.wait_for(
+                    _scan_all_chats(
+                        _realtime_client,
+                        limit_per_chat=PER_CHAT_SCAN_LIMIT,
+                        stats=stats,
+                        incremental=True,
+                    ),
+                    timeout=PARSER_SCAN_TIMEOUT_SEC,
                 )
-            stats["finished_at"] = _iso_now()
+            _mark_stats_finished(stats)
             if closed_data and closed_callback:
                 await closed_callback(closed_data)
             for order in orders:
@@ -864,8 +902,17 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
                 f"{stats['duplicates_exact']}/{stats['duplicates_fuzzy']}, "
                 f"закрыто {len(closed_data or [])}"
             )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Плановая проверка: таймаут %s с (чатов %s/%s)",
+                PARSER_SCAN_TIMEOUT_SEC,
+                stats.get("chats_ok"),
+                stats.get("chats_total"),
+            )
+            _mark_stats_finished(stats, error="timeout")
         except Exception as e:
             logger.error(f"Ошибка плановой проверки: {e}", exc_info=True)
+            _mark_stats_finished(stats, error=str(e))
         await asyncio.sleep(PARSER_POLL_INTERVAL_SEC)
 
 
@@ -878,11 +925,11 @@ async def _parser_health_loop(health_notify_callback=None):
             issues = []
             if not snap["online"]:
                 issues.append("offline")
-            elif snap["active_chats"] and snap["monitored"] < snap["active_chats"]:
-                issues.append(f"unresolved:{snap['active_chats'] - snap['monitored']}")
+            elif snap["active_chats"] and snap.get("resolved_chats", 0) < snap["active_chats"]:
+                issues.append(f"unresolved:{snap['active_chats'] - snap.get('resolved_chats', 0)}")
 
             if issues and _realtime_client and _realtime_client.is_connected():
-                if snap["monitored"] < snap["active_chats"]:
+                if snap.get("resolved_chats", 0) < snap["active_chats"]:
                     try:
                         async with _parser_lock:
                             await refresh_monitored_chat_ids(_realtime_client)
@@ -901,10 +948,10 @@ async def _parser_health_loop(health_notify_callback=None):
                             f"Если алерт повторяется — проверьте `user_session` и логи."
                         )
                     else:
-                        unresolved = snap["active_chats"] - snap["monitored"]
+                        unresolved = snap["active_chats"] - snap.get("resolved_chats", 0)
                         text = (
                             f"⚠️ *Парсер не видит {unresolved} чат(ов)*\n\n"
-                            f"В БД: {snap['active_chats']}, в мониторинге: {snap['monitored']}.\n"
+                            f"В БД: {snap['active_chats']}, резолв: {snap.get('resolved_chats', 0)}.\n"
                             f"Откройте «📋 Список чатов парсинга» или `/listchats`."
                         )
                     try:
@@ -943,6 +990,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
             logger.info(f"✅ {PARSER_LABEL} подключён")
 
             await refresh_monitored_chat_ids(_realtime_client)
+            await refresh_chat_expected_roles_cache(_realtime_client)
 
             async def _dispatch_parser_result(result, chat_title: str, *, edited: bool = False):
                 for item in _flatten_parser_result(result):
@@ -1071,12 +1119,13 @@ def get_parser_status_snapshot() -> dict:
     """Быстрый снимок для админ-статистики без повторного resolve всех чатов."""
     active = len(get_target_chats())
     online = bool(_realtime_client and _realtime_client.is_connected())
-    monitored = len(_monitored_chat_ids) if online else 0
     return {
         "online": online,
         "active_chats": active,
-        "monitored": monitored,
+        "resolved_chats": _resolved_chats_count if online else 0,
+        "monitored_aliases": len(_monitored_chat_ids) if online else 0,
         "session_file": is_session_file_present(),
+        "scan_in_progress": parser_scan_in_progress(),
     }
 
 
@@ -1092,9 +1141,15 @@ def format_parser_status_line(snapshot: dict) -> str:
         line = f"⏳ {PARSER_LABEL}: не подключён"
     line += f"\n   Чатов в БД: {snapshot['active_chats']}"
     if snapshot["online"]:
-        line += f" | в мониторинге: {snapshot['monitored']}"
-        if snapshot["monitored"] < snapshot["active_chats"]:
+        resolved = snapshot.get("resolved_chats", 0)
+        aliases = snapshot.get("monitored_aliases", 0)
+        line += f" | резолв: {resolved}/{snapshot['active_chats']}"
+        if aliases:
+            line += f" ({aliases} id-алиасов Telethon)"
+        if resolved < snapshot["active_chats"]:
             line += "\n   ⚠️ Не все чаты резолвятся — см. «Список чатов парсинга»"
+        if snapshot.get("scan_in_progress"):
+            line += "\n   🔄 Сейчас идёт полный прогон чатов (startup/manual/periodic)"
     return line
 
 # ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====================
@@ -1126,7 +1181,17 @@ def _empty_debug_stats() -> dict:
         "digest_blocks_saved": 0,
         "run_kind": None,
         "reject_samples": [],
+        "phase": None,
+        "error": None,
     }
+
+
+def _mark_stats_finished(stats: dict, error: str | None = None) -> None:
+    if not stats.get("finished_at"):
+        stats["finished_at"] = _iso_now()
+    stats["phase"] = "done"
+    if error:
+        stats["error"] = error
 
 
 def _new_stats(run_kind: str = "scan") -> dict:
@@ -1153,17 +1218,20 @@ LAST_DEBUG_STATS = _empty_debug_stats()
 async def _startup_sync(bot_callback, closed_callback=None):
     """Фоновая синхронизация после перезапуска — не блокирует realtime-слушатель."""
     stats = _new_stats("startup")
-    _publish_debug_stats(stats)
-    logger.info("🔄 Стартовая синхронизация вакансий (incremental)...")
     try:
         async with _parser_lock:
-            orders, closed_data = await _scan_all_chats(
-                _realtime_client,
-                limit_per_chat=PER_CHAT_SCAN_LIMIT,
-                stats=stats,
-                incremental=True,
+            _publish_debug_stats(stats)
+            logger.info("🔄 Стартовая синхронизация вакансий (incremental)...")
+            orders, closed_data = await asyncio.wait_for(
+                _scan_all_chats(
+                    _realtime_client,
+                    limit_per_chat=PER_CHAT_SCAN_LIMIT,
+                    stats=stats,
+                    incremental=True,
+                ),
+                timeout=PARSER_SCAN_TIMEOUT_SEC,
             )
-            stats["finished_at"] = _iso_now()
+        _mark_stats_finished(stats)
         if closed_data and closed_callback:
             await closed_callback(closed_data)
         for order in orders:
@@ -1174,10 +1242,12 @@ async def _startup_sync(bot_callback, closed_callback=None):
             f"отсеяно {stats['non_relevant']}, "
             f"уже в БД {stats['already_sent']}"
         )
+    except asyncio.TimeoutError:
+        logger.error("Стартовая синхронизация: таймаут %s с", PARSER_SCAN_TIMEOUT_SEC)
+        _mark_stats_finished(stats, error="timeout")
     except Exception as e:
         logger.error(f"Стартовая синхронизация: {e}", exc_info=True)
-        if stats.get("started_at") and not stats.get("finished_at"):
-            stats["finished_at"] = _iso_now()
+        _mark_stats_finished(stats, error=str(e))
 
 
 def get_last_debug_report() -> str:
@@ -1199,6 +1269,7 @@ def get_last_debug_report() -> str:
         f"Старт: {s.get('started_at')}",
         f"Финиш: {s.get('finished_at') or '⏳ в процессе…'}",
         parser_line,
+        f"Фаза: {s.get('phase') or ('scan' if parser_scan_in_progress() else '—')}",
         f"Чатов: {s.get('chats_ok', 0)}/{s.get('chats_total', 0)} успешно, ошибок: {s.get('chats_failed', 0)}",
         f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
         f"Совпадений найдено: {s.get('matched', 0)}",
@@ -1214,14 +1285,21 @@ def get_last_debug_report() -> str:
         try:
             started = datetime.strptime(s["started_at"], "%Y-%m-%d %H:%M:%S")
             age_min = (datetime.now() - started).total_seconds() / 60
-            if age_min > 15:
+            if not parser_scan_in_progress() and age_min > 2:
+                lines.append(
+                    f"\n⚠️ *Прогон без финиша*, но lock свободен ({int(age_min)} мин назад) — "
+                    "отчёт мог быть перезаписан новым прогоном. Смотрите логи Bothost."
+                )
+            elif parser_scan_in_progress() and age_min > 15:
                 lines.append(
                     f"\n⚠️ *Прогон «в процессе» уже {int(age_min)} мин* — "
-                    "скорее всего отчёт устарел (перезапуск или зависание lock). "
-                    "Нажмите `/check_now`."
+                    "возможно зависание Telethon. После деплоя fix — перезапуск или `/check_now`."
                 )
         except ValueError:
             pass
+    err = s.get("error")
+    if err:
+        lines.append(f"\n❌ Ошибка прогона: `{err}`")
     categories = s.get("categories") or {}
     if categories:
         lines.append("\n📊 *Распределение по категориям:*")
@@ -1490,7 +1568,7 @@ async def inspect_parser_chats() -> tuple:
                 "status": "ok",
                 "title": title,
                 "chat_id": chat_id,
-                "monitored": chat_id in _monitored_chat_ids,
+                "monitored": is_chat_monitored(entity.id),
             })
         else:
             results.append({**row, "status": "no_access", "title": None, "chat_id": None, "monitored": False})
@@ -2036,11 +2114,14 @@ def get_message_link(chat_id: int, message_id: int) -> str:
 
 async def safe_get_entity(client, chat_link: str):
     try:
-        entity = await client.get_entity(chat_link)
-        await asyncio.sleep(0.5)
+        entity = await asyncio.wait_for(client.get_entity(chat_link), timeout=ENTITY_RESOLVE_TIMEOUT_SEC)
+        await asyncio.sleep(0.3)
         return entity
     except errors.rpcerrorlist.ChannelPrivateError:
         logger.warning(f"⚠️ Приватный канал (нет доступа): {chat_link}")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(f"⚠️ Таймаут доступа к {chat_link} ({ENTITY_RESOLVE_TIMEOUT_SEC}s)")
         return None
     except errors.rpcerrorlist.UsernameNotOccupiedError:
         logger.warning(f"⚠️ Канал не найден: {chat_link}")
@@ -2053,56 +2134,68 @@ async def run_parser_audit() -> dict:
     """Админ: последние посты из каждого чата через фильтр, без сохранения."""
     stats = _new_stats("audit")
     stats["reject_samples"] = []
-    _publish_debug_stats(stats)
     try:
         async with _parser_lock:
+            _publish_debug_stats(stats)
             if _realtime_client and _realtime_client.is_connected():
                 logger.info(
                     "🔬 Аудит фильтра: последние %s постов из каждого чата (без сохранения)",
                     AUDIT_SCAN_LIMIT,
                 )
-                await _scan_all_chats(
-                    _realtime_client,
-                    limit_per_chat=AUDIT_SCAN_LIMIT,
-                    stats=stats,
-                    incremental=False,
-                    audit_only=True,
+                await asyncio.wait_for(
+                    _scan_all_chats(
+                        _realtime_client,
+                        limit_per_chat=AUDIT_SCAN_LIMIT,
+                        stats=stats,
+                        incremental=False,
+                        audit_only=True,
+                    ),
+                    timeout=PARSER_SCAN_TIMEOUT_SEC,
                 )
-                stats["finished_at"] = _iso_now()
+                _mark_stats_finished(stats)
                 return stats
             logger.error(f"❌ {PARSER_LABEL} offline — аудит пропущен")
-            stats["finished_at"] = _iso_now()
+            _mark_stats_finished(stats, error="offline")
             return stats
+    except asyncio.TimeoutError:
+        logger.error("Аудит фильтра: таймаут %s с", PARSER_SCAN_TIMEOUT_SEC)
+        _mark_stats_finished(stats, error="timeout")
+        return stats
     except Exception as e:
         logger.error(f"❌ Ошибка аудита фильтра: {e}", exc_info=True)
-        if stats.get("started_at") and not stats.get("finished_at"):
-            stats["finished_at"] = _iso_now()
+        _mark_stats_finished(stats, error=str(e))
         return stats
 
 
 async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
     stats = _new_stats("manual")
-    _publish_debug_stats(stats)
     try:
         async with _parser_lock:
+            _publish_debug_stats(stats)
             if _realtime_client and _realtime_client.is_connected():
                 logger.info("🔍 Ручная проверка через shared Telethon client")
-                result = await _scan_all_chats(
-                    _realtime_client, limit_per_chat=limit_per_chat, stats=stats,
-                    incremental=True,
+                result = await asyncio.wait_for(
+                    _scan_all_chats(
+                        _realtime_client, limit_per_chat=limit_per_chat, stats=stats,
+                        incremental=True,
+                    ),
+                    timeout=PARSER_SCAN_TIMEOUT_SEC,
                 )
-                stats["finished_at"] = _iso_now()
+                _mark_stats_finished(stats)
                 return result
 
             logger.error(
                 f"❌ {PARSER_LABEL} offline — ручная проверка пропущена (не создаём второй user_session)"
             )
-            stats["finished_at"] = _iso_now()
+            _mark_stats_finished(stats, error="offline")
             return [], []
+    except asyncio.TimeoutError:
+        logger.error("Ручная проверка: таймаут %s с", PARSER_SCAN_TIMEOUT_SEC)
+        _mark_stats_finished(stats, error="timeout")
+        return [], []
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
-        if LAST_DEBUG_STATS.get("started_at") and not LAST_DEBUG_STATS.get("finished_at"):
-            LAST_DEBUG_STATS["finished_at"] = _iso_now()
+        _mark_stats_finished(LAST_DEBUG_STATS, error=str(e))
         return [], []
 
 async def run_parser():

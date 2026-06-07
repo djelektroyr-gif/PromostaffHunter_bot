@@ -25,6 +25,7 @@ from parser import (
     format_chat_noise_report, parser_scan_in_progress,
     format_parser_wait_message, format_scan_finished_summary, LAST_DEBUG_STATS,
     format_reject_samples_report, format_channel_coverage_report, run_parser_audit,
+    PARSER_SCAN_TIMEOUT_SEC,
 )
 from admin_exports import (
     build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
@@ -1997,7 +1998,7 @@ USER_MENU_BUTTONS = {
 }
 
 from services.ux_middleware import ChatActivityMiddleware
-dp.update.outer_middleware(ChatActivityMiddleware(USER_MENU_BUTTONS, YOUR_USER_ID))
+dp.update.outer_middleware(ChatActivityMiddleware())
 
 ADMIN_BTN_HUB_PARSER = "📡 Парсер"
 ADMIN_BTN_HUB_USERS = "👥 Пользователи"
@@ -2271,6 +2272,7 @@ async def help_menu_button(message: types.Message):
 
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username
     first_name = message.from_user.first_name
@@ -2986,7 +2988,10 @@ async def response_card_callback(callback: types.CallbackQuery):
     except ValueError:
         return
     await show_response_card(
-        callback.message, response_id, user_id=callback.from_user.id, edit=True,
+        callback.message, response_id,
+        user_id=callback.from_user.id,
+        for_admin=callback.from_user.id == YOUR_USER_ID,
+        edit=True,
     )
 
 
@@ -4166,10 +4171,36 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("❌ Вакансия не найдена", show_alert=True)
         return
     vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
+    vac_snippet = vacancy_text[:200] if vacancy_text else None
     employer_contact = saved_contact or extract_contact_from_text(vacancy_text or "")
     if not employer_contact:
-        await callback.answer("⚠️ Контакт заказчика не найден. Отправлю отклик администратору.", show_alert=True)
-        await send_to_admin(callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get('photo_file_id'))
+        if not add_response(
+            user_id,
+            vacancy_id,
+            vac_snippet,
+            vacancy_link,
+            profile.get("photo_file_id"),
+            employer_contact=None,
+            source_chat_title=source_chat,
+            draft_status="admin_forward",
+        ):
+            await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+            return
+        await send_to_admin(
+            callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
+        )
+        return
+    if not add_response(
+        user_id,
+        vacancy_id,
+        vac_snippet,
+        vacancy_link,
+        profile.get("photo_file_id"),
+        employer_contact=employer_contact,
+        source_chat_title=source_chat,
+        draft_status="pending",
+    ):
+        await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
@@ -4188,15 +4219,14 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 draft_text=draft_text,
                 vacancy_id=vacancy_id,
             )
-            add_response(
+            update_response_delivery(
                 user_id,
                 vacancy_id,
-                vacancy_text[:200] if vacancy_text else None,
-                vacancy_link,
-                profile.get("photo_file_id"),
+                draft_status=draft_status,
+                vacancy_link=vacancy_link,
+                user_photo_file_id=profile.get("photo_file_id"),
                 employer_contact=employer_contact,
                 source_chat_title=source_chat,
-                draft_status=draft_status,
             )
     except Exception as e:
         logger.exception("handle_response user=%s vac=%s: %s", user_id, vacancy_id, e)
@@ -4213,15 +4243,14 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 text=plain + "\n\n_Черновик сохранён текстом — кнопка чата недоступна._",
                 parse_mode="Markdown",
             )
-            add_response(
+            update_response_delivery(
                 user_id,
                 vacancy_id,
-                vacancy_text[:200] if vacancy_text else None,
-                vacancy_link,
-                profile.get("photo_file_id"),
+                draft_status="manual",
+                vacancy_link=vacancy_link,
+                user_photo_file_id=profile.get("photo_file_id"),
                 employer_contact=employer_contact,
                 source_chat_title=source_chat,
-                draft_status="manual",
             )
             await send_user_message(
                 user_id,
@@ -4250,10 +4279,6 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 )
             except Exception:
                 pass
-            await callback.answer(
-                "Ошибка отправки. Напишите в поддержку — мы поможем.",
-                show_alert=True,
-            )
             return
         await notify_admin_response_issue(
             user_id,
@@ -4407,7 +4432,12 @@ async def handle_admin_vacancy_response(callback: types.CallbackQuery):
     if not profile or not profile.get("full_name") or not profile.get("phone"):
         await callback.answer("⚠️ Сначала заполните профиль! Нажмите /start", show_alert=True)
         return
-    add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, None, profile.get('photo_file_id'))
+    if not add_response(
+        user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, None, profile.get("photo_file_id"),
+        draft_status="admin_vacancy",
+    ):
+        await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+        return
     candidate_questionnaire = profile.get('questionnaire') or f"""📝 *АНКЕТА КАНДИДАТА*
 
 👤 *ФИО:* {profile['full_name']}
@@ -4434,7 +4464,6 @@ async def handle_admin_vacancy_response(callback: types.CallbackQuery):
 async def skip_photo_respond(callback: types.CallbackQuery, state: FSMContext):
     await send_application(callback, callback.from_user.id, (await state.get_data()).get("vacancy_id"), None)
     await state.clear()
-    await callback.answer()
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_add_"))
 async def respond_add_comment(callback: types.CallbackQuery, state: FSMContext):
@@ -4511,7 +4540,17 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
         await target.answer("❌ Вакансия не найдена")
         return
     vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
-    add_response(user_id, vacancy_id, vacancy_text[:200] if vacancy_text else None, vacancy_link, photo_file_id)
+    if not add_response(
+        user_id,
+        vacancy_id,
+        vacancy_text[:200] if vacancy_text else None,
+        vacancy_link,
+        photo_file_id,
+        draft_status="photo_application",
+    ):
+        if hasattr(target, "answer"):
+            await target.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+        return
     candidate_questionnaire = profile.get('questionnaire') or f"""📝 *АНКЕТА КАНДИДАТА*
 
 👤 *ФИО:* {profile['full_name']}
@@ -4623,9 +4662,7 @@ async def check_now_cmd(message: types.Message):
         return
     status_msg = await message.answer("🔍 Начинаю проверку...")
     progress_task = None
-    pending_kind = None
     if parser_scan_in_progress():
-        pending_kind = LAST_DEBUG_STATS.get("run_kind")
         await status_msg.edit_text(
             format_parser_wait_message(LAST_DEBUG_STATS),
             parse_mode="Markdown",
@@ -4638,21 +4675,18 @@ async def check_now_cmd(message: types.Message):
                 await progress_task
             except asyncio.CancelledError:
                 pass
-        if pending_kind in ("startup", "periodic"):
+    try:
+        await status_msg.edit_text("🔍 Ручная проверка чатов…")
+        orders, closed_data = await run_parser()
+        summary = format_scan_finished_summary(LAST_DEBUG_STATS)
+        if LAST_DEBUG_STATS.get("error") == "timeout":
             await status_msg.edit_text(
-                format_scan_finished_summary(LAST_DEBUG_STATS),
+                f"❌ Ручная проверка прервана по таймауту ({PARSER_SCAN_TIMEOUT_SEC // 60} мин).\n\n{summary}",
                 parse_mode="Markdown",
             )
             return
-    try:
-        if not parser_scan_in_progress():
-            await status_msg.edit_text("🔍 Ручная проверка чатов…")
-        orders, closed_data = await run_parser()
         if not orders and not closed_data:
-            await status_msg.edit_text(
-                format_scan_finished_summary(LAST_DEBUG_STATS),
-                parse_mode="Markdown",
-            )
+            await status_msg.edit_text(summary, parse_mode="Markdown")
             return
         if closed_data:
             await notify_closed_vacancies(closed_data)

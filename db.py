@@ -405,6 +405,18 @@ def init_db():
             "ALTER TABLE responses ADD COLUMN draft_status TEXT DEFAULT 'delivered'",
             cur=cur,
         )
+        cur.execute(
+            """
+            DELETE FROM responses
+            WHERE id NOT IN (
+                SELECT MIN(id) FROM responses GROUP BY user_id, vacancy_id
+            )
+            """
+        )
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_responses_user_vac "
+            "ON responses(user_id, vacancy_id)"
+        )
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
@@ -1947,24 +1959,63 @@ def add_response(
     employer_contact: str | None = None,
     source_chat_title: str | None = None,
     draft_status: str = "delivered",
-):
+) -> bool:
+    """Вставляет отклик. False — пользователь уже откликался (UNIQUE user_id + vacancy_id)."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                INSERT INTO responses (
+                    user_id, vacancy_id, vacancy_text, vacancy_link, user_photo_file_id,
+                    status, employer_contact, source_chat_title, draft_status
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ON CONFLICT(user_id, vacancy_id) DO NOTHING
+                """
+            ),
+            (
+                user_id,
+                vacancy_id,
+                vacancy_text,
+                vacancy_link,
+                user_photo_file_id,
+                employer_contact,
+                source_chat_title,
+                draft_status,
+            ),
+        )
+        return cur.rowcount > 0
+
+
+def update_response_delivery(
+    user_id: int,
+    vacancy_id: str,
+    *,
+    draft_status: str,
+    vacancy_link: str | None = None,
+    user_photo_file_id: str | None = None,
+    employer_contact: str | None = None,
+    source_chat_title: str | None = None,
+) -> None:
     execute(
         """
-        INSERT INTO responses (
-            user_id, vacancy_id, vacancy_text, vacancy_link, user_photo_file_id,
-            status, employer_contact, source_chat_title, draft_status
-        )
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        UPDATE responses SET
+            draft_status = ?,
+            vacancy_link = COALESCE(?, vacancy_link),
+            user_photo_file_id = COALESCE(?, user_photo_file_id),
+            employer_contact = COALESCE(?, employer_contact),
+            source_chat_title = COALESCE(?, source_chat_title)
+        WHERE user_id = ? AND vacancy_id = ?
         """,
         (
-            user_id,
-            vacancy_id,
-            vacancy_text,
+            draft_status,
             vacancy_link,
             user_photo_file_id,
             employer_contact,
             source_chat_title,
-            draft_status,
+            user_id,
+            vacancy_id,
         ),
     )
 
@@ -2443,13 +2494,26 @@ def get_last_processed_id(chat_id: str) -> int:
 
 
 def update_last_processed_id(chat_id: str, message_id: int):
-    execute("""
+    """Монотонно продвигает курсор чата (max), не откатывает при reject старых id."""
+    mid = int(message_id)
+    if IS_POSTGRES:
+        conflict_set = (
+            "last_message_id = GREATEST(last_processed.last_message_id, EXCLUDED.last_message_id),"
+        )
+    else:
+        conflict_set = (
+            "last_message_id = MAX(last_processed.last_message_id, excluded.last_message_id),"
+        )
+    execute(
+        f"""
         INSERT INTO last_processed (chat_id, last_message_id, updated_at)
         VALUES (?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(chat_id) DO UPDATE SET
-            last_message_id = excluded.last_message_id,
+            {conflict_set}
             updated_at = CURRENT_TIMESTAMP
-    """, (chat_id, message_id))
+        """,
+        (chat_id, mid),
+    )
 
 
 # ========== ЗАПРОСЫ PREMIUM ==========

@@ -28,6 +28,8 @@
 
 → **[`docs/CHANNEL_CROSSPOST_AND_BOTFATHER.md`](CHANNEL_CROSSPOST_AND_BOTFATHER.md)** — BotFather настроен владельцем (2026-06-05).
 
+→ **[`docs/AUDIT_STABILIZATION.md`](AUDIT_STABILIZATION.md)** — аудит стабилизации (2026-06-07), волны 1–3.
+
 → **[`docs/BACKLOG_REFERRAL_AND_ENGAGEMENT.md`](BACKLOG_REFERRAL_AND_ENGAGEMENT.md)** — рефералка (отложено) + анонсы выкатов / `/start` re-engagement.
 
 **Env Bothost перед выкатом:**
