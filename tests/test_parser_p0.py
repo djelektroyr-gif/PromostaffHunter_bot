@@ -8,6 +8,7 @@ from parser import (
     is_casting_call,
     is_job_post_for_staff,
     is_mixed_digest_post,
+    is_remote_office_job_spam,
     is_service_request,
     passes_quality_gate,
     should_split_digest,
@@ -398,3 +399,26 @@ def test_evaluate_rejects_ai_video_test_spam():
     ok, _, reason, _ = evaluate_vacancy(text)
     assert ok is False
     assert reason.startswith("stop_phrase")
+
+
+def test_driver_not_matched_in_soprovoditelnom():
+    text = (
+        "📝 В сопроводительном смс напишите слово «украшения»: @shop_boss\n"
+        "500 р/ч, оплата на месте."
+    )
+    assert detect_category(text) is None
+
+
+def test_rejects_remote_etsy_operator_job():
+    text = (
+        "(#Удаленка) Требуется #оператор- #ассистент ИИ, магазина украшений на Etsy\n"
+        "— Работа в ИИ-ассистенте, генерация карточек товара\n"
+        "— Полностью дистанционная работа\n"
+        "— Зарплата фикс от 57 300 до 70 000 ₽\n"
+        "📝 В сопроводительном смс напишите слово «украшения»: @karolikulacowa"
+    )
+    assert is_remote_office_job_spam(text) is True
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "karolikulacowa"})
+    assert ok is False
+    assert cat is None
+    assert reason == "remote_office_job"

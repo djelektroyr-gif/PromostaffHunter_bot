@@ -64,7 +64,7 @@ class PremiumFilterState(StatesGroup):
 
 def _premium_required_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Подписка", callback_data="sub_menu")],
+        [InlineKeyboardButton(text="💎 Подписка", callback_data="subscription_request")],
     ])
 
 
@@ -818,7 +818,11 @@ async def premium_filters_quiet_input(message: types.Message, state: FSMContext)
         )
         return
     start, end = parsed
-    patch_subscriber_notify_prefs(user_id, {"quiet_start": start, "quiet_end": end})
+    patch_subscriber_notify_prefs(user_id, {
+        "quiet_start": start,
+        "quiet_end": end,
+        "quiet_configured": True,
+    })
     await state.clear()
     await message.answer(f"✅ Тихие часы: {start} – {end} (МСК)")
     await show_premium_filters_screen(message, user_id)

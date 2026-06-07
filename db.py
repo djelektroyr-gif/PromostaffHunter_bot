@@ -2236,7 +2236,8 @@ def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
         SELECT id, source_chat_title, message_text, message_link, author_contact, address,
                found_at, published_at, category_code,
                address_normalized, location_lat, location_lon,
-               geo_tags, rate_hourly, rate_shift, rate_effective_hourly
+               geo_tags, rate_hourly, rate_shift, rate_effective_hourly,
+               shift_date, shift_time_start
         FROM vacancies
         WHERE id IN ({placeholders}) AND is_closed = {bool_false()}
         """,
@@ -2260,6 +2261,8 @@ def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
             "rate_hourly": r[13],
             "rate_shift": r[14],
             "rate_effective_hourly": r[15],
+            "shift_date": r[16],
+            "shift_time_start": r[17],
         }
         for r in rows
     }

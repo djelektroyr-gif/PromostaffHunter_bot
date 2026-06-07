@@ -234,6 +234,8 @@ REJECT_REASON_LABELS = {
     "no_contact": "нет контакта",
     "excluded_hashtag_role": "роль по хештегу вне профиля",
     "excluded_organizer": "организатор/свадьба",
+    "permanent_job": "постоянная/вахта",
+    "remote_office_job": "удалённая офисная работа",
     "staff_job": "персонал (прошёл gate)",
 }
 
@@ -1759,10 +1761,15 @@ def _keyword_in_text(keyword: str, text_lower: str) -> bool:
     if kw in ("промо", "склад", "сервис", "staff"):
         pattern = rf'(?<![a-zа-яё0-9]){re.escape(kw)}(?![a-zа-яё0-9])'
         return bool(re.search(pattern, text_lower, re.IGNORECASE))
-    if len(kw) <= 5:
+    if len(kw) <= 5 or kw in _BOUNDARY_KEYWORDS:
         pattern = rf'(?<![a-zа-яё0-9]){re.escape(kw)}(?![a-zа-яё0-9])'
         return bool(re.search(pattern, text_lower, re.IGNORECASE))
     return kw in text_lower
+
+
+_BOUNDARY_KEYWORDS = frozenset({
+    "водитель", "водители", "курьер", "экспедитор",
+})
 
 _CATEGORY_TIEBREAK = (
     "loader", "promoter", "hostess", "waiter", "animator", "wardrobe",
@@ -1976,6 +1983,41 @@ _ACADEMIC_WRITING_MARKERS = (
     "типографическ", "переплёт", "переплет", "прошивка", "ламинция",
     "заказать работу", "написание работ", "научная работа",
 )
+
+_REMOTE_OFFICE_MARKERS = (
+    "#удаленка", "#удалёнка", "удаленка", "удалёнка",
+    "дистанционная работа", "полностью дистанцион", "работа удалённо",
+    "работать удалённо", "удалённо без постоянного", "из дома",
+)
+_REMOTE_OFFICE_ROLE_MARKERS = (
+    "etsy", "оператор", "ассистент ии", "ии-ассистент", "нейросет",
+    "chatgpt", "claude", "маркетплейс", "wildberries", "ozon",
+    "оператор-", "оператор ",
+)
+_EVENT_STAFF_CONTEXT = (
+    "мероприят", "хелпер", "хэлпер", "грузчик", "промоутер", "аниматор",
+    "официант", "хостес", "на смену", "на сегодня", "на завтра", "разов",
+    "смена ", "event staff", "площадке",
+)
+
+
+def is_remote_office_job_spam(text: str) -> bool:
+    """Удалённая офисная/online-работа — не event-staff для Hunter."""
+    if not text:
+        return False
+    tl = text.lower()
+    has_remote = any(m.replace("#", "") in tl for m in _REMOTE_OFFICE_MARKERS)
+    if not has_remote and not any(w in tl for w in ("удален", "удалён", "дистанцион")):
+        return False
+    has_event = any(w in tl for w in _EVENT_STAFF_CONTEXT)
+    if has_event:
+        return False
+    if any(w in tl for w in _REMOTE_OFFICE_ROLE_MARKERS):
+        return True
+    if "зарплата фикс" in tl or "з/п" in tl or "зарплат" in tl:
+        if has_remote or "дистанцион" in tl:
+            return True
+    return False
 
 
 def is_academic_writing_spam(text: str) -> bool:
@@ -2203,6 +2245,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "unpaid", []
     if is_academic_writing_spam(text):
         return False, "academic_writing_spam", []
+    if is_remote_office_job_spam(text):
+        return False, "remote_office_job", []
     if is_professional_casting_spam(text):
         return False, "professional_casting", []
     for phrase in STOP_PHRASES:

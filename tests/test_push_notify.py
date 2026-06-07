@@ -18,6 +18,8 @@ MSK = ZoneInfo("Europe/Moscow")
 def _prefs(**notify_kw):
     prefs = default_prefs()
     prefs["notify"].update(notify_kw)
+    if notify_kw.get("quiet_start") or notify_kw.get("quiet_end"):
+        prefs["notify"]["quiet_configured"] = notify_kw.get("quiet_configured", True)
     return normalize_prefs(prefs)
 
 
@@ -86,3 +88,13 @@ def test_pause_until_morning():
     until = compute_pause_until_morning(prefs, now)
     assert until.astimezone(MSK).hour == 8
     assert until.astimezone(MSK).date().day == 4
+
+
+def test_default_prefs_do_not_block_quiet_hours():
+    prefs = normalize_prefs({})
+    late = datetime(2026, 6, 3, 23, 30, tzinfo=MSK)
+    assert is_in_quiet_hours(prefs, late) is False
+    ok, reason, digest = evaluate_push_delivery(prefs, "loader", now=late)
+    assert ok is True
+    assert reason is None
+    assert digest is False

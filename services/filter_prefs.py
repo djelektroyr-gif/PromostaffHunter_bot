@@ -30,8 +30,9 @@ def default_prefs() -> dict:
             "earliest_start": None,
         },
         "notify": {
-            "quiet_start": "23:00",
-            "quiet_end": "08:00",
+            "quiet_start": None,
+            "quiet_end": None,
+            "quiet_configured": False,
             "paused_until": None,
             "category_push": {},
             "digest_after_pause": True,
@@ -122,8 +123,10 @@ def normalize_prefs(raw: dict | None) -> dict:
     if isinstance(notify, dict):
         n = prefs["notify"]
         for key in ("quiet_start", "quiet_end", "paused_until"):
-            if key in notify and notify[key] is not None:
+            if key in notify:
                 n[key] = notify[key]
+        if "quiet_configured" in notify:
+            n["quiet_configured"] = bool(notify["quiet_configured"])
         if "digest_after_pause" in notify:
             n["digest_after_pause"] = bool(notify["digest_after_pause"])
         if "push_block_was_active" in notify:
@@ -227,8 +230,8 @@ def format_prefs_summary(prefs: dict) -> str:
     if prefs.get("apply_to_feed"):
         parts.append("фильтры в ленте")
     notify = prefs.get("notify") or {}
-    quiet = f"{notify.get('quiet_start', '23:00')}–{notify.get('quiet_end', '08:00')}"
-    parts.append(f"quiet {quiet}")
+    if notify.get("quiet_configured") and notify.get("quiet_start") and notify.get("quiet_end"):
+        parts.append(f"quiet {notify['quiet_start']}–{notify['quiet_end']}")
     from services.push_notify import format_busy_line, is_user_busy
 
     if is_user_busy(prefs):

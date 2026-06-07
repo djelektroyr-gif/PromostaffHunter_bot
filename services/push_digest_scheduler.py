@@ -13,6 +13,7 @@ from db import (
     clear_push_digest_pending,
     count_push_digest_pending,
     get_subscriber_filter_prefs_effective,
+    get_subscriber_filter_prefs_raw,
     list_active_premium_user_ids,
     patch_subscriber_notify_prefs,
 )
@@ -83,9 +84,8 @@ async def send_push_digest_if_pending(bot: Bot, user_id: int) -> bool:
 async def process_push_digest_transitions(bot: Bot) -> int:
     """Проверяет выход из quiet/busy и шлёт digest."""
     sent = 0
-    now_blocked_by_user: dict[int, bool] = {}
     for user_id in list_active_premium_user_ids():
-        prefs = get_subscriber_filter_prefs_effective(user_id)
+        prefs = get_subscriber_filter_prefs_raw(user_id)
         if not prefs:
             continue
         prefs = normalize_prefs(prefs)
@@ -97,14 +97,12 @@ async def process_push_digest_transitions(bot: Bot) -> int:
                 notify = prefs.get("notify") or {}
         blocked = is_push_blocked(prefs)
         was_blocked = bool(notify.get("push_block_was_active"))
-        now_blocked_by_user[user_id] = blocked
         if was_blocked and not blocked:
             if await send_push_digest_if_pending(bot, user_id):
                 sent += 1
                 await asyncio.sleep(PUSH_DIGEST_NOTIFY_DELAY_SEC)
-
-    for user_id, blocked in now_blocked_by_user.items():
-        patch_subscriber_notify_prefs(user_id, {"push_block_was_active": blocked})
+        if was_blocked != blocked:
+            patch_subscriber_notify_prefs(user_id, {"push_block_was_active": blocked})
 
     if sent:
         logger.info("Push digest messages sent: %d", sent)

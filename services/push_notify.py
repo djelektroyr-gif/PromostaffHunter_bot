@@ -33,9 +33,16 @@ def _minutes_since_midnight(hour: int, minute: int) -> int:
     return hour * 60 + minute
 
 
+def is_quiet_hours_configured(prefs: dict) -> bool:
+    notify = normalize_prefs(prefs).get("notify") or {}
+    return bool(notify.get("quiet_configured"))
+
+
 def is_in_quiet_hours(prefs: dict, now: datetime | None = None) -> bool:
     """Тихие часы по MSK; интервал может пересекать полночь."""
     notify = normalize_prefs(prefs).get("notify") or {}
+    if not notify.get("quiet_configured"):
+        return False
     start = parse_hhmm(notify.get("quiet_start"))
     end = parse_hhmm(notify.get("quiet_end"))
     if not start or not end:
@@ -143,6 +150,8 @@ def paused_until_iso(dt: datetime) -> str:
 
 def format_quiet_hours_line(prefs: dict) -> str:
     notify = normalize_prefs(prefs).get("notify") or {}
+    if not notify.get("quiet_configured"):
+        return "выкл."
     start = notify.get("quiet_start") or "23:00"
     end = notify.get("quiet_end") or "08:00"
     return f"{start} – {end}"
