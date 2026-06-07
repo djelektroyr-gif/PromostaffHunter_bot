@@ -24,6 +24,7 @@ from parser import (
     format_chat_noise_report, parser_scan_in_progress,
     format_parser_wait_message, format_scan_finished_summary, LAST_DEBUG_STATS,
     format_reject_samples_report, format_channel_coverage_report, run_parser_audit,
+    get_stats_for_filter_reports,
     PARSER_SCAN_TIMEOUT_SEC,
 )
 from admin_exports import (
@@ -811,13 +812,13 @@ async def send_parser_debug_report(message: types.Message):
 async def send_chat_noise_report(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    await answer_admin_report(message, format_chat_noise_report(LAST_DEBUG_STATS))
+    await answer_admin_report(message, format_chat_noise_report(get_stats_for_filter_reports()))
 
 
 async def send_reject_samples_report(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    await answer_admin_report(message, format_reject_samples_report(LAST_DEBUG_STATS))
+    await answer_admin_report(message, format_reject_samples_report(get_stats_for_filter_reports()))
 
 
 async def send_channel_coverage_report(message: types.Message):
@@ -829,7 +830,7 @@ async def send_channel_coverage_report(message: types.Message):
         for r in db_rows
         if r.get("source_chat_title")
     }
-    await answer_admin_report(message, format_channel_coverage_report(LAST_DEBUG_STATS, db_map))
+    await answer_admin_report(message, format_channel_coverage_report(get_stats_for_filter_reports(), db_map))
 
 def build_admin_dashboard_text() -> str:
     stats = get_admin_stats()
@@ -4812,9 +4813,9 @@ async def check_now_cmd(message: types.Message):
                 pass
     try:
         await status_msg.edit_text("🔍 Ручная проверка чатов…")
-        orders, closed_data = await run_parser()
-        summary = format_scan_finished_summary(LAST_DEBUG_STATS)
-        if LAST_DEBUG_STATS.get("error") == "timeout":
+        orders, closed_data, stats = await run_parser()
+        summary = format_scan_finished_summary(stats)
+        if stats.get("error") == "timeout":
             await status_msg.edit_text(
                 f"❌ Ручная проверка прервана по таймауту ({PARSER_SCAN_TIMEOUT_SEC // 60} мин).\n\n{summary}",
                 parse_mode="Markdown",

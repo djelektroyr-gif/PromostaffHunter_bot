@@ -353,28 +353,41 @@ def format_parser_wait_message(stats: dict | None = None) -> str:
 
 
 def format_scan_finished_summary(stats: dict | None = None) -> str:
-    """Краткий итог завершённого прогона (startup/periodic), без повторного scan."""
+    """Краткий итог завершённого прогона (startup/periodic/manual/audit)."""
     s = stats or LAST_DEBUG_STATS
     kind = s.get("run_kind") or "scan"
     labels = {
         "startup": "Стартовая синхронизация",
         "periodic": "Плановая проверка",
         "manual": "Ручная проверка",
+        "audit": "Аудит фильтра",
     }
     label = labels.get(kind, "Прогон парсера")
     err = s.get("error")
     err_line = f"\n❌ Ошибка: {err}" if err else ""
+    chats_ok = s.get("chats_ok") or 0
+    chats_total = s.get("chats_total") or 0
+    scanned = s.get("messages_scanned") or 0
+    chats_line = f"Чаты: {chats_ok}/{chats_total}\n" if chats_total else ""
+    hint = ""
+    if kind in ("manual", "periodic", "startup") and scanned == 0 and chats_total and chats_ok >= chats_total:
+        hint = (
+            "\n\n_Новых постов после курсора не было — нормально, "
+            "если ⚡ realtime уже забрал вакансии._"
+        )
     return (
         f"✅ *{label} завершена*{err_line}\n\n"
-        f"Просмотрено сообщений: {s.get('messages_scanned', 0)}\n"
+        f"{chats_line}"
+        f"Просмотрено сообщений: {scanned}\n"
         f"В ленту: {s.get('matched', 0)} | отсеяно: {s.get('non_relevant', 0)}\n"
-        f"Уже в БД: {s.get('already_sent', 0)} | закрыто: {s.get('closed_vacancies', 0)}\n\n"
+        f"Уже в БД: {s.get('already_sent', 0)} | закрыто: {s.get('closed_vacancies', 0)}"
+        f"{hint}\n\n"
         "Детали: «📝 Отчёт парсера» или «📊 Шум по чатам»."
     )
 
 
 def format_chat_noise_report(stats: dict | None = None) -> str:
-    s = stats or LAST_DEBUG_STATS
+    s = stats if stats is not None else get_stats_for_filter_reports()
     by_chat = s.get("by_chat") or {}
     if not by_chat:
         scanned = s.get("messages_scanned") or 0
@@ -423,7 +436,7 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
 
 
 def format_reject_samples_report(stats: dict | None = None) -> str:
-    s = stats or LAST_DEBUG_STATS
+    s = stats if stats is not None else get_stats_for_filter_reports()
     samples = s.get("reject_samples") or []
     if not samples:
         run_kind = s.get("run_kind")
@@ -455,7 +468,7 @@ def format_reject_samples_report(stats: dict | None = None) -> str:
 
 def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int] | None = None) -> str:
     """Сводка: откуда реально идут вакансии (БД) + что дал последний прогон."""
-    s = stats or LAST_DEBUG_STATS
+    s = stats if stats is not None else get_stats_for_filter_reports()
     by_chat = s.get("by_chat") or {}
     db_counts = db_counts or {}
     all_titles = set(by_chat.keys()) | set(db_counts.keys())
@@ -1186,12 +1199,48 @@ def _empty_debug_stats() -> dict:
     }
 
 
+_FINISHED_STATS: dict[str, dict] = {}
+
+
 def _mark_stats_finished(stats: dict, error: str | None = None) -> None:
     if not stats.get("finished_at"):
         stats["finished_at"] = _iso_now()
     stats["phase"] = "done"
     if error:
         stats["error"] = error
+    kind = stats.get("run_kind") or "scan"
+    _FINISHED_STATS[kind] = stats
+
+
+def get_last_finished_stats(run_kind: str) -> dict | None:
+    s = _FINISHED_STATS.get(run_kind)
+    if s and s.get("finished_at"):
+        return s
+    return None
+
+
+def get_stats_for_filter_reports() -> dict:
+    """Снимок для детальных отчётов — не затирается стартом incremental-прогона."""
+    for kind in ("audit", "manual", "startup", "periodic"):
+        s = get_last_finished_stats(kind)
+        if not s:
+            continue
+        if s.get("reject_samples") or s.get("by_chat"):
+            return s
+        if kind == "audit" and (s.get("messages_scanned") or 0) > 0:
+            return s
+    for kind in ("manual", "startup", "periodic", "audit"):
+        s = get_last_finished_stats(kind)
+        if s:
+            return s
+    return LAST_DEBUG_STATS
+
+
+def reset_parser_stats_cache() -> None:
+    """Сброс архива stats (только тесты)."""
+    global LAST_DEBUG_STATS, _FINISHED_STATS
+    LAST_DEBUG_STATS = _empty_debug_stats()
+    _FINISHED_STATS = {}
 
 
 def _new_stats(run_kind: str = "scan") -> dict:
@@ -2182,25 +2231,25 @@ async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
                     timeout=PARSER_SCAN_TIMEOUT_SEC,
                 )
                 _mark_stats_finished(stats)
-                return result
+                orders, closed_data = result
+                return orders, closed_data, stats
 
             logger.error(
                 f"❌ {PARSER_LABEL} offline — ручная проверка пропущена (не создаём второй user_session)"
             )
             _mark_stats_finished(stats, error="offline")
-            return [], []
+            return [], [], stats
     except asyncio.TimeoutError:
         logger.error("Ручная проверка: таймаут %s с", PARSER_SCAN_TIMEOUT_SEC)
         _mark_stats_finished(stats, error="timeout")
-        return [], []
+        return [], [], stats
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в парсере: {e}", exc_info=True)
-        _mark_stats_finished(LAST_DEBUG_STATS, error=str(e))
-        return [], []
+        _mark_stats_finished(stats, error=str(e))
+        return [], [], stats
 
 async def run_parser():
-    orders, closed_data = await get_new_messages()
-    return orders, closed_data
+    return await get_new_messages()
 
 async def test_filter(chat_link: str, limit: int = 30):
     try:

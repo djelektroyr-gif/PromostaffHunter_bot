@@ -272,3 +272,38 @@ def test_build_admin_parser_help_html():
     assert "Аудит фильтра" in text
     assert "Покрытие каналов" in text
     assert "Примеры отсева" in text
+
+
+def test_driver_expeditor_not_classified_as_helper():
+    text = (
+        "Требуется водитель-экспедитор на мероприятие.\n"
+        "Помощь с выгрузкой оборудования.\n"
+        "500 р/ч, оплата на месте.\n"
+        "@logistics_boss"
+    )
+    assert detect_category(text) == "driver"
+    ok, cat, _, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "driver"
+
+
+def test_supervisor_passes_excluded_organizer_gate():
+    text = (
+        "Нужен супервайзер на промо-мероприятие.\n"
+        "Контроль промо-персонала, координатор проекта.\n"
+        "700 р/ч, @super_boss"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "supervisor"
+    assert reason != "excluded_organizer"
+
+
+def test_wedding_organizer_still_rejected():
+    text = (
+        "Ищем организатора свадеб с опытом, координатор свадьбы.\n"
+        "5000 р/день, @wedding_pro"
+    )
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason == "excluded_organizer"
