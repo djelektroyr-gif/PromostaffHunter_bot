@@ -201,6 +201,85 @@ def test_fuzzy_duplicate_anketirovanie_same_author(monkeypatch):
     assert duplicate_type == "fuzzy"
 
 
+def test_order_number_duplicate_cross_chat(monkeypatch):
+    base = (
+        "Грузчики МОСКВА\n"
+        "№279697\n"
+        "Нужны 2 грузчика на разгрузку, оплата 500 р/ч\n"
+        "Создано заказов: 12\n"
+        "@boss_moscow"
+    )
+    repost = (
+        "HelpersTeam\n"
+        "Автопost №279697\n"
+        "❌ Закрыто\n"
+        "2 грузчика, 500 руб/час\n"
+        "@boss_moscow"
+    )
+
+    def fake_exact_duplicate(*args, **kwargs):
+        return False
+
+    def fake_recent(*args, **kwargs):
+        return [{
+            "id": "old",
+            "message_text": base,
+            "author_contact": "@boss_moscow",
+            "dedupe_key": "x",
+            "source_chat_title": "Грузчики МОСКВА",
+            "category_code": "loader",
+        }]
+
+    monkeypatch.setattr("parser.has_recent_duplicate_vacancy", fake_exact_duplicate)
+    monkeypatch.setattr("parser.get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    duplicate_type = detect_duplicate_type(
+        repost,
+        "@boss_moscow",
+        "new_key",
+        "loader",
+        "HelpersTeam",
+    )
+    assert duplicate_type == "order_number"
+
+
+def test_username_duplicate_cross_chat(monkeypatch):
+    base = (
+        "Нужны грузчики на завтра к 10:00, ставка 480 р/ч\n"
+        "Контакт @same_boss"
+    )
+    repost = (
+        "HelpersTeam repost\n"
+        "Грузчики завтра 10-00, 480 руб час\n"
+        "@same_boss"
+    )
+
+    def fake_exact_duplicate(*args, **kwargs):
+        return False
+
+    def fake_recent(*args, **kwargs):
+        return [{
+            "id": "old",
+            "message_text": base,
+            "author_contact": "@same_boss",
+            "dedupe_key": "x",
+            "source_chat_title": "Грузчики МОСКВА",
+            "category_code": "loader",
+        }]
+
+    monkeypatch.setattr("parser.has_recent_duplicate_vacancy", fake_exact_duplicate)
+    monkeypatch.setattr("parser.get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    duplicate_type = detect_duplicate_type(
+        repost,
+        "@same_boss",
+        "new_key",
+        "loader",
+        "HelpersTeam",
+    )
+    assert duplicate_type == "fuzzy"
+
+
 def test_metro_filter_matches_station():
     text = "Срочно нужен промоутер, метро Таганская, ставка 3500"
     assert extract_metro_tokens(text) == ["таганская"]

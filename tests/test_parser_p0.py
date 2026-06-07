@@ -354,3 +354,47 @@ def test_real_helper_in_helpersteam_chat_still_accepted():
     ok, cat, _, _ = evaluate_vacancy(text)
     assert ok is True
     assert cat == "helper"
+
+
+def test_evaluate_rejects_permanent_vakhta_job():
+    text = (
+        "Набор на вахту 60/30, оформление по ТК РФ, "
+        "проживание и питание бесплатно, график 6/1, ежемесячная оплата"
+    )
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason == "permanent_job"
+
+
+def test_evaluate_accepts_loader_shift_despite_tk_words_in_other_context():
+    text = (
+        "Завтра к 9:00 нужны 2 грузчика на разгрузку, "
+        "оплата 500 р/час, минималка 4 часа, @loader_boss"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "loader"
+
+
+def test_evaluate_rejects_event_hunt_service_request():
+    text = (
+        "Ищу #аниматора на 7 июня в Красногорск, "
+        "промо и цены жду в лс"
+    )
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason == "service_request"
+
+
+def test_evaluate_rejects_closed_vacancy_header():
+    text = "❌ Закрыто\nТребовался грузчик, ставка 500"
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason == "closed_vacancy"
+
+
+def test_evaluate_rejects_ai_video_test_spam():
+    text = "Тестируем сеть — нужно снять видео для распознавания образов, пишите в лс"
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason.startswith("stop_phrase")

@@ -132,6 +132,12 @@ async def publish_employer_vacancy(user: types.User, category_code: str, vacancy
 
     author_contact, contact_source = resolve_vacancy_contact(body, poster)
     address = extract_address_from_text(body)
+    from services.vacancy_enrichment import enrich_vacancy_text
+
+    enrichment = enrich_vacancy_text(body, legacy_address=address)
+    if enrichment.address_normalized:
+        address = enrichment.address_normalized
+    enrich_kwargs = enrichment.to_db_kwargs()
     dedupe_key = build_vacancy_dedupe_key(body, author_contact)
     ts = str(int(datetime.now().timestamp()))
     vacancy_id = make_vacancy_id(f"employer_{user.id}", ts, dedupe_key)
@@ -166,6 +172,7 @@ async def publish_employer_vacancy(user: types.User, category_code: str, vacancy
         employer_id,
         user.id,
         "pending",
+        **enrich_kwargs,
     )
     return True, vacancy_id
 
@@ -245,6 +252,9 @@ def build_order_from_vacancy_row(vacancy_id: str, row) -> dict | None:
         "chat_id": row[6],
         "author_contact": row[3],
         "address": row[4],
+        "address_normalized": row[13] if len(row) > 13 else None,
+        "location_lat": row[14] if len(row) > 14 else None,
+        "location_lon": row[15] if len(row) > 15 else None,
         "dedupe_key": row[7],
         "published_at": row[8],
         "poster_user_id": row[9],
@@ -253,7 +263,8 @@ def build_order_from_vacancy_row(vacancy_id: str, row) -> dict | None:
     }
 
 BTN_SETTINGS = "⚙️ Настройки"
-BTN_METRO = "📍 Станции метро"
+BTN_METRO = "📍 Станции метро"  # legacy alias → 🎯 Фильтры Premium
+BTN_PREMIUM_FILTERS = "🎯 Фильтры Premium"
 BTN_SETTINGS_CATEGORIES = "📌 Категории вакансий"
 BTN_SETTINGS_BACK = "◀️ В главное меню"
 BTN_MY_DATA = "👤 Мои данные"
@@ -264,6 +275,11 @@ BTN_UNSUB_LEGACY = "❌ Отписаться"
 bot = Bot(token=BOT_TOKEN)
 storage = create_fsm_storage()
 dp = Dispatcher(storage=storage)
+
+from handlers.premium_filters import router as premium_filters_router
+
+if premium_filters_router.parent_router is None:
+    dp.include_router(premium_filters_router)
 
 # Flood control для рассылки (пауза между отправками)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
@@ -295,13 +311,53 @@ def greeting_display_name(profile: dict | None, user: types.User) -> str:
     return "друг"
 
 
-def build_maps_url(address: str) -> str | None:
-    if not address or not address.strip():
-        return None
-    url = f"https://yandex.ru/maps/?text={quote(address.strip())}"
-    if len(url) > 2048 or not url.startswith("https://"):
-        return None
-    return url
+def build_maps_url(
+    address: str | None = None,
+    *,
+    address_normalized: str | None = None,
+    location_lat: float | None = None,
+    location_lon: float | None = None,
+) -> str | None:
+    from services.vacancy_enrichment import build_maps_url as _build
+
+    return _build(
+        address=address,
+        address_normalized=address_normalized,
+        location_lat=location_lat,
+        location_lon=location_lon,
+    )
+
+
+def _map_fields_from_vacancy(
+    vac: dict | None = None,
+    *,
+    address: str | None = None,
+    address_normalized: str | None = None,
+    location_lat: float | None = None,
+    location_lon: float | None = None,
+) -> dict:
+    if vac:
+        address = vac.get("address", address)
+        address_normalized = vac.get("address_normalized", address_normalized)
+        location_lat = vac.get("location_lat", location_lat)
+        location_lon = vac.get("location_lon", location_lon)
+    return {
+        "address": address,
+        "address_normalized": address_normalized,
+        "location_lat": location_lat,
+        "location_lon": location_lon,
+    }
+
+
+def _map_fields_from_push_row(row) -> dict:
+    if not row:
+        return _map_fields_from_vacancy()
+    return _map_fields_from_vacancy(
+        address=row[4],
+        address_normalized=row[13] if len(row) > 13 else None,
+        location_lat=row[14] if len(row) > 14 else None,
+        location_lon=row[15] if len(row) > 15 else None,
+    )
 
 
 def _inline_btn(
@@ -344,6 +400,9 @@ def build_vacancy_keyboard(
     vacancy_id: str,
     address: str | None = None,
     *,
+    address_normalized: str | None = None,
+    location_lat: float | None = None,
+    location_lon: float | None = None,
     responded: bool = False,
 ) -> InlineKeyboardMarkup:
     """Inline-кнопки с цветами Bot API 9.4 (style на InlineKeyboardButton)."""
@@ -351,7 +410,12 @@ def build_vacancy_keyboard(
         buttons = [[InlineKeyboardButton(text="✅ Отклик отправлен", callback_data="already_responded")]]
     else:
         buttons = [[_inline_btn("Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
-    maps_url = build_maps_url(address) if address else None
+    maps_url = build_maps_url(
+        address,
+        address_normalized=address_normalized,
+        location_lat=location_lat,
+        location_lon=location_lon,
+    )
     if maps_url:
         buttons.append([_inline_btn("На карте", url=maps_url, style="primary")])
     buttons.append([
@@ -740,7 +804,7 @@ async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy
         source=source_title or row[6] or "—",
         message_link=message_link,
     )
-    keyboard = build_vacancy_keyboard(vacancy_id, address)
+    keyboard = build_vacancy_keyboard(vacancy_id, **_map_fields_from_push_row(row))
     await send_vacancy_card(user_id, text, reply_markup=keyboard)
 
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown", chunk_size: int = 3800):
@@ -905,6 +969,17 @@ def format_subscription_screen(user_id: int) -> str:
             "🆓 <b>Бесплатный доступ</b>\n"
             "Лента «🔍 Посмотреть новые вакансии» — без моментальных push"
         )
+    from handlers.premium_filters import get_saved_filters_hint
+
+    saved_hint = get_saved_filters_hint(user_id)
+    if saved_hint:
+        status += f"\n\n{saved_hint}"
+    if is_user_premium(user_id):
+        prefs = get_subscriber_filter_prefs_effective(user_id)
+        if prefs:
+            from services.filter_prefs import format_prefs_summary
+
+            status += f"\n\n🎯 Фильтры: {escape_html(format_prefs_summary(prefs))}"
     pay_lines = []
     if SUBSCRIPTION_CARD_HINT:
         pay_lines.append(f"💳 <b>Реквизиты:</b> {escape_html(SUBSCRIPTION_CARD_HINT)}")
@@ -931,7 +1006,7 @@ def format_subscription_screen(user_id: int) -> str:
         f"<b>Premium даёт:</b>\n"
         f"• моментальные push-уведомления\n"
         f"• все категории без лимита\n"
-        f"• фильтр по метро/району (⚙️ Настройки → 📍 Станции метро)\n\n"
+        f"• 🎯 фильтры Premium: география, ставка (⚙️ Настройки)\n\n"
         f"<b>Free:</b> {_free_category_hint_short()}, только лента без push\n\n"
         f"{pay_heading}\n{pay_block}{trial_hint}"
     )
@@ -1014,9 +1089,6 @@ class PostVacancyState(StatesGroup):
     waiting_for_category = State()
     waiting_for_text = State()
     waiting_for_photo = State()
-
-class MetroState(StatesGroup):
-    waiting_for_zones = State()
 
 class RespondWithPhotoState(StatesGroup):
     waiting_for_photo = State()
@@ -1198,7 +1270,8 @@ def build_admin_help_html() -> str:
         "• «🗑 Удалить вакансию» — полное удаление из базы и у подписчиков (спам/ошибка парсера).\n"
         "• «📺 Канал» — лимиты автопоста, промо, новости, статистика @promostaff_agency_job.\n"
         "• «📣 В канал» — ручная публикация вакансии по ID (без лимитов).\n"
-        "• /delvac ID — удалить вакансию по ID.\n\n"
+        "• /delvac ID — удалить вакансию по ID.\n"
+        "• /enrich_backfill — пересчитать адрес/ставку/координаты (3 дня).\n\n"
         "<b>Общие команды</b>\n"
         "/start — админ-меню · /admin — дашборд · /status — статус парсера и счётчики · /help — эта справка"
     )
@@ -1305,7 +1378,13 @@ def build_admin_user_detail_html(user_id: int) -> str:
     else:
         status_line = "⛔ Неактивен (заблокировал бота или снят вручную)"
     cats = ", ".join(f"{c.get('emoji', '')} {c['name']}".strip() for c in get_user_categories(user_id)) or "—"
-    metro = (profile.get("metro_zones") or "").strip() or "все локации"
+    prefs = get_subscriber_filter_prefs_raw(user_id)
+    if prefs:
+        from services.filter_prefs import format_prefs_summary
+        filters_line = format_prefs_summary(prefs)
+    else:
+        metro = (profile.get("metro_zones") or "").strip()
+        filters_line = f"метро: {metro}" if metro else "все локации"
     registered = format_db_datetime_short(get_subscriber_registered_at(user_id))
     resp_n = count_user_responses(user_id)
     push_n = count_user_sent_vacancies(user_id)
@@ -1329,7 +1408,7 @@ def build_admin_user_detail_html(user_id: int) -> str:
         "",
         f"<b>Настройки</b>",
         f"Категории: {escape_html(cats)}",
-        f"Метро: {escape_html(metro)}",
+        f"Фильтры: {escape_html(filters_line)}",
     ]
     recent = get_user_responses(user_id, limit=3)
     if recent:
@@ -1896,19 +1975,69 @@ async def send_vacancy_to_subscribers(order: dict):
     )
 
     address = order.get('address') or extract_address_from_text(msg_text)
-    keyboard = build_vacancy_keyboard(vacancy_id, address)
+    keyboard = build_vacancy_keyboard(
+        vacancy_id,
+        address=address,
+        address_normalized=order.get("address_normalized"),
+        location_lat=order.get("location_lat"),
+        location_lon=order.get("location_lon"),
+    )
 
     sent_count = 0
     skipped_free = 0
-    skipped_metro = 0
+    skipped_filter = 0
+    skipped_quiet = 0
+    skipped_busy = 0
+    skipped_feed_only = 0
+    from services.subscriber_match import build_vacancy_match_dict, vacancy_matches_subscriber
+    from services.push_notify import evaluate_push_delivery
+    from db import add_push_digest_pending
+
+    vac_match = build_vacancy_match_dict(
+        message_text=msg_text,
+        address=address,
+        address_normalized=order.get("address_normalized") or (mod_row[13] if mod_row else None),
+        category_code=category_code,
+        geo_tags=order.get("geo_tags") or (mod_row[16] if mod_row and len(mod_row) > 16 else None),
+        rate_hourly=order.get("rate_hourly") or (mod_row[17] if mod_row and len(mod_row) > 17 else None),
+        rate_shift=order.get("rate_shift") or (mod_row[18] if mod_row and len(mod_row) > 18 else None),
+        rate_effective_hourly=order.get("rate_effective_hourly") or (
+            mod_row[19] if mod_row and len(mod_row) > 19 else None
+        ),
+        shift_date=order.get("shift_date") or (mod_row[20] if mod_row and len(mod_row) > 20 else None),
+        shift_time_start=order.get("shift_time_start") or (
+            mod_row[21] if mod_row and len(mod_row) > 21 else None
+        ),
+        location_lat=order.get("location_lat") or (mod_row[14] if mod_row else None),
+        location_lon=order.get("location_lon") or (mod_row[15] if mod_row else None),
+    )
     for subscriber in subscribers:
         if not is_user_premium(subscriber['user_id']):
             skipped_free += 1
             continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
             continue
-        if not vacancy_matches_user_metro(msg_text, address, subscriber.get('metro_zones')):
-            skipped_metro += 1
+        prefs = get_subscriber_filter_prefs_effective(subscriber['user_id'])
+        ok, filter_reason = vacancy_matches_subscriber(
+            vac_match,
+            prefs,
+            legacy_metro_zones=subscriber.get('metro_zones'),
+        )
+        if not ok:
+            skipped_filter += 1
+            continue
+        can_push, push_reason, queue_digest = evaluate_push_delivery(
+            prefs or {}, category_code,
+        )
+        if not can_push:
+            if push_reason == "quiet":
+                skipped_quiet += 1
+            elif push_reason == "busy":
+                skipped_busy += 1
+            elif push_reason == "feed_only":
+                skipped_feed_only += 1
+            if queue_digest and prefs:
+                add_push_digest_pending(subscriber['user_id'], vacancy_id)
             continue
         if not try_reserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id']):
             continue
@@ -1926,7 +2055,8 @@ async def send_vacancy_to_subscribers(order: dict):
 
     logger.info(
         f"Вакансия {vacancy_id} (категория {category_code}): push {sent_count}, "
-        f"free skip {skipped_free}, metro skip {skipped_metro}"
+        f"free skip {skipped_free}, filter skip {skipped_filter}, "
+        f"quiet {skipped_quiet}, busy {skipped_busy}, feed_only {skipped_feed_only}"
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
@@ -2029,7 +2159,7 @@ def get_settings_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SETTINGS_CATEGORIES)],
-            [KeyboardButton(text=BTN_METRO)],
+            [KeyboardButton(text=BTN_PREMIUM_FILTERS)],
             [KeyboardButton(text=BTN_SETTINGS_BACK)],
         ],
         resize_keyboard=True,
@@ -2039,7 +2169,7 @@ def get_settings_keyboard() -> ReplyKeyboardMarkup:
 USER_MENU_BUTTONS = {
     "🔍 Посмотреть новые вакансии",
     "📨 Мои отклики", BTN_SETTINGS, BTN_SETTINGS_LEGACY,
-    BTN_SETTINGS_CATEGORIES, BTN_METRO, BTN_SETTINGS_BACK,
+    BTN_SETTINGS_CATEGORIES, BTN_PREMIUM_FILTERS, BTN_METRO, BTN_SETTINGS_BACK,
     "📍 Мои районы",
     "💎 Подписка", BTN_MY_DATA, BTN_MY_DATA_LEGACY,
     "📖 Как пользоваться", "❓ Поддержка",
@@ -3146,15 +3276,40 @@ def _get_user_feed(user_id: int) -> dict | None:
     return data
 
 
-def _feed_metro_context(user_id: int) -> tuple[bool, str | None]:
-    profile = get_subscriber_profile(user_id)
-    metro_zones = profile.get("metro_zones") if profile else None
-    apply_metro = bool(is_user_premium(user_id) and metro_zones)
-    return apply_metro, metro_zones
+def _feed_filter_context(user_id: int) -> tuple[bool, dict | None]:
+    if not is_user_premium(user_id):
+        return False, None
+    prefs = get_subscriber_filter_prefs_effective(user_id)
+    if not prefs or not prefs.get("apply_to_feed"):
+        return False, prefs
+    return True, prefs
+
+
+def _vacancy_passes_feed_filters(vac: dict, cat_code: str, prefs: dict | None) -> bool:
+    if not prefs:
+        return True
+    from services.subscriber_match import vacancy_matches_subscriber
+
+    vac_match = {
+        "message_text": vac.get("text") or "",
+        "address": vac.get("address"),
+        "address_normalized": vac.get("address_normalized"),
+        "category_code": cat_code,
+        "geo_tags": vac.get("geo_tags"),
+        "rate_hourly": vac.get("rate_hourly"),
+        "rate_shift": vac.get("rate_shift"),
+        "rate_effective_hourly": vac.get("rate_effective_hourly"),
+        "shift_date": vac.get("shift_date"),
+        "shift_time_start": vac.get("shift_time_start"),
+        "location_lat": vac.get("location_lat"),
+        "location_lon": vac.get("location_lon"),
+    }
+    ok, _ = vacancy_matches_subscriber(vac_match, prefs)
+    return ok
 
 
 def _feed_vacancies_for_category(
-    user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None, feed_mode: str = "fresh",
+    user_id: int, cat: dict, apply_filters: bool, prefs: dict | None, feed_mode: str = "fresh",
 ) -> list:
     vacancies = get_feed_vacancies_for_user(user_id, cat["code"])
     result = []
@@ -3163,9 +3318,7 @@ def _feed_vacancies_for_category(
             continue
         if not vacancy_matches_category(vac.get("text") or "", cat["code"]):
             continue
-        if apply_metro and not vacancy_matches_user_metro(
-            vac.get("text", ""), vac.get("address"), metro_zones
-        ):
+        if apply_filters and not _vacancy_passes_feed_filters(vac, cat["code"], prefs):
             continue
         vac["category"] = cat
         result.append(vac)
@@ -3175,7 +3328,7 @@ def _feed_vacancies_for_category(
 def _collect_feed_vacancies(
     user_id: int, category_codes: list[str] | None = None, feed_mode: str = "fresh",
 ) -> list:
-    apply_metro, metro_zones = _feed_metro_context(user_id)
+    apply_filters, prefs = _feed_filter_context(user_id)
     user_categories = get_user_categories(user_id)
     if category_codes is not None:
         codes = set(category_codes)
@@ -3183,7 +3336,7 @@ def _collect_feed_vacancies(
     all_vacancies = []
     for cat in user_categories:
         all_vacancies.extend(
-            _feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones, feed_mode)
+            _feed_vacancies_for_category(user_id, cat, apply_filters, prefs, feed_mode)
         )
     all_vacancies.sort(
         key=lambda v: v.get("published_at") or v.get("found_at") or "",
@@ -3193,17 +3346,17 @@ def _collect_feed_vacancies(
 
 
 def _feed_count_for_category(
-    user_id: int, cat: dict, apply_metro: bool, metro_zones: str | None, feed_mode: str = "fresh",
+    user_id: int, cat: dict, apply_filters: bool, prefs: dict | None, feed_mode: str = "fresh",
 ) -> int:
-    return len(_feed_vacancies_for_category(user_id, cat, apply_metro, metro_zones, feed_mode))
+    return len(_feed_vacancies_for_category(user_id, cat, apply_filters, prefs, feed_mode))
 
 
 def _feed_mode_totals(user_id: int) -> tuple[int, int]:
-    apply_metro, metro_zones = _feed_metro_context(user_id)
+    apply_filters, prefs = _feed_filter_context(user_id)
     fresh_total = archive_total = 0
     for cat in get_user_categories(user_id):
-        fresh_total += _feed_count_for_category(user_id, cat, apply_metro, metro_zones, "fresh")
-        archive_total += _feed_count_for_category(user_id, cat, apply_metro, metro_zones, "archive")
+        fresh_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "fresh")
+        archive_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "archive")
     return fresh_total, archive_total
 
 
@@ -3222,12 +3375,12 @@ def build_feed_mode_keyboard(fresh_total: int, archive_total: int) -> InlineKeyb
 
 def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKeyboardMarkup, int]:
     user_categories = get_user_categories(user_id)
-    apply_metro, metro_zones = _feed_metro_context(user_id)
+    apply_filters, prefs = _feed_filter_context(user_id)
     buttons, row = [], []
     total = 0
     mode_label = "свежие" if feed_mode == "fresh" else "ранее"
     for i, cat in enumerate(user_categories):
-        count = _feed_count_for_category(user_id, cat, apply_metro, metro_zones, feed_mode)
+        count = _feed_count_for_category(user_id, cat, apply_filters, prefs, feed_mode)
         total += count
         row.append(InlineKeyboardButton(
             text=f"{cat['emoji']} {cat['name']} ({count})",
@@ -3251,8 +3404,8 @@ async def show_feed_mode_menu(message: types.Message, user_id: int):
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
     fresh_total, archive_total = _feed_mode_totals(user_id)
-    apply_metro, _ = _feed_metro_context(user_id)
-    hint = "\n\n📍 Учитывается фильтр «Станции метро»." if apply_metro else ""
+    apply_filters, _ = _feed_filter_context(user_id)
+    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
     if fresh_total == 0 and archive_total == 0:
         await message.answer(
             f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
@@ -3275,8 +3428,8 @@ async def show_feed_category_menu(message: types.Message, user_id: int, feed_mod
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
     markup, total = build_feed_category_keyboard(user_id, feed_mode)
-    apply_metro, _ = _feed_metro_context(user_id)
-    hint = "\n\n📍 Учитывается фильтр «Станции метро»." if apply_metro else ""
+    apply_filters, _ = _feed_filter_context(user_id)
+    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
     mode_title = f"🟢 Свежие ({FEED_FRESH_HOURS} ч)" if feed_mode == "fresh" else "📂 Ранее"
     if total == 0:
         await message.answer(
@@ -3306,8 +3459,11 @@ async def open_feed_vacancies(
     async with typing_keepalive(bot, message.chat.id):
         all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
     if not all_vacancies:
-        apply_metro, _ = _feed_metro_context(user_id)
-        hint = "\n\nПопробуйте расширить список станций в ⚙️ Настройки → 📍 Станции метро." if apply_metro else ""
+        apply_filters, _ = _feed_filter_context(user_id)
+        hint = (
+            "\n\nПопробуйте ослабить фильтры в ⚙️ Настройки → 🎯 Фильтры Premium."
+            if apply_filters else ""
+        )
         await message.answer(f"🔍 В этой категории вакансий нет.{hint}", parse_mode="Markdown")
         return
     user_pages[user_id] = {
@@ -3397,7 +3553,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
                 source=vac.get("source") or "—",
                 message_link=vac.get("link"),
             )
-            keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
+            keyboard = build_vacancy_keyboard(vac["id"], **_map_fields_from_vacancy(vac))
             try:
                 await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
                 try_reserve_vacancy_sent_to_user(vac["id"], user_id)
@@ -3626,10 +3782,6 @@ async def premium_request_reject_callback(callback: types.CallbackQuery):
         pass
 
 
-def _is_metro_reset(text: str) -> bool:
-    return text.strip().lower() in {"-", "0", "сброс", "reset", "отмена", "нет"}
-
-
 async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> bool:
     """Отмена активного FSM и переход по кнопке reply-меню."""
     text = (message.text or "").strip()
@@ -3649,8 +3801,9 @@ async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> boo
         await send_category_picker(message.chat.id, user_id)
     elif text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
         await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard())
-    elif text in {BTN_METRO, "📍 Мои районы"}:
-        await metro_zones_menu(message, state)
+    elif text in {BTN_PREMIUM_FILTERS, BTN_METRO, "📍 Мои районы"}:
+        from handlers.premium_filters import show_premium_filters_screen
+        await show_premium_filters_screen(message, user_id)
     elif text == "💎 Подписка":
         await subscription_menu(message)
     elif text in {"📋 Мои категории", "✏️ Изменить категории"}:
@@ -3668,70 +3821,6 @@ async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> boo
         await message.answer("↩️ Шаг отменён.", reply_markup=keyboard)
     return True
 
-
-async def _cancel_metro_input(message: types.Message, state: FSMContext):
-    """Выход из ввода метро без сохранения текста кнопки меню."""
-    await user_fsm_menu_escape(message, state)
-
-
-@dp.message(lambda m: m.text in {BTN_METRO, "📍 Мои районы"})
-async def metro_zones_menu(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not is_user_premium(user_id):
-        await message.answer(
-            "📍 Фильтр по метро — функция *Premium*.\n\n"
-            "Оформите подписку в 💎 Подписка или дождитесь окончания пробного периода.",
-            parse_mode="Markdown",
-            reply_markup=get_settings_keyboard() if message.text == BTN_METRO else get_main_keyboard(user_id)[0],
-        )
-        return
-    profile = get_subscriber_profile(user_id)
-    current = profile.get("metro_zones") if profile else None
-    current_line = current if current else "не заданы (приходят все локации)"
-    await message.answer(
-        f"📍 *Станции метро*\n\n"
-        f"Сейчас: {current_line}\n\n"
-        f"Введите станции через запятую, например:\n"
-        f"`Таганская, Беляево, Сокол`\n\n"
-        f"Чтобы *сбросить* фильтр — отправьте `0` или `-`.",
-        parse_mode="Markdown",
-        reply_markup=get_settings_keyboard(),
-    )
-    await state.set_state(MetroState.waiting_for_zones)
-
-
-@dp.message(MetroState.waiting_for_zones)
-async def metro_zones_save(message: types.Message, state: FSMContext):
-    from services.chat_feedback import send_typing
-    await send_typing(bot, message.chat.id)
-    user_id = message.from_user.id
-    text = (message.text or "").strip()
-    if text in USER_MENU_BUTTONS:
-        await _cancel_metro_input(message, state)
-        return
-    if _is_metro_reset(text):
-        set_user_metro_zones(user_id, None)
-        await state.clear()
-        await message.answer(
-            "✅ Фильтр по метро сброшен — снова все локации.",
-            reply_markup=get_settings_keyboard(),
-        )
-        return
-    zones = ", ".join(z.strip() for z in text.split(",") if z.strip())
-    if not zones or "👤" in zones or "⚙️" in zones:
-        await message.answer(
-            "❌ Укажите названия станций через запятую.\n"
-            "Или отправьте `0`, чтобы показывать все локации.",
-            parse_mode="Markdown",
-        )
-        return
-    set_user_metro_zones(user_id, zones)
-    await state.clear()
-    await message.answer(
-        f"✅ Сохранено: *{zones}*\n\nPush и лента — только вакансии с этими станциями.",
-        parse_mode="Markdown",
-        reply_markup=get_settings_keyboard(),
-    )
 
 @dp.message(Command("user"))
 async def user_admin_cmd(message: types.Message):
@@ -4076,11 +4165,10 @@ async def notfit_vacancy_pick(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data and c.data.startswith("notfit_cancel:"))
 async def notfit_vacancy_cancel(callback: types.CallbackQuery):
     vacancy_id = callback.data.split(":", 1)[1]
-    row = fetchone("SELECT address FROM vacancies WHERE id = ?", (vacancy_id,))
-    address = row[0] if row else None
+    row = get_vacancy_push_row(vacancy_id)
     try:
         await callback.message.edit_reply_markup(
-            reply_markup=build_vacancy_keyboard(vacancy_id, address),
+            reply_markup=build_vacancy_keyboard(vacancy_id, **_map_fields_from_push_row(row)),
         )
     except TelegramBadRequest:
         pass
@@ -4301,6 +4389,17 @@ async def _send_admin_delete_vacancy_result(callback: types.CallbackQuery, resul
         except TelegramBadRequest:
             plain = re.sub(r"<[^>]*>", "", result)
             await callback.message.answer(plain, reply_markup=get_admin_mod_keyboard())
+
+
+@dp.message(Command("enrich_backfill"))
+async def enrich_backfill_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    from db import backfill_vacancy_enrichment
+
+    await message.answer("⏳ Пересчитываю enrichment за 3 дня…")
+    updated = await run_db(backfill_vacancy_enrichment, 3)
+    await message.answer(f"✅ Enrichment backfill: обновлено {updated} вакансий.")
 
 
 @dp.message(Command("delvac"))
@@ -6124,6 +6223,17 @@ async def on_startup():
         logger.info(f"🔄 Миграция ID вакансий: обновлено {migrated} записей")
     logger.info("📁 База данных инициализирована")
 
+    async def _startup_enrichment_backfill():
+        try:
+            from db import backfill_vacancy_enrichment
+            updated = await run_db(backfill_vacancy_enrichment, 3)
+            if updated:
+                logger.info("Enrichment backfill on startup: %s vacancies", updated)
+        except Exception as e:
+            logger.warning("Enrichment backfill on startup failed: %s", e)
+
+    spawn_background_task(_startup_enrichment_backfill())
+
     from services.channel_images import log_channel_images_status
     from services.channel_promo_texts import log_promo_texts_status
 
@@ -6179,6 +6289,10 @@ async def on_startup():
         "💎 Планировщик Premium: истечение + напоминание за %s дн. (каждый час)",
         PREMIUM_RENEWAL_REMIND_DAYS,
     )
+
+    from services.push_digest_scheduler import push_digest_scheduler_loop
+    spawn_background_task(push_digest_scheduler_loop(bot))
+    logger.info("🔔 Планировщик push-digest: каждую минуту (quiet / «занят»)")
 
     async def channel_snapshot_loop():
         import asyncio

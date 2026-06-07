@@ -255,7 +255,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 ### Фильтр метро (Premium)
 
 - Поле `subscribers.metro_zones` (через запятую).
-- Кнопка **📍 Мои районы** — push и лента фильтруются по станциям; если в вакансии метро не указано — не отсекаем.
+- Кнопка **🎯 Фильтры Premium** (⚙️ Настройки) — география, ставка, опционально фильтры в ленте; legacy **📍 Станции метро** / **📍 Мои районы** открывают тот же экран.
 
 ### Известные ограничения парсера
 
@@ -263,6 +263,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 - [x] Digest «1. … 2. …» — **split по блокам** (P1, `tool-v1`); reject только блоки, не прошедшие gate.
 - [x] P0: `evaluate_vacancy()` — staff gate + per-category quality; push re-check.
 - [x] Закрытие вакансии — reply «закрыто», строка «ЗАКРЫТО» в посте, зачёркивание (MessageEdited).
+- [x] **Обогащение вакансий** (адрес для карт, координаты, ₽/ч и ₽/смена) — ✅ фаза 0: [PREMIUM_FILTERS.md §6](PREMIUM_FILTERS.md#6-фаза-0--обогащение-парсера-обязательный-фундамент), `/enrich_backfill`.
 
 **Классификация (2026-06-05):** «координатор свадеб/организатор» ≠ супервайзер; отдельно «промо», «выгрузка/фасовка/рохля» → грузчик; без оплаты — не в ленту; fuzzy-dedupe ловит повторы одной кампании с разными адресами.
 
@@ -309,6 +310,8 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 - [x] Напоминание за 3 дня до конца Premium (cron, `PREMIUM_RENEWAL_REMIND_DAYS`).
 - [ ] Статусы отклика (`sent` / `closed`) в UI.
 - [ ] Избранное ⭐, пауза push (Premium).
+- [x] **Premium-фильтры v2 — фаза 2** — тихие часы, «занят», digest, режим push по категориям (`services/push_notify.py`, `push_digest_scheduler.py`).
+- [x] **Premium-фильтры v2 — фаза 3** — смена (ночь/сегодня/earliest), радиус от города, координаты в каталоге МО.
 
 ---
 
@@ -332,6 +335,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 | Push только Premium | ✅ Free — лента без push |
 | **Пробный период** | ✅ `TRIAL_DAYS` (default 7), `trial_used` |
 | Фильтр метро | ✅ Premium, `metro_zones` |
+| Premium-фильтры v2 (geo, ставка, push-режимы) | ✅ [PREMIUM_FILTERS.md](PREMIUM_FILTERS.md) — согласовано |
 | Автооплата / webhook | ❌ нет (ручная карта) |
 
 ### Решение владельца (2026-06-03)
@@ -361,7 +365,7 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 |-------|------|------------|
 | **Free** | 0 ₽ | До 3 категорий, лента «🔍 Посмотреть новые», **без push** |
 | **Trial** | 0 ₽ | `TRIAL_DAYS` дней Premium (один раз на user_id) при завершении выбора категорий |
-| **Premium** | env `SUBSCRIPTION_PRICE_RUB`/мес | Push, все категории, фильтр метро |
+| **Premium** | env `SUBSCRIPTION_PRICE_RUB`/мес | Push, все категории, 🎯 фильтры Premium |
 
 ### TODO по подписке (осталось)
 
@@ -435,7 +439,7 @@ VACANCY_MAX_AGE_HOURS=36
 | Второй процесс ломал Telethon | `session_lock.py` |
 | Парсер offline без алертов | Health loop + auto-reconnect |
 | «Только сегодня» отсекало вечер | `is_message_recent` 36 ч |
-| Нет фильтра метро | `metro_zones` + 📍 Мои районы |
+| Нет фильтра Premium | `subscriber_filter_prefs` + ⚙️ → 🎯 Фильтры Premium |
 | Telethon EOF на сервере | `create_authorized_client()` — connect без input(); алерт если нет `.session` |
 | `TypeNotFoundError` / Constructor ID | Обновить `telethon` в `requirements.txt`; один `.session` на один процесс; авто-reconnect 30 с |
 | Конфликт `cat_` postvacancy vs регистрация | Префикс `postcat_` для админ-публикации |

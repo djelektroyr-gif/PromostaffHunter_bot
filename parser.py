@@ -589,12 +589,33 @@ async def _save_parsed_vacancy_block(
     if not author_contact and message.text and message.text != eval_text:
         author_contact, contact_source = resolve_vacancy_contact(message.text, poster)
     address = extract_address_from_text(eval_text) or extract_address_from_text(message.text or "")
+    full_text = "\n".join(part for part in (eval_text, message.text or "") if part)
+    msg_lat, msg_lon = _extract_message_geo(message)
+    from services.vacancy_enrichment import enrich_vacancy_text
+
+    enrichment = enrich_vacancy_text(
+        full_text,
+        legacy_address=address,
+        location_lat=msg_lat,
+        location_lon=msg_lon,
+    )
+    if enrichment.address_normalized:
+        address = enrichment.address_normalized
+    enrich_kwargs = enrichment.to_db_kwargs()
+
     dedupe_key = build_vacancy_dedupe_key(cleaned_text, author_contact)
 
-    duplicate_type = await run_db(detect_duplicate_type, cleaned_text, author_contact, dedupe_key)
+    duplicate_type = await run_db(
+        detect_duplicate_type,
+        cleaned_text,
+        author_contact,
+        dedupe_key,
+        category,
+        chat_title,
+    )
     if duplicate_type:
         if stats is not None:
-            if duplicate_type == "exact":
+            if duplicate_type in ("exact", "order_number"):
                 stats["duplicates_exact"] += 1
             else:
                 stats["duplicates_fuzzy"] += 1
@@ -634,6 +655,7 @@ async def _save_parsed_vacancy_block(
         employer_id,
         None,
         "approved",
+        **enrich_kwargs,
     )
     _bump_chat_stat(stats, chat_title, "matched")
     if stats is not None:
@@ -651,6 +673,16 @@ async def _save_parsed_vacancy_block(
         "reason": reason,
         "author_contact": author_contact,
         "address": address,
+        "address_normalized": enrichment.address_normalized,
+        "location_lat": enrichment.location_lat,
+        "location_lon": enrichment.location_lon,
+        "category_code": category,
+        "geo_tags": enrichment.geo_tags,
+        "rate_hourly": enrichment.rate_hourly,
+        "rate_shift": enrichment.rate_shift,
+        "rate_effective_hourly": enrichment.rate_effective_hourly,
+        "shift_date": enrichment.shift_date,
+        "shift_time_start": enrichment.shift_time_start,
         "dedupe_key": dedupe_key,
         "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
         "poster_user_id": poster.get("user_id"),
@@ -1418,6 +1450,23 @@ def extract_contact_from_text(text: str) -> str:
         return f"@{ls_match.group(1)}"
     return None
 
+def _extract_message_geo(message) -> tuple[float | None, float | None]:
+    geo = getattr(message, "geo", None)
+    if geo is not None:
+        try:
+            return float(geo.lat), float(geo.long)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    media = getattr(message, "media", None)
+    if media is not None:
+        point = getattr(media, "geo", None)
+        if point is not None:
+            try:
+                return float(point.lat), float(point.long)
+            except (TypeError, ValueError, AttributeError):
+                pass
+    return None, None
+
 def extract_address_from_text(text: str) -> str:
     if not text:
         return None
@@ -1443,10 +1492,37 @@ def extract_address_from_text(text: str) -> str:
         return city_match.group(1)
     return None
 
+_ORDER_NUMBER_RE = re.compile(
+    r"(?:автопост\s*)?[№#]\s*(\d{4,7})\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_order_numbers(text: str) -> set[str]:
+    if not text:
+        return set()
+    return {m.group(1) for m in _ORDER_NUMBER_RE.finditer(text)}
+
+
+def _extract_telegram_usernames(text: str, author_contact: str | None = None) -> set[str]:
+    names = {m.lower() for m in re.findall(r"@([a-zA-Z0-9_]{4,32})", text or "")}
+    contact = (author_contact or "").strip().lower()
+    if contact.startswith("@"):
+        names.add(contact[1:])
+    return names
+
+
 def _normalize_for_dedupe(text: str) -> str:
     if not text:
         return ""
-    normalized = re.sub(r'https?://\S+|t\.me/\S+', ' ', text.lower())
+    normalized = text.lower()
+    normalized = re.sub(r"❌\s*закрыто", " ", normalized)
+    normalized = re.sub(r"(?:авто)?post\s*№?\s*\d+", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"[№#]\s*\d{4,7}", " ", normalized)
+    normalized = re.sub(r"создано\s+заказов\s*:\s*\d+", " ", normalized)
+    normalized = re.sub(r"зарегистрирован\s*:\s*\d+", " ", normalized)
+    normalized = re.sub(r"⭐️+vip⭐️+", " ", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'https?://\S+|t\.me/\S+', ' ', normalized)
     normalized = re.sub(r'@\w+', ' ', normalized)
     normalized = re.sub(r'[\W_]+', ' ', normalized, flags=re.UNICODE)
     return re.sub(r'\s+', ' ', normalized).strip()
@@ -1490,29 +1566,47 @@ def _extract_phone_digits(text: str) -> str:
         digits = "7" + digits[1:]
     return digits if len(digits) == 11 else None
 
-def detect_duplicate_type(text: str, author_contact: str, dedupe_key: str) -> str:
+def detect_duplicate_type(
+    text: str,
+    author_contact: str,
+    dedupe_key: str,
+    category_code: str | None = None,
+    source_chat_title: str | None = None,
+) -> str | None:
     if has_recent_duplicate_vacancy(dedupe_key, max_age_days=1):
         return "exact"
     normalized_text = _normalize_for_dedupe(text)
     fuzzy_text = _normalize_for_fuzzy_dedupe(text)
     if not normalized_text:
         return None
+    order_numbers = _extract_order_numbers(text)
     phone_digits = _extract_phone_digits(text)
+    usernames = _extract_telegram_usernames(text, author_contact)
     normalized_contact = (author_contact or "").strip().lower()
     recent = get_recent_open_vacancies_for_dedupe(max_age_days=1, limit=250)
     for row in recent:
         candidate_text = _normalize_for_dedupe(row.get("message_text", ""))
         if not candidate_text:
             continue
+        if order_numbers and order_numbers & _extract_order_numbers(row.get("message_text", "")):
+            return "order_number"
+        if category_code and row.get("category_code") and category_code != row.get("category_code"):
+            continue
+        candidate_usernames = _extract_telegram_usernames(
+            row.get("message_text", ""), row.get("author_contact"),
+        )
         same_contact = normalized_contact and normalized_contact == (row.get("author_contact") or "").strip().lower()
         same_phone = phone_digits and phone_digits == _extract_phone_digits(row.get("message_text", ""))
-        if not (same_contact or same_phone):
+        same_username = bool(usernames & candidate_usernames)
+        if not (same_contact or same_phone or same_username):
             continue
         similarity = SequenceMatcher(None, normalized_text, candidate_text).ratio()
         fuzzy_similarity = SequenceMatcher(
             None, fuzzy_text, _normalize_for_fuzzy_dedupe(row.get("message_text", ""))
         ).ratio()
-        if similarity >= 0.82 or fuzzy_similarity >= 0.78:
+        threshold = 0.50 if (same_contact or same_username) else 0.55
+        fuzzy_threshold = 0.45 if (same_contact or same_username) else 0.50
+        if similarity >= threshold or fuzzy_similarity >= fuzzy_threshold:
             return "fuzzy"
     return None
 
@@ -1848,6 +1942,30 @@ _SERVICE_REQUEST_RES = (
     re.compile(r"присылайте\s+(?:программу|видео|описание|варианты|прайс|цены)", re.I),
     re.compile(r"бюджет\s+\d+.*(?:ищу|нужен\s+#)", re.I),
     re.compile(r"ищу\s+#\w+\s+на\s+\d", re.I),
+    re.compile(r"ищ[ую]\s+#\w", re.I),
+    re.compile(
+        r"ищ[ую]\s+(?:контактный\s+зоопарк|фотозон|дидже[яй]|видеограф|рилсмейк|мастер-класс\s+для\s+заказчика)",
+        re.I,
+    ),
+    re.compile(r"промо\s+и\s+цены\s+жду", re.I),
+    re.compile(r"фото,\s*описание\s+и\s+цену", re.I),
+)
+
+_PERMANENT_JOB_MARKERS = (
+    "на постоянную работу", "на постоянку", "постоянная работа",
+    "вахта 30", "вахта 60", "вахта 90", "на вахту",
+    "оформление по тк", "оформление по тк рф", "по тк рф",
+    "ежемесячн", "два раза в месяц", "график 5/2", "график 6/1",
+    "набор на вахту", "проживание и питание бесплатно",
+)
+_SHIFT_JOB_MARKERS = (
+    "на сегодня", "на завтра", "на сейчас", "срочно",
+    "заказ наряд", "разово", "подработк", "смена ",
+)
+
+_PRO_CASTING_MARKERS = (
+    "спектакл", "гастрол", "проф. артист", "профессиональный акт",
+    "актер в ", "актёр в ", "командировка в ",
 )
 
 _ACADEMIC_WRITING_MARKERS = (
@@ -1869,6 +1987,54 @@ def is_academic_writing_spam(text: str) -> bool:
     if hits >= 2:
         return True
     if hits >= 1 and any(w in tl for w in ("скидка", "новых клиентов", "реферальн", "под ключ")):
+        return True
+    if "helpers team" in tl.replace(" ", "") or "helpersteam" in tl.replace(" ", ""):
+        if hits >= 1 or any(w in tl for w in ("сессия", "зачёт", "экзамен", "дедлайн")):
+            return True
+    return False
+
+
+def is_closed_vacancy_post(text: str) -> bool:
+    if not text:
+        return False
+    head = text.lstrip()[:80].lower()
+    return head.startswith("❌") and "закрыто" in head
+
+
+def is_permanent_job_spam(text: str) -> bool:
+    """Вахта/ТК — не разовая смена для бота."""
+    if not text:
+        return False
+    tl = text.lower()
+    if not any(m in tl for m in _PERMANENT_JOB_MARKERS):
+        return False
+    if any(m in tl for m in _SHIFT_JOB_MARKERS):
+        return False
+    if re.search(r"к\s*\d{1,2}[:.\s]", tl):
+        return False
+    if re.search(r"№\s*\d{4,7}", tl):
+        return False
+    return True
+
+
+def is_professional_casting_spam(text: str) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+    if not any(m in tl for m in _PRO_CASTING_MARKERS):
+        return False
+    if any(w in tl for w in ("аниматор", "хелпер", "промоутер", "грузчик", "раздача листовок")):
+        return False
+    return True
+
+
+def is_chat_listing_noise(text: str) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+    if "бот для отправки объявлений" in tl:
+        return True
+    if "подписаться на max" in tl and "заявк" not in tl:
         return True
     return False
 
@@ -2027,10 +2193,18 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
     if not text:
         return False, "empty", []
     tl = text.lower()
+    if is_closed_vacancy_post(text):
+        return False, "closed_vacancy", []
+    if is_chat_listing_noise(text):
+        return False, "chat_noise", []
+    if is_permanent_job_spam(text):
+        return False, "permanent_job", []
     if is_unpaid_vacancy(text):
         return False, "unpaid", []
     if is_academic_writing_spam(text):
         return False, "academic_writing_spam", []
+    if is_professional_casting_spam(text):
+        return False, "professional_casting", []
     for phrase in STOP_PHRASES:
         if phrase.lower() in tl:
             return False, f"stop_phrase: {phrase}", []

@@ -14,6 +14,8 @@
 | **Trial** | один раз при «✅ Завершить выбор» категорий (`grant_trial_if_eligible`) | все | да | да | `TRIAL_DAYS` (env, default 7) |
 | **Premium** | оплата + одобрение админа или `/setplan` | все | да | да | `paid_until` в БД |
 
+Расширенные фильтры (ставка, города, тихие часы) — **[PREMIUM_FILTERS.md](PREMIUM_FILTERS.md)** (согласовано, реализация по фазам).
+
 **Лимит Free:** `FREE_CATEGORY_LIMIT` (env, default **1**). Вторая категория и дальше — только Premium.
 
 **Premium активен:** `plan = 'premium'` и `paid_until` в будущем (`is_user_premium()`).

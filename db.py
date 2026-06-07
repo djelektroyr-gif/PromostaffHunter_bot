@@ -215,6 +215,24 @@ def init_db():
         )
 
         cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS subscriber_filter_prefs (
+                user_id INTEGER PRIMARY KEY,
+                prefs_json TEXT NOT NULL DEFAULT '{{}}',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES subscribers(user_id)
+            )
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS push_digest_pending (
+                user_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, vacancy_id)
+            )
+        """)
+
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS employers (
                 id {serial_pk()},
                 telegram_user_id INTEGER UNIQUE,
@@ -297,6 +315,17 @@ def init_db():
             ("employer_id", "ALTER TABLE vacancies ADD COLUMN employer_id INTEGER DEFAULT NULL"),
             ("posted_by_bot_user_id", "ALTER TABLE vacancies ADD COLUMN posted_by_bot_user_id INTEGER DEFAULT NULL"),
             ("moderation_status", "ALTER TABLE vacancies ADD COLUMN moderation_status TEXT DEFAULT 'approved'"),
+            ("address_normalized", "ALTER TABLE vacancies ADD COLUMN address_normalized TEXT DEFAULT NULL"),
+            ("geo_tags", "ALTER TABLE vacancies ADD COLUMN geo_tags TEXT DEFAULT NULL"),
+            ("rate_hourly", "ALTER TABLE vacancies ADD COLUMN rate_hourly INTEGER DEFAULT NULL"),
+            ("rate_shift", "ALTER TABLE vacancies ADD COLUMN rate_shift INTEGER DEFAULT NULL"),
+            ("min_hours", "ALTER TABLE vacancies ADD COLUMN min_hours INTEGER DEFAULT NULL"),
+            ("rate_effective_hourly", "ALTER TABLE vacancies ADD COLUMN rate_effective_hourly INTEGER DEFAULT NULL"),
+            ("shift_date", "ALTER TABLE vacancies ADD COLUMN shift_date TEXT DEFAULT NULL"),
+            ("shift_time_start", "ALTER TABLE vacancies ADD COLUMN shift_time_start TEXT DEFAULT NULL"),
+            ("location_lat", "ALTER TABLE vacancies ADD COLUMN location_lat REAL DEFAULT NULL"),
+            ("location_lon", "ALTER TABLE vacancies ADD COLUMN location_lon REAL DEFAULT NULL"),
+            ("enrichment_version", "ALTER TABLE vacancies ADD COLUMN enrichment_version INTEGER DEFAULT NULL"),
         ):
             add_column_if_missing("vacancies", col, ddl, cur=cur)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
@@ -1171,6 +1200,116 @@ def set_user_metro_zones(user_id: int, metro_zones: str | None):
     execute("UPDATE subscribers SET metro_zones = ? WHERE user_id = ?", (metro_zones, user_id))
 
 
+def get_subscriber_filter_prefs_raw(user_id: int) -> dict | None:
+    import json
+    from services.filter_prefs import normalize_prefs
+
+    row = fetchone(
+        "SELECT prefs_json FROM subscriber_filter_prefs WHERE user_id = ?",
+        (user_id,),
+    )
+    if not row or not row[0]:
+        return None
+    try:
+        data = json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+    return normalize_prefs(data) if isinstance(data, dict) else None
+
+
+def set_subscriber_filter_prefs(user_id: int, prefs: dict) -> None:
+    import json
+    from services.filter_prefs import normalize_prefs
+
+    payload = json.dumps(normalize_prefs(prefs), ensure_ascii=False)
+    execute(
+        """
+        INSERT INTO subscriber_filter_prefs (user_id, prefs_json, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            prefs_json = excluded.prefs_json,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, payload),
+    )
+
+
+def get_subscriber_filter_prefs_effective(user_id: int) -> dict | None:
+    """Prefs с миграцией legacy metro_zones; None если Premium не активен."""
+    if not is_user_premium(user_id):
+        return None
+    from services.filter_prefs import merge_metro_zones_into_prefs, migrate_legacy_metro_zones, normalize_prefs
+
+    prefs = get_subscriber_filter_prefs_raw(user_id)
+    profile = get_subscriber_profile(user_id)
+    metro = (profile or {}).get("metro_zones")
+    if prefs is None:
+        if metro:
+            prefs = normalize_prefs({})
+            prefs["geo"] = migrate_legacy_metro_zones(metro)["geo"]
+            prefs["apply_to_feed"] = True
+            set_subscriber_filter_prefs(user_id, prefs)
+            return prefs
+        return normalize_prefs({})
+    return merge_metro_zones_into_prefs(prefs, metro)
+
+
+def clear_subscriber_filter_prefs(user_id: int) -> None:
+    execute("DELETE FROM subscriber_filter_prefs WHERE user_id = ?", (user_id,))
+
+
+def list_active_premium_user_ids() -> list[int]:
+    rows = fetchall(
+        f"""
+        SELECT user_id FROM subscribers
+        WHERE is_active = {bool_true()} AND plan = 'premium' AND {paid_until_active()}
+        ORDER BY user_id
+        """,
+    )
+    return [r[0] for r in rows]
+
+
+def add_push_digest_pending(user_id: int, vacancy_id: str) -> bool:
+    """Добавляет вакансию в очередь digest. False если уже есть."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "INSERT INTO push_digest_pending (user_id, vacancy_id) VALUES (?, ?) "
+                "ON CONFLICT(user_id, vacancy_id) DO NOTHING"
+            ),
+            (user_id, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
+def count_push_digest_pending(user_id: int) -> int:
+    row = fetchone(
+        "SELECT COUNT(*) FROM push_digest_pending WHERE user_id = ?",
+        (user_id,),
+    )
+    return int(row[0]) if row else 0
+
+
+def clear_push_digest_pending(user_id: int) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(q("DELETE FROM push_digest_pending WHERE user_id = ?"), (user_id,))
+        return cur.rowcount
+
+
+def patch_subscriber_notify_prefs(user_id: int, patch: dict) -> dict:
+    """Обновляет notify-блок prefs; возвращает полные prefs."""
+    from services.filter_prefs import normalize_prefs
+
+    prefs = get_subscriber_filter_prefs_effective(user_id) or normalize_prefs({})
+    notify = dict(prefs.get("notify") or {})
+    notify.update(patch)
+    prefs["notify"] = notify
+    set_subscriber_filter_prefs(user_id, prefs)
+    return prefs
+
+
 def grant_trial_if_eligible(user_id: int, trial_days: int) -> bool:
     """Выдаёт пробный Premium один раз на user_id. Возвращает True если выдан."""
     if trial_days <= 0:
@@ -1418,7 +1557,12 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  poster_user_id: int = None, poster_username: str = None,
                  poster_display_name: str = None, contact_source: str = None,
                  employer_id: int = None, posted_by_bot_user_id: int = None,
-                 moderation_status: str = "approved"):
+                 moderation_status: str = "approved",
+                 *, address_normalized: str = None, geo_tags: str = None,
+                 rate_hourly: int = None, rate_shift: int = None, min_hours: int = None,
+                 rate_effective_hourly: int = None, shift_date: str = None,
+                 shift_time_start: str = None, location_lat: float = None,
+                 location_lon: float = None, enrichment_version: int = None):
     # PostgreSQL: в ON CONFLICT нужен префикс vacancies. — иначе ambiguous column
     v = "vacancies." if IS_POSTGRES else ""
     mod = moderation_status or "approved"
@@ -1427,8 +1571,11 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
         (id, source_chat, source_chat_title, category_code, message_text, message_link,
          author_contact, address, is_closed, dedupe_key, published_at,
          poster_user_id, poster_username, poster_display_name, contact_source,
-         employer_id, posted_by_bot_user_id, moderation_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         employer_id, posted_by_bot_user_id, moderation_status,
+         address_normalized, geo_tags, rate_hourly, rate_shift, min_hours,
+         rate_effective_hourly, shift_date, shift_time_start, location_lat, location_lon,
+         enrichment_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             source_chat_title = excluded.source_chat_title,
             category_code = excluded.category_code,
@@ -1444,13 +1591,77 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
             contact_source = COALESCE(excluded.contact_source, {v}contact_source),
             employer_id = COALESCE(excluded.employer_id, {v}employer_id),
             posted_by_bot_user_id = COALESCE(excluded.posted_by_bot_user_id, {v}posted_by_bot_user_id),
-            moderation_status = COALESCE(excluded.moderation_status, {v}moderation_status)
+            moderation_status = COALESCE(excluded.moderation_status, {v}moderation_status),
+            address_normalized = COALESCE(excluded.address_normalized, {v}address_normalized),
+            geo_tags = COALESCE(excluded.geo_tags, {v}geo_tags),
+            rate_hourly = COALESCE(excluded.rate_hourly, {v}rate_hourly),
+            rate_shift = COALESCE(excluded.rate_shift, {v}rate_shift),
+            min_hours = COALESCE(excluded.min_hours, {v}min_hours),
+            rate_effective_hourly = COALESCE(excluded.rate_effective_hourly, {v}rate_effective_hourly),
+            shift_date = COALESCE(excluded.shift_date, {v}shift_date),
+            shift_time_start = COALESCE(excluded.shift_time_start, {v}shift_time_start),
+            location_lat = COALESCE(excluded.location_lat, {v}location_lat),
+            location_lon = COALESCE(excluded.location_lon, {v}location_lon),
+            enrichment_version = COALESCE(excluded.enrichment_version, {v}enrichment_version)
     """, (
         vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
         author_contact, address, is_closed, dedupe_key, published_at,
         poster_user_id, poster_username, poster_display_name, contact_source,
         employer_id, posted_by_bot_user_id, mod,
+        address_normalized, geo_tags, rate_hourly, rate_shift, min_hours,
+        rate_effective_hourly, shift_date, shift_time_start, location_lat, location_lon,
+        enrichment_version,
     ))
+
+
+def update_vacancy_enrichment(vacancy_id: str, enrichment_kwargs: dict) -> None:
+    if not enrichment_kwargs:
+        return
+    allowed = (
+        "address_normalized", "geo_tags", "rate_hourly", "rate_shift", "min_hours",
+        "rate_effective_hourly", "shift_date", "shift_time_start",
+        "location_lat", "location_lon", "enrichment_version",
+    )
+    parts = []
+    values = []
+    for key in allowed:
+        if key in enrichment_kwargs and enrichment_kwargs[key] is not None:
+            parts.append(f"{key} = ?")
+            values.append(enrichment_kwargs[key])
+    if not parts:
+        return
+    values.append(vacancy_id)
+    execute(f"UPDATE vacancies SET {', '.join(parts)} WHERE id = ?", tuple(values))
+
+
+def backfill_vacancy_enrichment(days: int = 3) -> int:
+    from services.vacancy_enrichment import ENRICHMENT_VERSION, enrich_vacancy_text
+
+    rows = fetchall(
+        f"""
+        SELECT id, message_text, address
+        FROM vacancies
+        WHERE is_closed = {bool_false()}
+          AND found_at >= {now_minus_days(days)}
+          AND (enrichment_version IS NULL OR enrichment_version < ?)
+        ORDER BY found_at DESC
+        """,
+        (ENRICHMENT_VERSION,),
+    )
+    updated = 0
+    for row in rows:
+        vid, message_text, address = row[0], row[1] or "", row[2]
+        enrichment = enrich_vacancy_text(message_text, legacy_address=address)
+        kwargs = enrichment.to_db_kwargs()
+        if enrichment.address_normalized and not address:
+            kwargs["address"] = enrichment.address_normalized
+            execute(
+                "UPDATE vacancies SET address = ? WHERE id = ? AND (address IS NULL OR address = '')",
+                (enrichment.address_normalized, vid),
+            )
+        update_vacancy_enrichment(vid, kwargs)
+        updated += 1
+    return updated
 
 
 _VACANCY_VISIBLE_SQL = "(moderation_status IS NULL OR moderation_status = 'approved')"
@@ -1458,7 +1669,9 @@ _VACANCY_VISIBLE_SQL = "(moderation_status IS NULL OR moderation_status = 'appro
 
 def get_vacancy_row(vacancy_id: str):
     return fetchone(
-        "SELECT message_text, message_link, source_chat_title, author_contact, address FROM vacancies WHERE id = ?",
+        """SELECT message_text, message_link, source_chat_title, author_contact, address,
+                  address_normalized, location_lat, location_lon
+           FROM vacancies WHERE id = ?""",
         (vacancy_id,),
     )
 
@@ -1467,7 +1680,10 @@ def get_vacancy_push_row(vacancy_id: str):
     return fetchone(
         """SELECT message_text, message_link, source_chat_title, author_contact, address,
                   category_code, source_chat, dedupe_key, published_at, poster_user_id,
-                  poster_username, moderation_status, posted_by_bot_user_id
+                  poster_username, moderation_status, posted_by_bot_user_id,
+                  address_normalized, location_lat, location_lon,
+                  geo_tags, rate_hourly, rate_shift, rate_effective_hourly,
+                  shift_date, shift_time_start
            FROM vacancies WHERE id = ?""",
         (vacancy_id,),
     )
@@ -1955,7 +2171,7 @@ def has_recent_duplicate_vacancy(dedupe_key: str, max_age_days: int = 1) -> bool
 def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200) -> list:
     rows = fetchall(
         f"""
-        SELECT id, message_text, author_contact, dedupe_key
+        SELECT id, message_text, author_contact, dedupe_key, source_chat_title, category_code
         FROM vacancies
         WHERE is_closed = {bool_false()}
           AND found_at >= {now_minus_days(max_age_days)}
@@ -1970,6 +2186,8 @@ def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200
             "message_text": row[1] or "",
             "author_contact": row[2],
             "dedupe_key": row[3],
+            "source_chat_title": row[4] or "",
+            "category_code": row[5] or "",
         }
         for row in rows
     ]
@@ -1980,7 +2198,10 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
     rows = fetchall(
         f"""
         SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
-               v.author_contact, v.address, v.found_at, v.published_at
+               v.author_contact, v.address, v.found_at, v.published_at,
+               v.address_normalized, v.location_lat, v.location_lon,
+               v.category_code, v.geo_tags, v.rate_hourly, v.rate_shift, v.rate_effective_hourly,
+               v.shift_date, v.shift_time_start
         FROM vacancies v
         WHERE v.category_code = ? AND v.is_closed = {bool_false()}
           AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
@@ -1996,6 +2217,10 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
         {
             "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
             "found_at": r[6], "published_at": r[7],
+            "address_normalized": r[8], "location_lat": r[9], "location_lon": r[10],
+            "category_code": r[11], "geo_tags": r[12],
+            "rate_hourly": r[13], "rate_shift": r[14], "rate_effective_hourly": r[15],
+            "shift_date": r[16], "shift_time_start": r[17],
         }
         for r in rows
     ]
@@ -2009,7 +2234,9 @@ def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
     rows = fetchall(
         f"""
         SELECT id, source_chat_title, message_text, message_link, author_contact, address,
-               found_at, published_at, category_code
+               found_at, published_at, category_code,
+               address_normalized, location_lat, location_lon,
+               geo_tags, rate_hourly, rate_shift, rate_effective_hourly
         FROM vacancies
         WHERE id IN ({placeholders}) AND is_closed = {bool_false()}
         """,
@@ -2026,6 +2253,13 @@ def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
             "found_at": r[6],
             "published_at": r[7],
             "category_code": r[8],
+            "address_normalized": r[9],
+            "location_lat": r[10],
+            "location_lon": r[11],
+            "geo_tags": r[12],
+            "rate_hourly": r[13],
+            "rate_shift": r[14],
+            "rate_effective_hourly": r[15],
         }
         for r in rows
     }
