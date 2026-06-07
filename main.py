@@ -4264,7 +4264,7 @@ async def _execute_admin_delete_vacancy(vacancy_id: str) -> str:
     channel_msg_id = get_vacancy_channel_message_id(vacancy_id)
     stats = await run_db(delete_vacancy_completely, vacancy_id)
     if not stats:
-        return f"❌ Вакансия `{vacancy_id}` не найдена или уже удалена."
+        return f"❌ Вакансия <code>{escape_html(vacancy_id)}</code> не найдена или уже удалена."
 
     channel_deleted = False
     if channel_msg_id and HUNTER_CHANNEL_ID:
@@ -4274,12 +4274,13 @@ async def _execute_admin_delete_vacancy(vacancy_id: str) -> str:
         except Exception as e:
             logger.warning("delete channel post vacancy=%s msg=%s: %s", vacancy_id, channel_msg_id, e)
 
+    vid = escape_html(vacancy_id)
     lines = [
-        f"🗑 Вакансия `{vacancy_id}` удалена из базы.",
-        f"• Снято с учёта push: {stats['push_recipients']} подписчик(ов)",
-        f"• sent_vacancies: {stats.get('deleted_sent_vacancies', 0)}",
+        f"🗑 Вакансия <code>{vid}</code> удалена из базы.",
+        f"• Снято с учёта push: {stats['push_recipients']} подписчиков",
+        f"• записей push: {stats.get('deleted_sent_vacancies', 0)}",
         f"• откликов: {stats.get('deleted_responses', 0)}",
-        f"• лент (feed session): {stats.get('feed_sessions_updated', 0)}",
+        f"• лент: {stats.get('feed_sessions_updated', 0)}",
     ]
     if channel_msg_id:
         if channel_deleted:
@@ -4287,6 +4288,19 @@ async def _execute_admin_delete_vacancy(vacancy_id: str) -> str:
         else:
             lines.append(f"• Пост в канале (msg {channel_msg_id}) — удалите вручную, если нужно.")
     return "\n".join(lines)
+
+
+async def _send_admin_delete_vacancy_result(callback: types.CallbackQuery, result: str) -> None:
+    try:
+        await callback.message.edit_text(result, parse_mode="HTML", reply_markup=None)
+    except TelegramBadRequest:
+        try:
+            await callback.message.answer(
+                result, parse_mode="HTML", reply_markup=get_admin_mod_keyboard(),
+            )
+        except TelegramBadRequest:
+            plain = re.sub(r"<[^>]*>", "", result)
+            await callback.message.answer(plain, reply_markup=get_admin_mod_keyboard())
 
 
 @dp.message(Command("delvac"))
@@ -4354,10 +4368,7 @@ async def delete_vacancy_confirm(callback: types.CallbackQuery):
     vacancy_id = callback.data.replace("delvac_yes_", "", 1)
     await safe_callback_answer(callback, "Удаляю…")
     result = await _execute_admin_delete_vacancy(vacancy_id)
-    try:
-        await callback.message.edit_text(result, parse_mode="Markdown", reply_markup=None)
-    except TelegramBadRequest:
-        await callback.message.answer(result, parse_mode="Markdown", reply_markup=get_admin_mod_keyboard())
+    await _send_admin_delete_vacancy_result(callback, result)
 
 
 @dp.callback_query(lambda c: c.data == "delvac_no")
