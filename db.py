@@ -35,28 +35,80 @@ logger = logging.getLogger(__name__)
 DB_NAME = db_info_label() if IS_POSTGRES else get_database_path()
 
 
+def _pg_alter_integer_to_bigint(cur, table: str, column: str) -> bool:
+    """PostgreSQL: INTEGER → BIGINT для Telegram id > 2^31."""
+    if not column_exists_cur(cur, table, column):
+        return False
+    if pg_column_data_type(cur, table, column) != "integer":
+        return False
+    try:
+        cur.execute(
+            f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE BIGINT USING "{column}"::bigint'
+        )
+        logger.info("PostgreSQL: %s.%s → BIGINT", table, column)
+        return True
+    except Exception as e:
+        logger.warning("PostgreSQL migrate %s.%s: %s", table, column, e)
+        return False
+
+
 def _migrate_pg_telegram_bigint_ids(cur) -> None:
     """Telegram user/message id > 2^31 — INTEGER в PG переполняется."""
     if not IS_POSTGRES:
         return
-    targets = [
+
+    dropped_fks: list[tuple[str, str, str]] = []
+    cur.execute(
+        """
+        SELECT c.conname, child.relname AS child_table, pg_get_constraintdef(c.oid) AS condef
+        FROM pg_constraint c
+        JOIN pg_class child ON child.oid = c.conrelid
+        JOIN pg_class parent ON parent.oid = c.confrelid
+        WHERE c.contype = 'f' AND parent.relname = 'subscribers'
+        """
+    )
+    for conname, child_table, condef in cur.fetchall():
+        try:
+            cur.execute(f'ALTER TABLE "{child_table}" DROP CONSTRAINT IF EXISTS "{conname}"')
+            dropped_fks.append((conname, child_table, condef))
+            logger.info("PostgreSQL: dropped FK %s on %s", conname, child_table)
+        except Exception as e:
+            logger.warning("PostgreSQL drop FK %s on %s: %s", conname, child_table, e)
+
+    for table in (
+        "subscribers",
+        "user_categories",
+        "vacancy_notfit_feedback",
+        "user_forum_topics",
+        "channel_member_events",
+        "user_feed_sessions",
+        "llm_usage",
+        "star_purchases",
+        "sent_vacancies",
+        "responses",
+        "complaints",
+        "support_requests",
+        "premium_requests",
+    ):
+        _pg_alter_integer_to_bigint(cur, table, "user_id")
+
+    for conname, child_table, condef in dropped_fks:
+        try:
+            cur.execute(f'ALTER TABLE "{child_table}" ADD CONSTRAINT "{conname}" {condef}')
+            logger.info("PostgreSQL: restored FK %s on %s", conname, child_table)
+        except Exception as e:
+            logger.warning("PostgreSQL restore FK %s on %s: %s", conname, child_table, e)
+
+    for table, column in (
         ("vacancies", "poster_user_id"),
-        ("vacancies", "employer_id"),
         ("vacancies", "posted_by_bot_user_id"),
         ("employers", "telegram_user_id"),
         ("employers", "bot_user_id"),
         ("last_processed", "last_message_id"),
-    ]
-    for table, column in targets:
-        if not column_exists_cur(cur, table, column):
-            continue
-        if pg_column_data_type(cur, table, column) != "integer":
-            continue
-        try:
-            cur.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT")
-            logger.info("PostgreSQL: %s.%s → BIGINT", table, column)
-        except Exception as e:
-            logger.warning("PostgreSQL migrate %s.%s: %s", table, column, e)
+        ("vacancy_channel_posts", "message_id"),
+        ("user_forum_topics", "thread_id"),
+    ):
+        _pg_alter_integer_to_bigint(cur, table, column)
 
 
 def _migrate_legacy_database_if_needed() -> None:
