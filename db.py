@@ -2308,6 +2308,24 @@ def get_subscribers_display(limit: int = 20) -> list:
     return [{"user_id": r[0], "name": r[1]} for r in rows]
 
 
+def get_vacancy_counts_by_chat(days: int = 7) -> list[dict]:
+    """Вакансии по source_chat_title за последние N дней."""
+    with db_conn(commit=False) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(f"""
+                SELECT source_chat_title, COUNT(*) AS cnt
+                FROM vacancies
+                WHERE source_chat_title IS NOT NULL
+                  AND source_chat_title != ''
+                  AND found_at >= {now_minus_days(days)}
+                GROUP BY source_chat_title
+                ORDER BY cnt DESC
+            """),
+        )
+        return [{"source_chat_title": r[0], "count": r[1]} for r in cur.fetchall()]
+
+
 def get_admin_stats() -> dict:
     with db_conn(commit=False) as conn:
         cur = conn.cursor()

@@ -34,6 +34,8 @@ PARSER_HEALTH_INTERVAL_SEC = 600
 PARSER_RECONNECT_DELAY_SEC = 30
 PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
+AUDIT_SCAN_LIMIT = 20
+REJECT_SAMPLES_MAX = 12
 PARSER_LABEL = "Парсер групп (Telethon)"
 MOSCOW_TZ = timezone(timedelta(hours=3))
 _session_config_alert_sent = False
@@ -204,23 +206,90 @@ async def _close_vacancy_by_message_id(
     return None
 
 
+REJECT_REASON_LABELS = {
+    "empty": "пустой текст",
+    "unpaid": "без оплаты",
+    "service_request": "услуга, не найм",
+    "casting": "кастинг/модель",
+    "no_hiring": "нет признаков найма",
+    "no_payment": "нет оплаты в тексте",
+    "no_contact": "нет контакта",
+    "excluded_hashtag_role": "роль по хештегу вне профиля",
+    "excluded_organizer": "организатор/свадьба",
+    "staff_job": "персонал (прошёл gate)",
+}
+
+
+def reject_reason_label(reason: str | None) -> str:
+    if not reason:
+        return "—"
+    if reason in REJECT_REASON_LABELS:
+        return REJECT_REASON_LABELS[reason]
+    if reason.startswith("stop_phrase:"):
+        return f"стоп-фраза: {reason.split(':', 1)[1].strip()}"
+    if reason.startswith("excluded_category:"):
+        return f"искл. категория: {reason.split(':', 1)[1].strip()}"
+    if reason.startswith("quality_gate:"):
+        return f"качество ({reason.split(':', 1)[1].strip()})"
+    if reason == "ambiguous_category":
+        return "роль не определена"
+    if reason == "digest_split_required":
+        return "digest (разбивается на блоки)"
+    return reason
+
+
+def _chat_bucket(stats: dict | None, chat_title: str) -> dict:
+    return stats.setdefault("by_chat", {}).setdefault(
+        chat_title,
+        {
+            "scanned": 0,
+            "matched": 0,
+            "rejected": 0,
+            "role_mismatch": 0,
+            "already_sent": 0,
+            "old": 0,
+            "no_text": 0,
+            "reasons": {},
+        },
+    )
+
+
+def _record_reject_sample(
+    stats: dict | None,
+    chat_title: str,
+    reason: str | None,
+    text: str,
+    *,
+    category: str | None = None,
+):
+    if stats is None or not text:
+        return
+    samples = stats.setdefault("reject_samples", [])
+    preview = re.sub(r"\s+", " ", text).strip()[:140]
+    if any(s.get("preview") == preview and s.get("chat") == chat_title for s in samples):
+        return
+    samples.append(
+        {
+            "chat": chat_title,
+            "reason": reason or "—",
+            "category": category,
+            "preview": preview,
+        }
+    )
+    if len(samples) > REJECT_SAMPLES_MAX:
+        del samples[0 : len(samples) - REJECT_SAMPLES_MAX]
+
+
 def _bump_chat_stat(stats: dict | None, chat_title: str, field: str, reason: str | None = None):
     if stats is None or not chat_title:
         return
-    bucket = stats.setdefault("by_chat", {}).setdefault(
-        chat_title,
-        {"scanned": 0, "matched": 0, "rejected": 0, "role_mismatch": 0, "reasons": {}},
-    )
-    if field == "scanned":
-        bucket["scanned"] += 1
-    elif field == "matched":
-        bucket["matched"] += 1
+    bucket = _chat_bucket(stats, chat_title)
+    if field in ("scanned", "matched", "role_mismatch", "already_sent", "old", "no_text"):
+        bucket[field] = bucket.get(field, 0) + 1
     elif field == "rejected":
-        bucket["rejected"] += 1
+        bucket["rejected"] = bucket.get("rejected", 0) + 1
         if reason:
             bucket["reasons"][reason] = bucket["reasons"].get(reason, 0) + 1
-    elif field == "role_mismatch":
-        bucket["role_mismatch"] += 1
 
 
 async def refresh_chat_expected_roles_cache(client):
@@ -243,10 +312,67 @@ async def refresh_chat_expected_roles_cache(client):
             _chat_expected_roles[alias] = roles
 
 
+def format_parser_wait_message(stats: dict | None = None) -> str:
+    """Текст ожидания для админ-кнопки «Ручная проверка», пока lock занят."""
+    s = stats or LAST_DEBUG_STATS
+    kind = s.get("run_kind") or "scan"
+    labels = {
+        "startup": "стартовая синхронизация",
+        "manual": "ручная проверка",
+        "periodic": "плановая проверка",
+    }
+    label = labels.get(kind, kind)
+    chats_ok = s.get("chats_ok") or 0
+    chats_total = s.get("chats_total") or 0
+    scanned = s.get("messages_scanned") or 0
+    matched = s.get("matched") or 0
+    return (
+        "🔍 *Ожидание парсера…*\n\n"
+        f"Идёт *{label}*: чаты {chats_ok}/{chats_total}, "
+        f"сообщений {scanned}, в ленту {matched}.\n"
+        "При ~36 чатах полный прогон обычно *5–15 мин* после перезапуска."
+    )
+
+
+def format_scan_finished_summary(stats: dict | None = None) -> str:
+    """Краткий итог завершённого прогона (startup/periodic), без повторного scan."""
+    s = stats or LAST_DEBUG_STATS
+    kind = s.get("run_kind") or "scan"
+    labels = {
+        "startup": "Стартовая синхронизация",
+        "periodic": "Плановая проверка",
+        "manual": "Ручная проверка",
+    }
+    label = labels.get(kind, "Прогон парсера")
+    return (
+        f"✅ *{label} завершена*\n\n"
+        f"Просмотрено сообщений: {s.get('messages_scanned', 0)}\n"
+        f"В ленту: {s.get('matched', 0)} | отсеяно: {s.get('non_relevant', 0)}\n"
+        f"Уже в БД: {s.get('already_sent', 0)} | закрыто: {s.get('closed_vacancies', 0)}\n\n"
+        "Детали: «📝 Отчёт парсера» или «📊 Шум по чатам»."
+    )
+
+
 def format_chat_noise_report(stats: dict | None = None) -> str:
     s = stats or LAST_DEBUG_STATS
     by_chat = s.get("by_chat") or {}
     if not by_chat:
+        scanned = s.get("messages_scanned") or 0
+        if scanned and not s.get("finished_at"):
+            chats_ok = s.get("chats_ok") or 0
+            chats_total = s.get("chats_total") or 0
+            return (
+                "📊 *Шум по чатам*\n\n"
+                f"Прогон ещё идёт: сообщений {scanned}, чатов {chats_ok}/{chats_total}.\n"
+                "Отчёт появится после завершения — или нажмите снова через пару минут."
+            )
+        if scanned and s.get("finished_at"):
+            return (
+                "📊 *Шум по чатам*\n\n"
+                f"Последний прогон просмотрел {scanned} сообщ., "
+                f"но почти все уже были в БД или без текста для фильтра.\n"
+                "Шум считается только по сообщениям, прошедшим через фильтр категорий."
+            )
         return "📊 *Шум по чатам*\n\nНет данных — запустите «🔍 Ручная проверка» или дождитесь планового прогона."
     lines = ["📊 *Шум по чатам* (последний прогон)", ""]
     ranked = []
@@ -254,7 +380,7 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
         scanned = bucket.get("scanned") or 0
         matched = bucket.get("matched") or 0
         rejected = bucket.get("rejected") or 0
-        total = scanned or (matched + rejected)
+        total = max(scanned, matched + rejected)
         noise_pct = int(rejected * 100 / total) if total else 0
         ranked.append((noise_pct, title, bucket, total))
     ranked.sort(reverse=True)
@@ -266,11 +392,121 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
             top_reason = f", топ: {r} ({c})"
         mismatch = bucket.get("role_mismatch") or 0
         mm = f", вне профиля чата: {mismatch}" if mismatch else ""
+        already = bucket.get("already_sent") or 0
+        al = f", уже в БД: {already}" if already else ""
         lines.append(
             f"• *{title}* — шум ~{noise_pct}% ({bucket.get('rejected', 0)}/{total}), "
-            f"в ленту: {bucket.get('matched', 0)}{mm}{top_reason}"
+            f"в ленту: {bucket.get('matched', 0)}{mm}{al}{top_reason}"
         )
     lines.append("\nПрофиль чата: `/setchatroles ссылка promoter,helper,loader`")
+    return "\n".join(lines)
+
+
+def format_reject_samples_report(stats: dict | None = None) -> str:
+    s = stats or LAST_DEBUG_STATS
+    samples = s.get("reject_samples") or []
+    if not samples:
+        run_kind = s.get("run_kind")
+        hint = (
+            "Запустите «🔬 Аудит фильтра» — прогонит последние посты из каждого чата "
+            "через фильтр *без сохранения* и покажет, что отсеяно."
+        )
+        if run_kind and run_kind != "audit":
+            hint = (
+                "В обычном прогоне примеры копятся только по *новым* сообщениям, прошедшим фильтр.\n"
+                + hint
+            )
+        return f"📋 *Примеры отсева*\n\nПока пусто.\n{hint}"
+    lines = [
+        "📋 *Примеры отсева* (последний прогон)",
+        f"Тип: {s.get('run_kind') or '—'} | показано {len(samples)}",
+        "",
+    ]
+    for i, sample in enumerate(reversed(samples), 1):
+        label = reject_reason_label(sample.get("reason"))
+        cat = sample.get("category")
+        cat_part = f" → `{cat}`" if cat else ""
+        lines.append(f"{i}. *{sample.get('chat', '—')}* — {label}{cat_part}")
+        lines.append(f"   _{sample.get('preview', '')}_")
+        lines.append("")
+    lines.append("Подсказка: если видите ложный отсев — пришлите номер примера, поправим фильтр.")
+    return "\n".join(lines).strip()
+
+
+def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int] | None = None) -> str:
+    """Сводка: откуда реально идут вакансии (БД) + что дал последний прогон."""
+    s = stats or LAST_DEBUG_STATS
+    by_chat = s.get("by_chat") or {}
+    db_counts = db_counts or {}
+    all_titles = set(by_chat.keys()) | set(db_counts.keys())
+    if not all_titles and not s.get("started_at"):
+        return (
+            "📡 *Покрытие каналов*\n\n"
+            "Нет данных. Запустите «🔬 Аудит фильтра» или дождитесь прогона."
+        )
+
+    rows = []
+    for title in all_titles:
+        b = by_chat.get(title, {})
+        db_n = db_counts.get(title, 0)
+        matched = b.get("matched") or 0
+        rejected = b.get("rejected") or 0
+        scanned = b.get("scanned") or 0
+        already = b.get("already_sent") or 0
+        rows.append((db_n, matched, rejected, scanned, already, title, b))
+
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    lines = [
+        "📡 *Покрытие каналов*",
+        "",
+        "*За 7 дней в БД* — сколько вакансий сохранено из чата.",
+        "*Последний прогон* — что парсер увидел в *новых* постах (incremental).",
+        "Если «прогон 0» — новых сообщений не было; realtime или прошлый прогон уже забрали.",
+        "",
+    ]
+
+    active_db = [r for r in rows if r[0] > 0]
+    if active_db:
+        lines.append(f"*Дают вакансии ({len(active_db)} чатов):*")
+        for db_n, matched, rejected, scanned, already, title, b in active_db[:14]:
+            scan_part = (
+                f"прогон: +{matched} в ленту, {rejected} отсеяно, {already} уже в БД"
+                if scanned
+                else "прогон: новых постов не было"
+            )
+            lines.append(f"• *{title}* — БД **{db_n}**, {scan_part}")
+        lines.append("")
+
+    silent_db = [r for r in rows if r[0] == 0 and r[3] == 0]
+    if silent_db:
+        lines.append(f"*Молчат в БД ({len(silent_db)} чатов, 0 вакансий за 7 д):*")
+        for *_, title, _b in silent_db[:8]:
+            lines.append(f"  • {title}")
+        if len(silent_db) > 8:
+            lines.append(f"  … и ещё {len(silent_db) - 8}")
+        lines.append("")
+        lines.append(
+            "Частые причины: чат не про hiring-фильтр, нет доступа (❌ в списке чатов), "
+            "или там редко постят подходящие роли. «🔬 Аудит фильтра» покажет отсев по последним постам."
+        )
+
+    if s.get("run_kind") == "audit" and by_chat:
+        lines.append("")
+        lines.append("*Аудит (последние посты, без сохранения):*")
+        audit_rows = sorted(
+            by_chat.items(),
+            key=lambda x: (x[1].get("matched") or 0, x[1].get("rejected") or 0),
+            reverse=True,
+        )
+        for title, b in audit_rows[:10]:
+            if not (b.get("scanned") or 0):
+                continue
+            lines.append(
+                f"• {title}: в ленту {b.get('matched', 0)}, "
+                f"отсеяно {b.get('rejected', 0)} из {b.get('scanned', 0)}"
+            )
+
     return "\n".join(lines)
 
 
@@ -296,7 +532,6 @@ async def _save_parsed_vacancy_block(
     stats: dict | None,
 ) -> dict | None:
     """Один блок текста → evaluate, dedupe, save_vacancy, order для push."""
-    _bump_chat_stat(stats, chat_title, "scanned")
     eval_text = block_text
     if block_index is not None and message.text:
         eval_text = enrich_digest_block(block_text, message.text)
@@ -305,6 +540,7 @@ async def _save_parsed_vacancy_block(
         stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
     if not accepted or not category:
         _bump_chat_stat(stats, chat_title, "rejected", reason)
+        _record_reject_sample(stats, chat_title, reason, eval_text)
         return None
 
     expected = _chat_expected_roles.get(str(chat_id)) or _chat_expected_roles.get(chat_id)
@@ -397,15 +633,18 @@ async def _process_single_message(
     if not message.text:
         if stats is not None:
             stats["no_text"] += 1
+            _bump_chat_stat(stats, chat_title, "no_text")
         return None
     message_id = str(message.id)
     if not allow_reprocess and await run_db(is_message_processed, message_id, chat_id):
         if stats is not None:
             stats["already_sent"] += 1
+            _bump_chat_stat(stats, chat_title, "already_sent")
         return None
     if not allow_reprocess and not is_message_recent(message.date):
         if stats is not None:
             stats["old_messages"] += 1
+            _bump_chat_stat(stats, chat_title, "old")
         return None
 
     entities = getattr(message, "entities", None)
@@ -485,7 +724,50 @@ async def _process_single_message(
     return order
 
 
-async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, stats: dict = None, *, incremental: bool = False):
+def _audit_record_eval(stats: dict | None, chat_title: str, block_text: str, poster: dict | None = None):
+    accepted, category, reason, _ = evaluate_vacancy(block_text, poster)
+    if stats is not None:
+        stats["messages_scanned"] = stats.get("messages_scanned", 0) + 1
+    _bump_chat_stat(stats, chat_title, "scanned")
+    if accepted and category:
+        _bump_chat_stat(stats, chat_title, "matched")
+        if stats is not None:
+            stats["matched"] += 1
+            stats["categories"][category] = stats["categories"].get(category, 0) + 1
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+    else:
+        _bump_chat_stat(stats, chat_title, "rejected", reason)
+        if stats is not None:
+            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+            stats["non_relevant"] += 1
+        _record_reject_sample(stats, chat_title, reason, block_text, category=category)
+
+
+async def _audit_evaluate_message(message, chat_title: str, stats: dict | None):
+    """Прогон текста через фильтр без записи в БД — для админ-аудита."""
+    if not message.text:
+        if stats is not None:
+            stats["no_text"] += 1
+        _bump_chat_stat(stats, chat_title, "no_text")
+        return
+    poster = await extract_poster_info(message)
+    if should_split_digest(message.text):
+        if stats is not None:
+            stats["digest_posts"] = stats.get("digest_posts", 0) + 1
+        for block in split_vacancy_blocks(message.text)[:MAX_DIGEST_BLOCKS]:
+            _audit_record_eval(stats, chat_title, block, poster)
+        return
+    _audit_record_eval(stats, chat_title, message.text, poster)
+
+
+async def _scan_all_chats(
+    client,
+    limit_per_chat: int = PER_CHAT_SCAN_LIMIT,
+    stats: dict = None,
+    *,
+    incremental: bool = False,
+    audit_only: bool = False,
+):
     all_results = []
     closed_vacancies_users = []
     target_chats = await run_db(get_target_chats)
@@ -509,24 +791,43 @@ async def _scan_all_chats(client, limit_per_chat: int = PER_CHAT_SCAN_LIMIT, sta
             stats["chats_ok"] += 1
 
         iter_kwargs = {"limit": limit_per_chat}
-        if incremental:
+        if incremental and not audit_only:
             last_id = await run_db(get_last_processed_id, chat_id)
             if last_id:
                 iter_kwargs["min_id"] = last_id
 
+        if stats is not None:
+            run_kind = stats.get("run_kind") or "scan"
+        else:
+            run_kind = "scan"
+        logger.info(
+            "📡 %s: чат %s/%s «%s» (incremental=%s, audit=%s)",
+            run_kind,
+            i,
+            len(target_chats),
+            chat_title,
+            incremental and not audit_only,
+            audit_only,
+        )
+
         async for message in client.iter_messages(entity, **iter_kwargs):
-            if stats is not None:
-                stats["messages_scanned"] += 1
-                if stats["messages_scanned"] % 25 == 0:
-                    await asyncio.sleep(0)
+            if not audit_only:
+                if stats is not None:
+                    stats["messages_scanned"] += 1
+                    _bump_chat_stat(stats, chat_title, "scanned")
+                    if stats["messages_scanned"] % 25 == 0:
+                        await asyncio.sleep(0)
             try:
-                result = await _process_single_message(message, entity, chat_id, chat_title, stats)
-                for item in _flatten_parser_result(result):
-                    if item.get("type") == "closed":
-                        closed_vacancies_users.append((item["vacancy_id"], item["users"]))
-                    else:
-                        all_results.append(item)
-                        await asyncio.sleep(0.05)
+                if audit_only:
+                    await _audit_evaluate_message(message, chat_title, stats)
+                else:
+                    result = await _process_single_message(message, entity, chat_id, chat_title, stats)
+                    for item in _flatten_parser_result(result):
+                        if item.get("type") == "closed":
+                            closed_vacancies_users.append((item["vacancy_id"], item["users"]))
+                        else:
+                            all_results.append(item)
+                            await asyncio.sleep(0.05)
             except Exception as e:
                 if stats is not None:
                     stats["errors"] += 1
@@ -824,6 +1125,7 @@ def _empty_debug_stats() -> dict:
         "digest_posts": 0,
         "digest_blocks_saved": 0,
         "run_kind": None,
+        "reject_samples": [],
     }
 
 
@@ -927,10 +1229,13 @@ def get_last_debug_report() -> str:
             lines.append(f"  • {cat}: {count}")
     reasons = s.get("reasons") or {}
     if reasons:
-        top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
-        lines.append("\n📋 Топ причин фильтра:")
+        top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:8]
+        lines.append("\n📋 *Топ причин фильтра:*")
         for reason, count in top:
-            lines.append(f"  • {reason}: {count}")
+            lines.append(f"  • {reject_reason_label(reason)} (`{reason}`): {count}")
+    samples = s.get("reject_samples") or []
+    if samples:
+        lines.append(f"\n📋 Примеры отсева: {len(samples)} шт. — кнопка «📋 Примеры отсева»")
     chat_errors = s.get("errors_by_chat") or {}
     if chat_errors:
         lines.append("\n⚠️ Ошибки по чатам:")
@@ -1743,6 +2048,37 @@ async def safe_get_entity(client, chat_link: str):
     except Exception as e:
         logger.warning(f"⚠️ Ошибка доступа к {chat_link}: {type(e).__name__}")
         return None
+
+async def run_parser_audit() -> dict:
+    """Админ: последние посты из каждого чата через фильтр, без сохранения."""
+    stats = _new_stats("audit")
+    stats["reject_samples"] = []
+    _publish_debug_stats(stats)
+    try:
+        async with _parser_lock:
+            if _realtime_client and _realtime_client.is_connected():
+                logger.info(
+                    "🔬 Аудит фильтра: последние %s постов из каждого чата (без сохранения)",
+                    AUDIT_SCAN_LIMIT,
+                )
+                await _scan_all_chats(
+                    _realtime_client,
+                    limit_per_chat=AUDIT_SCAN_LIMIT,
+                    stats=stats,
+                    incremental=False,
+                    audit_only=True,
+                )
+                stats["finished_at"] = _iso_now()
+                return stats
+            logger.error(f"❌ {PARSER_LABEL} offline — аудит пропущен")
+            stats["finished_at"] = _iso_now()
+            return stats
+    except Exception as e:
+        logger.error(f"❌ Ошибка аудита фильтра: {e}", exc_info=True)
+        if stats.get("started_at") and not stats.get("finished_at"):
+            stats["finished_at"] = _iso_now()
+        return stats
+
 
 async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):
     stats = _new_stats("manual")

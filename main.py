@@ -23,6 +23,8 @@ from parser import (
     spawn_background_task, vacancy_matches_category, evaluate_vacancy,
     resolve_vacancy_contact, build_vacancy_dedupe_key,
     format_chat_noise_report, parser_scan_in_progress,
+    format_parser_wait_message, format_scan_finished_summary, LAST_DEBUG_STATS,
+    format_reject_samples_report, format_channel_coverage_report, run_parser_audit,
 )
 from admin_exports import (
     build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
@@ -739,12 +741,12 @@ async def admin_fsm_menu_escape(message: types.Message, state: FSMContext) -> bo
         await send_parser_debug_report(message)
     elif text == "📊 Шум по чатам":
         await send_chat_noise_report(message)
+    elif text == "📋 Примеры отсева":
+        await send_reject_samples_report(message)
+    elif text == "📡 Покрытие каналов":
+        await send_channel_coverage_report(message)
     elif text == "📡 Парсер":
-        await message.answer(
-            "📡 *Парсер* — чаты, прогон, качество ленты.",
-            parse_mode="Markdown",
-            reply_markup=get_admin_parser_keyboard(),
-        )
+        await send_admin_parser_intro(message)
     elif text == "📺 Канал":
         await message.answer(
             "📺 *Канал* — лимиты, промо, новости и статистика.",
@@ -771,8 +773,25 @@ async def send_parser_debug_report(message: types.Message):
 async def send_chat_noise_report(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    from parser import LAST_DEBUG_STATS, format_chat_noise_report
     await answer_admin_report(message, format_chat_noise_report(LAST_DEBUG_STATS))
+
+
+async def send_reject_samples_report(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await answer_admin_report(message, format_reject_samples_report(LAST_DEBUG_STATS))
+
+
+async def send_channel_coverage_report(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    db_rows = await run_db(get_vacancy_counts_by_chat, 7)
+    db_map = {
+        r["source_chat_title"]: r["count"]
+        for r in db_rows
+        if r.get("source_chat_title")
+    }
+    await answer_admin_report(message, format_channel_coverage_report(LAST_DEBUG_STATS, db_map))
 
 def build_admin_dashboard_text() -> str:
     stats = get_admin_stats()
@@ -1080,33 +1099,75 @@ def build_user_help_html(user_id: int) -> str:
     )
 
 
+def build_admin_parser_help_html() -> str:
+    return (
+        "<b>📡 Парсер — как пользоваться</b>\n\n"
+        "<b>Зачем что</b>\n"
+        "• <b>🔍 Ручная проверка</b> — забрать <i>новые</i> посты в ленту и БД "
+        "(incremental, только то, что ещё не обработано).\n"
+        "• <b>🔬 Аудит фильтра</b> — диагностика: последние ~20 постов из <i>каждого</i> чата "
+        "прогоняются через фильтр <b>без сохранения</b>. Нужен, когда непонятно, что отсеивается.\n"
+        "• <b>📡 Покрытие каналов</b> — кто реально дал вакансии в БД за 7 дней и кто «молчит».\n"
+        "• <b>📋 Примеры отсева</b> — тексты отброшенных постов + причина "
+        "(нет контакта, кастинг, качество роли и т.д.).\n"
+        "• <b>📊 Шум по чатам</b> — доля отсева vs попаданий в ленту по каждому чату.\n"
+        "• <b>📝 Отчёт парсера</b> — цифры последнего прогона (старт, финиш, причины).\n"
+        "• <b>📋 Список чатов парсинга</b> — доступ Telethon (✅/❌) и мониторинг 📡.\n\n"
+        "<b>Сценарий: «мало вакансий / только 2–3 чата»</b>\n"
+        "1. <b>📊 Статистика</b> или /status — парсер «подключён», чатов в мониторинге ≈ числу в БД.\n"
+        "2. <b>📡 Покрытие каналов</b> — кто даёт в БД; «молчащие» — норма, если там редко постят подходящие роли.\n"
+        "3. <b>🔬 Аудит фильтра</b> — подождать 5–15 мин (36 чатов). После — пункты 4–5.\n"
+        "4. <b>📋 Примеры отсева</b> — если пост выглядит вакансией, а отсеян — запомните номер примера.\n"
+        "5. <b>📊 Шум по чатам</b> — какой чат шумный, топ-причина отсева.\n\n"
+        "<b>Сценарий: забрать свежие посты в бот</b>\n"
+        "• <b>🔍 Ручная проверка</b> (/check_now) — после перезапуска может писать «ожидание» "
+        "5–15 мин (идёт стартовая синхронизация), затем итог.\n"
+        "• Realtime и плановый прогон (~5 мин) работают сами; ручная проверка — если нужно сейчас.\n\n"
+        "<b>Чаты и роли</b>\n"
+        "• Чат с ❌ в списке — аккаунт парсера не в группе или нет доступа.\n"
+        "• <code>/setchatroles @channel promoter,helper,loader</code> — ожидаемые роли для чата.\n"
+        "• <code>/addchat</code>, <code>/removechat</code> — добавить/убрать чат.\n\n"
+        "<b>Команды парсера</b>\n"
+        "/check_now — ручная проверка · /audit_filter — аудит · /debug_last — отчёт"
+    )
+
+
 def build_admin_help_html() -> str:
     return (
-        "<b>📖 Админ: как пользоваться</b>\n\n"
-        "Меню разбито на разделы — «📡 Парсер», «👥 Пользователи», «📥 Excel». "
-        "«◀️ Назад» возвращает в главное админ-меню.\n\n"
-        "<b>📡 Парсер</b>\n"
-        "• «🔍 Ручная проверка» или /check_now — прогон всех чатов\n"
-        "• «📝 Отчёт парсера» — статистика последнего прогона\n"
-        "• «📋 Список чатов парсинга» — доступ и мониторинг\n"
-        "• «📊 Шум по чатам» — отсеяно vs в ленту по каждому чату\n"
-        "• `/setchatroles ссылка promoter,helper` — ожидаемые роли чата\n\n"
+        "<b>📖 Админ: как пользоваться ботом</b>\n\n"
+        "Главное меню — разделы «📡 Парсер», «👥 Пользователи», «📥 Excel», «📝 Модерация». "
+        "«◀️ Назад» — наверх. Справка всегда здесь: /help или «📖 Как пользоваться».\n\n"
+        + build_admin_parser_help_html()
+        + "\n\n"
         "<b>👥 Пользователи</b>\n"
-        "• «🗂️ Карточки пользователей» — список и карточка с активностью\n"
-        "• «💎 Запросы Premium» — чек + ✅/❌\n"
-        "• /user USER_ID — открыть карточку по ID\n"
-        "• /setplan USER_ID premium 30 — выдать Premium из чата\n\n"
+        "• «🗂️ Карточки пользователей» — профиль, категории, Premium, отклики.\n"
+        "• «💎 Запросы Premium» — чек на оплату, кнопки ✅/❌.\n"
+        "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
+        "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения пользователей.\n"
+        "• /user USER_ID — карточка по ID · /setplan USER_ID premium 30 — выдать Premium.\n\n"
         "<b>📥 Excel</b>\n"
-        "• подписчики, вакансии, заказчики\n"
-        "• «📥 Excel: не подходит» — feedback «👎 Не подходит» с причинами\n\n"
+        "Выгрузки: подписчики, вакансии, заказчики, отклики, «не подходит» (feedback с причинами).\n\n"
         "<b>📝 Модерация и канал</b>\n"
-        "• «📺 Канал» — лимиты, промо, новости, статистика\n"
-        "• «📣 В канал» — вакансия по ID (без лимитов)\n\n"
-        "<b>Команды</b>\n"
-        "/help — эта справка\n"
-        "/start — админ-меню\n"
-        "/debug_last — отчёт парсера"
+        "• «📝 Модерация вакансий» — очередь на approve/reject.\n"
+        "• «📺 Канал» — лимиты автопоста, промо, новости, статистика @promostaff_agency_job.\n"
+        "• «📣 В канал» — ручная публикация вакансии по ID (без лимитов).\n\n"
+        "<b>Общие команды</b>\n"
+        "/start — админ-меню · /admin — дашборд · /status — статус парсера и счётчики · /help — эта справка"
     )
+
+
+async def send_admin_parser_intro(message: types.Message):
+    """Экран раздела «Парсер»: краткая инструкция + клавиатура."""
+    text = build_admin_parser_help_html()
+    try:
+        if len(text) > 3800:
+            await send_long_message(message.chat.id, text, parse_mode="HTML")
+        else:
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    except TelegramBadRequest:
+        plain = re.sub(r"<[^>]*>", "", text)
+        await message.answer(plain, disable_web_page_preview=True)
+    await message.answer("👇 Кнопки парсера", reply_markup=get_admin_parser_keyboard())
 
 
 async def send_user_help(message: types.Message, user_id: int):
@@ -1960,8 +2021,10 @@ def get_admin_hub_keyboard() -> ReplyKeyboardMarkup:
 def get_admin_parser_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔍 Ручная проверка"), KeyboardButton(text="📝 Отчёт парсера")],
-            [KeyboardButton(text="📋 Список чатов парсинга"), KeyboardButton(text="📊 Шум по чатам")],
+            [KeyboardButton(text="🔍 Ручная проверка"), KeyboardButton(text="🔬 Аудит фильтра")],
+            [KeyboardButton(text="📝 Отчёт парсера"), KeyboardButton(text="📋 Примеры отсева")],
+            [KeyboardButton(text="📡 Покрытие каналов"), KeyboardButton(text="📊 Шум по чатам")],
+            [KeyboardButton(text="📋 Список чатов парсинга")],
             [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📤 Отправить вакансию")],
             [KeyboardButton(text="🧭 Маппинг категорий")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
@@ -2164,6 +2227,7 @@ ADMIN_MENU_BUTTONS = {
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
+    "🔬 Аудит фильтра", "📋 Примеры отсева", "📡 Покрытие каналов",
     "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
     "📣 Вакансия в канал", "📣 В канал", "📝 Новость в канал", "📢 Промо в канал",
     "✏️ Тексты промо",
@@ -2173,11 +2237,26 @@ ADMIN_MENU_BUTTONS = {
 
 # ========== КОМАНДЫ И ОБРАБОТЧИКИ ==========
 
+async def send_admin_help(message: types.Message):
+    text = build_admin_help_html()
+    try:
+        if len(text) > 3800:
+            await send_long_message(message.chat.id, text, parse_mode="HTML")
+        else:
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    except TelegramBadRequest:
+        plain = re.sub(r"<[^>]*>", "", text)
+        if len(plain) > 3800:
+            await send_long_message(message.chat.id, plain, parse_mode=None)
+        else:
+            await message.answer(plain, disable_web_page_preview=True)
+
+
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
     user_id = message.from_user.id
     if user_id == YOUR_USER_ID:
-        await message.answer(build_admin_help_html(), parse_mode="HTML")
+        await send_admin_help(message)
         return
     await send_user_help(message, user_id)
 
@@ -2185,7 +2264,7 @@ async def help_cmd(message: types.Message):
 @dp.message(lambda m: m.text in ("📖 Как пользоваться", "📖 Справка"))
 async def help_menu_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
-        await message.answer(build_admin_help_html(), parse_mode="HTML")
+        await send_admin_help(message)
         return
     await send_user_help(message, message.from_user.id)
 
@@ -4518,29 +4597,117 @@ async def status_cmd(message: types.Message):
         reply_markup=get_admin_keyboard(),
     )
 
+async def _parser_wait_progress_loop(status_msg: types.Message):
+    """Пока lock занят — обновляем статус по LAST_DEBUG_STATS."""
+    while parser_scan_in_progress():
+        try:
+            await status_msg.edit_text(
+                format_parser_wait_message(LAST_DEBUG_STATS),
+                parse_mode="Markdown",
+            )
+        except TelegramBadRequest:
+            pass
+        except Exception as e:
+            logger.debug("parser wait progress edit failed: %s", e)
+        await asyncio.sleep(15)
+
+
+async def _wait_parser_lock_release():
+    while parser_scan_in_progress():
+        await asyncio.sleep(1)
+
+
 @dp.message(Command("check_now"))
 async def check_now_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
     status_msg = await message.answer("🔍 Начинаю проверку...")
+    progress_task = None
+    pending_kind = None
     if parser_scan_in_progress():
+        pending_kind = LAST_DEBUG_STATS.get("run_kind")
         await status_msg.edit_text(
-            "🔍 Ожидание парсера…\n"
-            "Идёт синхронизация чатов (стартовая или ручная). Обычно 1–3 мин."
+            format_parser_wait_message(LAST_DEBUG_STATS),
+            parse_mode="Markdown",
         )
+        progress_task = asyncio.create_task(_parser_wait_progress_loop(status_msg))
+        await _wait_parser_lock_release()
+        if progress_task:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+        if pending_kind in ("startup", "periodic"):
+            await status_msg.edit_text(
+                format_scan_finished_summary(LAST_DEBUG_STATS),
+                parse_mode="Markdown",
+            )
+            return
     try:
+        if not parser_scan_in_progress():
+            await status_msg.edit_text("🔍 Ручная проверка чатов…")
         orders, closed_data = await run_parser()
         if not orders and not closed_data:
-            await status_msg.edit_text("✅ Новых вакансий не найдено.")
+            await status_msg.edit_text(
+                format_scan_finished_summary(LAST_DEBUG_STATS),
+                parse_mode="Markdown",
+            )
             return
         if closed_data:
             await notify_closed_vacancies(closed_data)
         for order in orders:
             await send_vacancy_to_subscribers(order)
-        await status_msg.edit_text(f"✅ Проверка завершена. Найдено вакансий: {len(orders)}. Уведомлений о закрытии: {len(closed_data)}")
+        await status_msg.edit_text(
+            f"✅ Проверка завершена. Найдено вакансий: {len(orders)}. "
+            f"Уведомлений о закрытии: {len(closed_data)}",
+            parse_mode="Markdown",
+        )
     except Exception as e:
         logger.error(f"Ошибка в check_now_cmd: {e}")
         await status_msg.edit_text(f"❌ Ошибка: {str(e)[:100]}")
+    finally:
+        if progress_task and not progress_task.done():
+            progress_task.cancel()
+
+
+@dp.message(Command("audit_filter"))
+async def audit_filter_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    status_msg = await message.answer("🔬 Запускаю аудит фильтра…")
+    progress_task = None
+    if parser_scan_in_progress():
+        await status_msg.edit_text(
+            format_parser_wait_message(LAST_DEBUG_STATS),
+            parse_mode="Markdown",
+        )
+        progress_task = asyncio.create_task(_parser_wait_progress_loop(status_msg))
+        await _wait_parser_lock_release()
+        if progress_task:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+    try:
+        await status_msg.edit_text(
+            "🔬 Аудит: последние посты из каждого чата через фильтр (без сохранения)…"
+        )
+        stats = await run_parser_audit()
+        summary = (
+            f"🔬 *Аудит завершён*\n\n"
+            f"Просмотрено: {stats.get('messages_scanned', 0)} постов\n"
+            f"Прошли фильтр: {stats.get('matched', 0)} | отсеяно: {stats.get('non_relevant', 0)}\n\n"
+            "Смотрите «📋 Примеры отсева», «📡 Покрытие каналов», «📊 Шум по чатам»."
+        )
+        await status_msg.edit_text(summary, parse_mode="Markdown")
+    except Exception as e:
+        logger.error("audit_filter_cmd: %s", e)
+        await status_msg.edit_text(f"❌ Ошибка аудита: {str(e)[:100]}")
+    finally:
+        if progress_task and not progress_task.done():
+            progress_task.cancel()
 
 @dp.message(Command("debug_last"))
 async def debug_last_cmd(message: types.Message):
@@ -4802,6 +4969,12 @@ async def admin_stats_button(message: types.Message):
 async def admin_check_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
         await check_now_cmd(message)
+
+
+@dp.message(lambda m: m.text == "🔬 Аудит фильтра")
+async def admin_audit_filter_button(message: types.Message):
+    if message.from_user.id == YOUR_USER_ID:
+        await audit_filter_cmd(message)
 
 @dp.message(lambda m: m.text == "📋 Список откликов")
 async def admin_responses_button(message: types.Message):
@@ -5151,11 +5324,7 @@ async def admin_export_notfit(message: types.Message):
 
 @dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_PARSER)
 async def admin_nav_parser(message: types.Message):
-    await message.answer(
-        "📡 *Парсер* — чаты, прогон, качество ленты.",
-        parse_mode="Markdown",
-        reply_markup=get_admin_parser_keyboard(),
-    )
+    await send_admin_parser_intro(message)
 
 
 @dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_HUB_USERS)
@@ -5193,6 +5362,16 @@ async def admin_nav_back(message: types.Message):
 @dp.message(lambda m: m.text == "📊 Шум по чатам")
 async def admin_chat_noise_button(message: types.Message):
     await send_chat_noise_report(message)
+
+
+@dp.message(lambda m: m.text == "📋 Примеры отсева")
+async def admin_reject_samples_button(message: types.Message):
+    await send_reject_samples_report(message)
+
+
+@dp.message(lambda m: m.text == "📡 Покрытие каналов")
+async def admin_channel_coverage_button(message: types.Message):
+    await send_channel_coverage_report(message)
 
 
 @dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == "📺 Канал")

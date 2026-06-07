@@ -195,3 +195,80 @@ def test_loader_uborka_two_people():
     ok, cat, _, _ = evaluate_vacancy(text)
     assert ok is True
     assert cat == "loader"
+
+
+def test_format_chat_noise_report_in_progress():
+    from parser import format_chat_noise_report
+
+    text = format_chat_noise_report(
+        {
+            "by_chat": {},
+            "messages_scanned": 120,
+            "chats_ok": 5,
+            "chats_total": 36,
+            "finished_at": None,
+        }
+    )
+    assert "Прогон ещё идёт" in text
+    assert "120" in text
+
+
+def test_format_chat_noise_report_with_by_chat():
+    from parser import format_chat_noise_report
+
+    text = format_chat_noise_report(
+        {
+            "by_chat": {
+                "Test Chat": {
+                    "scanned": 10,
+                    "matched": 2,
+                    "rejected": 6,
+                    "role_mismatch": 0,
+                    "reasons": {"not_staff": 4},
+                }
+            }
+        }
+    )
+    assert "Test Chat" in text
+    assert "шум" in text.lower()
+
+
+def test_format_reject_samples_report():
+    from parser import format_reject_samples_report
+
+    text = format_reject_samples_report(
+        {
+            "run_kind": "audit",
+            "reject_samples": [
+                {
+                    "chat": "Promo Chat",
+                    "reason": "no_contact",
+                    "preview": "Нужны промоутеры, 500 р/ч",
+                }
+            ],
+        }
+    )
+    assert "no_contact" not in text or "контакта" in text
+    assert "Promo Chat" in text
+    assert "500 р/ч" in text
+
+
+def test_format_channel_coverage_report():
+    from parser import format_channel_coverage_report
+
+    text = format_channel_coverage_report(
+        {"by_chat": {"Active": {"matched": 2, "rejected": 5, "scanned": 10}}},
+        {"Active": 15, "Silent": 0},
+    )
+    assert "Active" in text
+    assert "15" in text
+    assert "Silent" in text or "Молчат" in text
+
+
+def test_build_admin_parser_help_html():
+    from main import build_admin_parser_help_html
+
+    text = build_admin_parser_help_html()
+    assert "Аудит фильтра" in text
+    assert "Покрытие каналов" in text
+    assert "Примеры отсева" in text
