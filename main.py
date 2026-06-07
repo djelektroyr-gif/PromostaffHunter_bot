@@ -269,6 +269,7 @@ BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API пр
 RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
 _processing_finish: set[int] = set()
+_broadcast_lock = asyncio.Lock()
 
 
 def escape_markdown(text: str) -> str:
@@ -335,9 +336,17 @@ def build_notfit_reason_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_vacancy_keyboard(vacancy_id: str, address: str | None = None) -> InlineKeyboardMarkup:
+def build_vacancy_keyboard(
+    vacancy_id: str,
+    address: str | None = None,
+    *,
+    responded: bool = False,
+) -> InlineKeyboardMarkup:
     """Inline-кнопки с цветами Bot API 9.4 (style на InlineKeyboardButton)."""
-    buttons = [[_inline_btn("Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
+    if responded:
+        buttons = [[InlineKeyboardButton(text="✅ Отклик отправлен", callback_data="already_responded")]]
+    else:
+        buttons = [[_inline_btn("Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
     maps_url = build_maps_url(address) if address else None
     if maps_url:
         buttons.append([_inline_btn("На карте", url=maps_url, style="primary")])
@@ -424,6 +433,34 @@ async def send_vacancy_card(
             )
             return
         raise
+
+
+async def _mark_vacancy_card_responded(
+    callback: types.CallbackQuery,
+    vacancy_id: str,
+    address: str | None = None,
+) -> None:
+    """Убирает повторный отклик — меняет inline-клавиатуру на карточке вакансии."""
+    if not callback.message:
+        return
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=build_vacancy_keyboard(vacancy_id, address, responded=True),
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            logger.debug("mark_vacancy_card_responded: %s", e)
+
+
+async def _offer_feed_session_restart(message: types.Message) -> None:
+    await message.answer(
+        "⏱ *Сессия ленты истекла* — бот перезапускался или прошло много времени.\n\n"
+        "Откройте вакансии заново:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Открыть ленту", callback_data="feed_pick_mode")],
+        ]),
+    )
 
 
 def _free_category_hint_short() -> str:
@@ -3286,6 +3323,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
 
     data = user_pages.get(user_id)
     if not data:
+        await _offer_feed_session_restart(message)
         return
     vacancies = data["vacancies"]
     total = data["total"]
@@ -3339,6 +3377,14 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_page_"))
 async def vacancy_page_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    if user_id not in user_pages:
+        await safe_callback_answer(
+            callback,
+            "Сессия ленты истекла — нажмите «Открыть ленту»",
+            show_alert=True,
+        )
+        await _offer_feed_session_restart(callback.message)
+        return
     page = int(callback.data.split("_")[2])
     await safe_callback_answer(callback, "Загружаю страницу…")
     await send_vacancy_page(callback.message, user_id, page)
@@ -3465,8 +3511,8 @@ async def premium_request_approve_callback(callback: types.CallbackQuery):
     except (ValueError, IndexError):
         await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
         return
-    req = get_premium_request(request_id)
-    if not req or req.get("status") != "pending":
+    req = approve_premium_request(request_id)
+    if not req:
         await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
         return
     target_id = req["user_id"]
@@ -4017,11 +4063,18 @@ async def moderation_approve(callback: types.CallbackQuery):
         await callback.answer("Недоступно", show_alert=True)
         return
     vacancy_id = callback.data.replace("mod_ok_", "", 1)
+    await safe_callback_answer(callback, "Публикую…")
+    if not set_vacancy_moderation_if_pending(vacancy_id, "approved"):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer("ℹ️ Вакансия уже обработана ранее.")
+        return
     row = get_vacancy_push_row(vacancy_id)
     if not row:
-        await callback.answer("Вакансия не найдена", show_alert=True)
+        await callback.message.answer("Вакансия не найдена")
         return
-    set_vacancy_moderation(vacancy_id, "approved")
     order = build_order_from_vacancy_row(vacancy_id, row)
     if order:
         schedule_vacancy_push(order)
@@ -4035,8 +4088,14 @@ async def moderation_approve(callback: types.CallbackQuery):
             )
         except Exception as e:
             logger.warning("moderation notify employer: %s", e)
-    await callback.message.edit_text(f"✅ Вакансия `{vacancy_id}` опубликована.", parse_mode="Markdown")
-    await callback.answer("Опубликовано")
+    try:
+        await callback.message.edit_text(
+            f"✅ Вакансия `{vacancy_id}` опубликована.",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("mod_ch_"))
@@ -4056,8 +4115,15 @@ async def moderation_reject(callback: types.CallbackQuery):
         await callback.answer("Недоступно", show_alert=True)
         return
     vacancy_id = callback.data.replace("mod_no_", "", 1)
+    await safe_callback_answer(callback, "Отклоняю…")
     row = get_vacancy_push_row(vacancy_id)
-    set_vacancy_moderation(vacancy_id, "rejected")
+    if not set_vacancy_moderation_if_pending(vacancy_id, "rejected"):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer("ℹ️ Вакансия уже обработана ранее.")
+        return
     employer_uid = row[12] if row else None
     if employer_uid:
         try:
@@ -4069,8 +4135,14 @@ async def moderation_reject(callback: types.CallbackQuery):
             )
         except Exception as e:
             logger.warning("moderation reject notify: %s", e)
-    await callback.message.edit_text(f"❌ Вакансия `{vacancy_id}` отклонена.", parse_mode="Markdown")
-    await callback.answer("Отклонено")
+    try:
+        await callback.message.edit_text(
+            f"❌ Вакансия `{vacancy_id}` отклонена.",
+            parse_mode="Markdown",
+            reply_markup=None,
+        )
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(Command("setchatroles"))
@@ -4186,6 +4258,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         ):
             await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
             return
+        await _mark_vacancy_card_responded(callback, vacancy_id, address)
         await send_to_admin(
             callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
         )
@@ -4202,6 +4275,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     ):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
+    await _mark_vacancy_card_responded(callback, vacancy_id, address)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
@@ -4821,6 +4895,9 @@ async def broadcast_confirm(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != YOUR_USER_ID:
         await callback.answer("Недоступно", show_alert=True)
         return
+    if _broadcast_lock.locked():
+        await callback.answer("Рассылка уже выполняется", show_alert=True)
+        return
     data = await state.get_data()
     text = data.get("broadcast_text")
     if not text:
@@ -4828,8 +4905,13 @@ async def broadcast_confirm(callback: types.CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await callback.answer("Рассылка запущена")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
     status_msg = await callback.message.edit_text("📢 Рассылка началась...")
-    sent, failed, err = await run_broadcast(callback.from_user.id, text, status_msg)
+    async with _broadcast_lock:
+        sent, failed, err = await run_broadcast(callback.from_user.id, text, status_msg)
     if err:
         await status_msg.edit_text(err)
     else:
@@ -4838,10 +4920,17 @@ async def broadcast_confirm(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=None,
         )
 
+
 @dp.callback_query(lambda c: c.data == "broadcast_cancel")
 async def broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
     await state.clear()
-    await callback.message.edit_text("❌ Рассылка отменена.")
+    try:
+        await callback.message.edit_text("❌ Рассылка отменена.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 @dp.message(Command("clean_old"))

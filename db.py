@@ -1411,6 +1411,20 @@ def set_vacancy_moderation(vacancy_id: str, status: str):
     execute("UPDATE vacancies SET moderation_status = ? WHERE id = ?", (status, vacancy_id))
 
 
+def set_vacancy_moderation_if_pending(vacancy_id: str, status: str) -> bool:
+    """Меняет статус только если вакансия ещё pending. False — уже обработана."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE vacancies SET moderation_status = ? "
+                "WHERE id = ? AND moderation_status = 'pending'"
+            ),
+            (status, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
 def record_vacancy_notfit(
     user_id: int,
     vacancy_id: str,
@@ -2650,15 +2664,37 @@ def resolve_premium_requests(user_id: int):
     )
 
 
+def approve_premium_request(request_id: int) -> dict | None:
+    """Атомарно одобряет один pending-запрос. None — уже обработан."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE premium_requests SET status = 'approved' "
+                "WHERE id = ? AND status = 'pending'"
+            ),
+            (request_id,),
+        )
+        if cur.rowcount == 0:
+            return None
+        cur.execute(q(f"{_PREMIUM_REQUEST_SELECT} WHERE id = ?"), (request_id,))
+        row = cur.fetchone()
+        return _premium_request_row(row) if row else None
+
+
 def reject_premium_request(request_id: int) -> int | None:
-    row = fetchone(
-        f"{_PREMIUM_REQUEST_SELECT} WHERE id = ? AND status = 'pending'",
-        (request_id,),
-    )
-    if not row:
-        return None
-    execute(
-        "UPDATE premium_requests SET status = 'rejected' WHERE id = ?",
-        (request_id,),
-    )
-    return row[1]
+    """Атомарно отклоняет pending-запрос. Возвращает user_id или None."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE premium_requests SET status = 'rejected' "
+                "WHERE id = ? AND status = 'pending'"
+            ),
+            (request_id,),
+        )
+        if cur.rowcount == 0:
+            return None
+        cur.execute(q("SELECT user_id FROM premium_requests WHERE id = ?"), (request_id,))
+        row = cur.fetchone()
+        return row[0] if row else None

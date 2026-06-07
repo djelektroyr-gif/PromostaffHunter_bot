@@ -83,9 +83,14 @@
 - [x] `/start` → `state.clear()`
 - [x] Тесты на cursor + responses
 
-### Волна 2 — защита от двойных нажатий
+### Волна 2 — защита от двойных нажатий ✅
 
-Premium approve / moderation atomic UPDATE; disable кнопку после respond; broadcast lock; лента «сессия истекла».
+- [x] Premium approve — `approve_premium_request()` atomic UPDATE
+- [x] Moderation approve/reject — `set_vacancy_moderation_if_pending()`
+- [x] Respond — кнопка «✅ Отклик отправлен» после первого клика
+- [x] Broadcast — `_broadcast_lock` + admin guard на cancel
+- [x] Лента — «Сессия истекла» + кнопка «Открыть ленту»
+- [x] Тесты `test_wave2_stabilization.py`
 
 ### Волна 3 — hardening
 
@@ -111,3 +116,4 @@ Stars/push/channel idempotent; FSM escape helper; RedisStorage; PG smoke tests.
 |------|-------|-------------|
 | 2026-06-07 | — | Аудит зафиксирован |
 | 2026-06-07 | 1 | Parser cursor + mark scanned; UNIQUE отклики; admin card; `/start` clear FSM; parser lock/typing UX |
+| 2026-06-07 | 2 | Atomic premium/moderation; respond keyboard lock; broadcast lock; feed session expired UX |
