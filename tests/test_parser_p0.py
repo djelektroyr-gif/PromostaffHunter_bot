@@ -326,6 +326,24 @@ def test_helpers_team_academic_spam_rejected():
     assert detect_category(text) is None
 
 
+def test_helpers_team_brand_alone_not_helper_category():
+    text = "Всем привет! На связи владелец чата HelpersTeam @ramil_ve"
+    assert detect_category(text) is None
+    ok, _, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+
+
+def test_helper_na_meropriyatie_accepted():
+    text = (
+        "Нужен хелпер на мероприятие 5 июня, помощь на площадке.\n"
+        "Ставка 4000 ₽/смена\n"
+        "Для отклика @boss1"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text)
+    assert ok is True
+    assert cat == "helper"
+
+
 def test_real_helper_in_helpersteam_chat_still_accepted():
     text = (
         "HelpersTeam | \u041c\u043e\u0441\u043a\u0432\u0430\n"

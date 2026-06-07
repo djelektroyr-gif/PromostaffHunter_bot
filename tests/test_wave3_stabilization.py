@@ -17,6 +17,7 @@ from db import (
     get_premium_request,
     init_db,
     is_vacancy_channel_posted,
+    get_vacancy_row,
     load_user_feed_session,
     mark_vacancy_channel_posted,
     release_vacancy_channel_post,
@@ -25,6 +26,8 @@ from db import (
     set_vacancy_moderation_if_pending,
     try_reserve_promo_slot,
     try_reserve_vacancy_channel_post,
+    delete_vacancy_completely,
+    get_vacancy_channel_message_id,
     try_reserve_vacancy_sent_to_user,
     unreserve_vacancy_sent_to_user,
     update_last_processed_id,
@@ -166,6 +169,44 @@ def test_user_feed_session_roundtrip(tmp_db):
     assert session["feed_filter"] == ["loader", "helper"]
     assert session["vacancy_ids"] == ["v1", "v2", "v3"]
     assert session["page"] == 2
+
+
+def test_delete_vacancy_completely(tmp_db):
+    add_subscriber(501, "u", "U", None)
+    add_subscriber(502, "u2", "U2", None)
+    save_vacancy(
+        "spam_v1",
+        "c1",
+        "Chat",
+        "helper",
+        "Реклама курсовых",
+        "https://t.me/x/1",
+        "@spam",
+        None,
+        False,
+        "dk_spam",
+        "2026-06-07 12:00:00",
+    )
+    assert try_reserve_vacancy_sent_to_user("spam_v1", 501) is True
+    assert try_reserve_vacancy_sent_to_user("spam_v1", 502) is True
+    add_response(501, "spam_v1", "отклик", draft_status="pending")
+    mark_vacancy_channel_posted("spam_v1", category_code="helper", message_id=999)
+    save_user_feed_session(501, "fresh", ["helper"], ["spam_v1", "other_v"], page=0)
+
+    stats = delete_vacancy_completely("spam_v1")
+    assert stats is not None
+    assert stats["push_recipients"] == 2
+    assert stats["deleted_vacancy"] == 1
+    assert stats["deleted_sent_vacancies"] == 2
+    assert stats["deleted_responses"] == 1
+    assert stats["channel_message_id"] == 999
+    assert stats["feed_sessions_updated"] == 1
+
+    assert get_vacancy_row("spam_v1") is None
+    assert is_vacancy_channel_posted("spam_v1") is False
+    session = load_user_feed_session(501)
+    assert session["vacancy_ids"] == ["other_v"]
+    assert delete_vacancy_completely("spam_v1") is None
 
 
 # --- FSM storage fallback ---

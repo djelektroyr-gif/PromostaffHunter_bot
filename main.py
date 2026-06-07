@@ -186,6 +186,9 @@ async def notify_admin_moderation(vacancy_id: str, category_code: str, preview: 
             InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"mod_ok_{vacancy_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_no_{vacancy_id}"),
         ],
+        [
+            InlineKeyboardButton(text="🗑 Удалить из бота", callback_data=f"mod_del_{vacancy_id}"),
+        ],
     ])
     try:
         await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown", reply_markup=markup)
@@ -1055,6 +1058,10 @@ class ChannelCustomPostState(StatesGroup):
     waiting_content = State()
 
 
+class DeleteVacancyState(StatesGroup):
+    waiting_for_id = State()
+
+
 class ChannelPromoTextState(StatesGroup):
     waiting_text = State()
 
@@ -1188,8 +1195,10 @@ def build_admin_help_html() -> str:
         "Выгрузки: подписчики, вакансии, заказчики, отклики, «не подходит» (feedback с причинами).\n\n"
         "<b>📝 Модерация и канал</b>\n"
         "• «📝 Модерация вакансий» — очередь на approve/reject.\n"
+        "• «🗑 Удалить вакансию» — полное удаление из базы и у подписчиков (спам/ошибка парсера).\n"
         "• «📺 Канал» — лимиты автопоста, промо, новости, статистика @promostaff_agency_job.\n"
-        "• «📣 В канал» — ручная публикация вакансии по ID (без лимитов).\n\n"
+        "• «📣 В канал» — ручная публикация вакансии по ID (без лимитов).\n"
+        "• /delvac ID — удалить вакансию по ID.\n\n"
         "<b>Общие команды</b>\n"
         "/start — админ-меню · /admin — дашборд · /status — статус парсера и счётчики · /help — эта справка"
     )
@@ -2102,6 +2111,7 @@ def get_admin_mod_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📝 Модерация вакансий"), KeyboardButton(text="📺 Канал")],
+            [KeyboardButton(text="🗑 Удалить вакансию")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
         resize_keyboard=True,
@@ -2268,6 +2278,7 @@ ADMIN_MENU_BUTTONS = {
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
+    "🗑 Удалить вакансию",
     "🔬 Аудит фильтра", "📋 Примеры отсева", "📡 Покрытие каналов",
     "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
     "📣 Вакансия в канал", "📣 В канал", "📝 Новость в канал", "📢 Промо в канал",
@@ -4207,6 +4218,160 @@ async def moderation_reject(callback: types.CallbackQuery):
         pass
 
 
+def _delete_vacancy_confirm_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"delvac_yes_{vacancy_id}"),
+        InlineKeyboardButton(text="Отмена", callback_data="delvac_no"),
+    ]])
+
+
+async def _prompt_delete_vacancy(chat_id: int, vacancy_id: str, *, reply_markup=None) -> bool:
+    """Показывает превью и кнопки подтверждения. False — вакансия не найдена."""
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        await bot.send_message(
+            chat_id,
+            f"❌ Вакансия `{vacancy_id}` не найдена.",
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+        return False
+    preview = escape_markdown((row[0] or "")[:250])
+    cat_name = get_category_name(row[5] or "")
+    push_n = len(get_users_who_received_vacancy(vacancy_id))
+    in_channel = is_vacancy_channel_posted(vacancy_id)
+    channel_note = "да" if in_channel else "нет"
+    text = (
+        f"🗑 *Удалить вакансию из бота?*\n\n"
+        f"ID: `{vacancy_id}`\n"
+        f"Категория: {escape_markdown(cat_name)}\n"
+        f"Push подписчикам: {push_n}\n"
+        f"В канале: {channel_note}\n\n"
+        f"{preview}\n\n"
+        "Будет удалена из базы, снята с учёта у подписчиков и лент. "
+        "Пост в канале тоже попробуем удалить."
+    )
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode="Markdown",
+        reply_markup=_delete_vacancy_confirm_keyboard(vacancy_id),
+    )
+    return True
+
+
+async def _execute_admin_delete_vacancy(vacancy_id: str) -> str:
+    channel_msg_id = get_vacancy_channel_message_id(vacancy_id)
+    stats = await run_db(delete_vacancy_completely, vacancy_id)
+    if not stats:
+        return f"❌ Вакансия `{vacancy_id}` не найдена или уже удалена."
+
+    channel_deleted = False
+    if channel_msg_id and HUNTER_CHANNEL_ID:
+        try:
+            await bot.delete_message(HUNTER_CHANNEL_ID, channel_msg_id)
+            channel_deleted = True
+        except Exception as e:
+            logger.warning("delete channel post vacancy=%s msg=%s: %s", vacancy_id, channel_msg_id, e)
+
+    lines = [
+        f"🗑 Вакансия `{vacancy_id}` удалена из базы.",
+        f"• Снято с учёта push: {stats['push_recipients']} подписчик(ов)",
+        f"• sent_vacancies: {stats.get('deleted_sent_vacancies', 0)}",
+        f"• откликов: {stats.get('deleted_responses', 0)}",
+        f"• лент (feed session): {stats.get('feed_sessions_updated', 0)}",
+    ]
+    if channel_msg_id:
+        if channel_deleted:
+            lines.append(f"• Пост в канале (msg {channel_msg_id}) удалён.")
+        else:
+            lines.append(f"• Пост в канале (msg {channel_msg_id}) — удалите вручную, если нужно.")
+    return "\n".join(lines)
+
+
+@dp.message(Command("delvac"))
+async def delvac_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "🗑 *Удаление вакансии*\n\n"
+            "Использование: `/delvac ID`\n"
+            "ID — из карточки вакансии или модерации.\n\n"
+            "Или кнопка «🗑 Удалить вакансию» в разделе модерации.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_mod_keyboard(),
+        )
+        return
+    vacancy_id = parts[1].strip()
+    await _prompt_delete_vacancy(message.chat.id, vacancy_id, reply_markup=get_admin_mod_keyboard())
+
+
+@dp.message(lambda m: m.text == "🗑 Удалить вакансию")
+async def admin_delete_vacancy_button(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await message.answer(
+        "🗑 Отправьте *ID вакансии* для удаления из базы и у подписчиков.\n"
+        "ID можно скопировать из push-сообщения или модерации.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_mod_keyboard(),
+    )
+    await state.set_state(DeleteVacancyState.waiting_for_id)
+
+
+@dp.message(DeleteVacancyState.waiting_for_id)
+async def admin_delete_vacancy_id(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if message.text in ADMIN_MENU_BUTTONS:
+        await state.clear()
+        return
+    vacancy_id = (message.text or "").strip()
+    if not vacancy_id:
+        await message.answer("❌ Укажите ID вакансии или нажмите «◀️ Назад».")
+        return
+    await state.clear()
+    await _prompt_delete_vacancy(message.chat.id, vacancy_id, reply_markup=get_admin_mod_keyboard())
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("mod_del_"))
+async def moderation_delete_prompt(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    vacancy_id = callback.data.replace("mod_del_", "", 1)
+    await callback.answer()
+    await _prompt_delete_vacancy(callback.message.chat.id, vacancy_id)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("delvac_yes_"))
+async def delete_vacancy_confirm(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    vacancy_id = callback.data.replace("delvac_yes_", "", 1)
+    await safe_callback_answer(callback, "Удаляю…")
+    result = await _execute_admin_delete_vacancy(vacancy_id)
+    try:
+        await callback.message.edit_text(result, parse_mode="Markdown", reply_markup=None)
+    except TelegramBadRequest:
+        await callback.message.answer(result, parse_mode="Markdown", reply_markup=get_admin_mod_keyboard())
+
+
+@dp.callback_query(lambda c: c.data == "delvac_no")
+async def delete_vacancy_cancel(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text("❌ Удаление отменено.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
 @dp.message(Command("setchatroles"))
 async def setchatroles_cmd(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -5913,11 +6078,16 @@ async def admin_moderation_button(message: types.Message):
     await message.answer(f"📝 *На модерации:* {len(pending)}", parse_mode="Markdown")
     for v in pending:
         preview = (v.get("message_text") or "")[:350]
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            _inline_btn("Опубликовать", callback_data=f"mod_ok_{v['id']}", style="success"),
-            _inline_btn("Отклонить", callback_data=f"mod_no_{v['id']}", style="danger"),
-            _inline_btn("📣 Канал", callback_data=f"mod_ch_{v['id']}"),
-        ]])
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                _inline_btn("Опубликовать", callback_data=f"mod_ok_{v['id']}", style="success"),
+                _inline_btn("Отклонить", callback_data=f"mod_no_{v['id']}", style="danger"),
+                _inline_btn("📣 Канал", callback_data=f"mod_ch_{v['id']}"),
+            ],
+            [
+                _inline_btn("🗑 Удалить", callback_data=f"mod_del_{v['id']}", style="danger"),
+            ],
+        ])
         await message.answer(
             f"*{get_category_name(v['category_code'])}* · `{v['id']}`\n"
             f"Контакт: {v.get('author_contact') or '—'}\n\n"

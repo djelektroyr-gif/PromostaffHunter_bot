@@ -2117,6 +2117,74 @@ def get_users_who_received_vacancy(vacancy_id: str) -> list:
     return [row[0] for row in rows]
 
 
+def get_vacancy_channel_message_id(vacancy_id: str) -> int | None:
+    row = fetchone(
+        "SELECT message_id FROM vacancy_channel_posts WHERE vacancy_id = ? AND message_id IS NOT NULL",
+        (vacancy_id,),
+    )
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def delete_vacancy_completely(vacancy_id: str) -> dict | None:
+    """Удаляет вакансию и все связанные записи (push, отклики, канал, ленты)."""
+    import json
+
+    if not fetchone("SELECT id FROM vacancies WHERE id = ?", (vacancy_id,)):
+        return None
+
+    channel_message_id = get_vacancy_channel_message_id(vacancy_id)
+    push_recipients = len(get_users_who_received_vacancy(vacancy_id))
+    stats: dict = {
+        "vacancy_id": vacancy_id,
+        "channel_message_id": channel_message_id,
+        "push_recipients": push_recipients,
+    }
+    ref_tables = (
+        "sent_vacancies",
+        "responses",
+        "complaints",
+        "vacancy_notfit_feedback",
+        "star_purchases",
+        "vacancy_channel_posts",
+    )
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        for table in ref_tables:
+            cur.execute(q(f"DELETE FROM {table} WHERE vacancy_id = ?"), (vacancy_id,))
+            stats[f"deleted_{table}"] = cur.rowcount
+
+        feed_updated = 0
+        cur.execute(q("SELECT user_id, vacancy_ids FROM user_feed_sessions"))
+        for user_id, ids_json in cur.fetchall():
+            try:
+                ids = json.loads(ids_json) if ids_json else []
+            except json.JSONDecodeError:
+                continue
+            if vacancy_id not in ids:
+                continue
+            new_ids = [vid for vid in ids if vid != vacancy_id]
+            if new_ids:
+                cur.execute(
+                    q(
+                        "UPDATE user_feed_sessions SET vacancy_ids = ?, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE user_id = ?"
+                    ),
+                    (json.dumps(new_ids), user_id),
+                )
+            else:
+                cur.execute(q("DELETE FROM user_feed_sessions WHERE user_id = ?"), (user_id,))
+            feed_updated += 1
+        stats["feed_sessions_updated"] = feed_updated
+
+        cur.execute(q("DELETE FROM vacancies WHERE id = ?"), (vacancy_id,))
+        stats["deleted_vacancy"] = cur.rowcount
+
+    return stats if stats["deleted_vacancy"] else None
+
+
 def mark_vacancy_closed(message_id: str, chat_id: str):
     """Помечает вакансию закрытой и возвращает (canonical_id, user_ids для уведомления)."""
     legacy_id = f"{chat_id}_{message_id}"
