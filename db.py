@@ -329,6 +329,17 @@ def init_db():
         """)
 
         cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS user_feed_sessions (
+                user_id INTEGER PRIMARY KEY,
+                feed_mode TEXT NOT NULL,
+                category_codes TEXT,
+                vacancy_ids TEXT NOT NULL,
+                page INTEGER DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS llm_usage (
                 id {serial_pk()},
                 user_id INTEGER NOT NULL,
@@ -803,7 +814,7 @@ def count_channel_vacancy_posts_in_msk_hour(category_code: str | None = None) ->
     rows = fetchall(
         """
         SELECT category_code, posted_at FROM vacancy_channel_posts
-        WHERE COALESCE(post_kind, 'vacancy') = 'vacancy'
+        WHERE COALESCE(post_kind, 'vacancy') = 'vacancy' AND message_id IS NOT NULL
         """
     )
     count = 0
@@ -855,6 +866,30 @@ def mark_promo_sent(promo_slot: str, sent_date: str):
         INSERT INTO channel_promo_sent (promo_slot, sent_date) VALUES (?, ?)
         ON CONFLICT(promo_slot, sent_date) DO NOTHING
         """,
+        (promo_slot, sent_date),
+    )
+
+
+def try_reserve_promo_slot(promo_slot: str, sent_date: str) -> bool:
+    """Резервирует слот промо до отправки в канал."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                INSERT INTO channel_promo_sent (promo_slot, sent_date)
+                VALUES (?, ?)
+                ON CONFLICT(promo_slot, sent_date) DO NOTHING
+                """
+            ),
+            (promo_slot, sent_date),
+        )
+        return cur.rowcount > 0
+
+
+def release_promo_slot(promo_slot: str, sent_date: str) -> None:
+    execute(
+        "DELETE FROM channel_promo_sent WHERE promo_slot = ? AND sent_date = ?",
         (promo_slot, sent_date),
     )
 
@@ -1512,8 +1547,38 @@ def save_user_topic_thread(user_id: int, topic_key: str, thread_id: int):
 
 
 def is_vacancy_channel_posted(vacancy_id: str) -> bool:
-    row = fetchone("SELECT 1 FROM vacancy_channel_posts WHERE vacancy_id = ?", (vacancy_id,))
+    row = fetchone(
+        "SELECT 1 FROM vacancy_channel_posts WHERE vacancy_id = ? AND message_id IS NOT NULL",
+        (vacancy_id,),
+    )
     return bool(row)
+
+
+def try_reserve_vacancy_channel_post(vacancy_id: str, category_code: str | None = None) -> bool:
+    """Резервирует слот в канале до send_message (message_id пока NULL)."""
+    if is_vacancy_channel_posted(vacancy_id):
+        return False
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                INSERT INTO vacancy_channel_posts
+                    (vacancy_id, category_code, post_kind, message_id, posted_at)
+                VALUES (?, ?, 'vacancy', NULL, CURRENT_TIMESTAMP)
+                ON CONFLICT(vacancy_id) DO NOTHING
+                """
+            ),
+            (vacancy_id, category_code),
+        )
+        return cur.rowcount > 0
+
+
+def release_vacancy_channel_post(vacancy_id: str) -> None:
+    execute(
+        "DELETE FROM vacancy_channel_posts WHERE vacancy_id = ? AND message_id IS NULL",
+        (vacancy_id,),
+    )
 
 
 def get_llm_usage_today(user_id: int, usage_day: str) -> int:
@@ -1546,14 +1611,23 @@ def create_star_purchase(user_id: int, vacancy_id: str, stars_amount: int, paylo
 
 
 def complete_star_purchase(payload: str) -> dict | None:
-    row = fetchone(
-        "SELECT user_id, vacancy_id, stars_amount FROM star_purchases WHERE payload = ? AND status = 'pending'",
-        (payload,),
-    )
-    if not row:
-        return None
-    execute("UPDATE star_purchases SET status = 'paid' WHERE payload = ?", (payload,))
-    return {"user_id": row[0], "vacancy_id": row[1], "stars_amount": row[2]}
+    """Атомарно помечает покупку Stars как paid. None — уже обработана."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q("UPDATE star_purchases SET status = 'paid' WHERE payload = ? AND status = 'pending'"),
+            (payload,),
+        )
+        if cur.rowcount == 0:
+            return None
+        cur.execute(
+            q("SELECT user_id, vacancy_id, stars_amount FROM star_purchases WHERE payload = ?"),
+            (payload,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {"user_id": row[0], "vacancy_id": row[1], "stars_amount": row[2]}
 
 
 def has_star_purchase_for_vacancy(user_id: int, vacancy_id: str) -> bool:
@@ -1875,6 +1949,97 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
     ]
 
 
+def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
+    """Вакансии для восстановления ленты после рестарта (порядок ids сохраняется)."""
+    if not vacancy_ids:
+        return []
+    placeholders = ",".join("?" * len(vacancy_ids))
+    rows = fetchall(
+        f"""
+        SELECT id, source_chat_title, message_text, message_link, author_contact, address,
+               found_at, published_at, category_code
+        FROM vacancies
+        WHERE id IN ({placeholders}) AND is_closed = {bool_false()}
+        """,
+        tuple(vacancy_ids),
+    )
+    by_id = {
+        r[0]: {
+            "id": r[0],
+            "source": r[1],
+            "text": r[2],
+            "link": r[3],
+            "contact": r[4],
+            "address": r[5],
+            "found_at": r[6],
+            "published_at": r[7],
+            "category_code": r[8],
+        }
+        for r in rows
+    }
+    return [by_id[vid] for vid in vacancy_ids if vid in by_id]
+
+
+def save_user_feed_session(
+    user_id: int,
+    feed_mode: str,
+    category_codes: list[str] | None,
+    vacancy_ids: list[str],
+    page: int = 0,
+) -> None:
+    import json
+
+    codes_json = json.dumps(category_codes) if category_codes is not None else None
+    ids_json = json.dumps(vacancy_ids)
+    execute(
+        """
+        INSERT INTO user_feed_sessions (user_id, feed_mode, category_codes, vacancy_ids, page, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            feed_mode = excluded.feed_mode,
+            category_codes = excluded.category_codes,
+            vacancy_ids = excluded.vacancy_ids,
+            page = excluded.page,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (user_id, feed_mode, codes_json, ids_json, page),
+    )
+
+
+def load_user_feed_session(user_id: int) -> dict | None:
+    import json
+
+    row = fetchone(
+        """
+        SELECT feed_mode, category_codes, vacancy_ids, page
+        FROM user_feed_sessions WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+    if not row:
+        return None
+    codes = json.loads(row[1]) if row[1] else None
+    ids = json.loads(row[2]) if row[2] else []
+    if not ids:
+        return None
+    return {
+        "feed_mode": row[0],
+        "feed_filter": codes,
+        "vacancy_ids": ids,
+        "page": row[3] or 0,
+    }
+
+
+def update_user_feed_session_page(user_id: int, page: int) -> None:
+    execute(
+        """
+        UPDATE user_feed_sessions SET page = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = ?
+        """,
+        (page, user_id),
+    )
+
+
 def count_feed_vacancies_for_user(user_id: int, category_code: str) -> int:
     return fetchval(
         f"""
@@ -1913,10 +2078,31 @@ def mark_vacancy_sent(vacancy_id: str):
 
 
 def mark_vacancy_sent_to_user(vacancy_id: str, user_id: int):
-    execute("""
-        INSERT INTO sent_vacancies (user_id, vacancy_id) VALUES (?, ?)
-        ON CONFLICT(user_id, vacancy_id) DO NOTHING
-    """, (user_id, vacancy_id))
+    try_reserve_vacancy_sent_to_user(vacancy_id, user_id)
+
+
+def try_reserve_vacancy_sent_to_user(vacancy_id: str, user_id: int) -> bool:
+    """Резервирует доставку push/ленты до send_message."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                INSERT INTO sent_vacancies (user_id, vacancy_id)
+                VALUES (?, ?)
+                ON CONFLICT(user_id, vacancy_id) DO NOTHING
+                """
+            ),
+            (user_id, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
+def unreserve_vacancy_sent_to_user(vacancy_id: str, user_id: int) -> None:
+    execute(
+        "DELETE FROM sent_vacancies WHERE user_id = ? AND vacancy_id = ?",
+        (user_id, vacancy_id),
+    )
 
 
 def has_user_received_vacancy(user_id: int, vacancy_id: str) -> bool:

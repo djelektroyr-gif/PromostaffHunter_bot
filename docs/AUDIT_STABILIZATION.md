@@ -92,9 +92,15 @@
 - [x] Лента — «Сессия истекла» + кнопка «Открыть ленту»
 - [x] Тесты `test_wave2_stabilization.py`
 
-### Волна 3 — hardening
+### Волна 3 — hardening ✅
 
-Stars/push/channel idempotent; FSM escape helper; RedisStorage; PG smoke tests.
+- [x] Stars — `complete_star_purchase()` atomic UPDATE до выдачи буста
+- [x] Push — `try_reserve_vacancy_sent_to_user()` до send, `unreserve` при ошибке Telegram
+- [x] Channel — `try_reserve_vacancy_channel_post()` / `try_reserve_promo_slot()` до send, release при ошибке
+- [x] FSM — `UserMenuFsmEscapeMiddleware` + `user_fsm_menu_escape()` для всех `USER_MENU_BUTTONS`
+- [x] Feed — `user_feed_sessions` в БД + `_get_user_feed()` после рестарта
+- [x] FSM storage — `REDIS_URL` → RedisStorage, иначе MemoryStorage
+- [x] Тесты `test_wave3_stabilization.py` (P1, R3, premium, moderation, wave3)
 
 ---
 
@@ -102,11 +108,12 @@ Stars/push/channel idempotent; FSM escape helper; RedisStorage; PG smoke tests.
 
 | ✅ Хорошо | ❌ Дыры |
 |-----------|--------|
-| Фильтр, dedupe, quality gate | `handle_response`, double-tap |
-| Feed, freshness | `add_response` UNIQUE |
-| Premium extend, downgrade | Moderation → push |
-| Category toggle atomic | Channel post E2E |
-| Response card format | Incremental cursor |
+| Фильтр, dedupe, quality gate | `handle_response` E2E |
+| Feed, freshness | Moderation → push E2E |
+| Premium extend, downgrade | Channel post E2E (Telegram) |
+| Category toggle atomic | — |
+| Response card format | — |
+| P1 cursor, R3 отклики, idempotent stars/push/channel | — |
 
 ---
 
@@ -117,3 +124,4 @@ Stars/push/channel idempotent; FSM escape helper; RedisStorage; PG smoke tests.
 | 2026-06-07 | — | Аудит зафиксирован |
 | 2026-06-07 | 1 | Parser cursor + mark scanned; UNIQUE отклики; admin card; `/start` clear FSM; parser lock/typing UX |
 | 2026-06-07 | 2 | Atomic premium/moderation; respond keyboard lock; broadcast lock; feed session expired UX |
+| 2026-06-07 | 3 | Idempotent stars/push/channel; FSM menu escape; feed persist; RedisStorage optional; wave3 tests |

@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 from aiogram.types import InlineKeyboardMarkup
 
 from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
-from db import is_vacancy_channel_posted, mark_vacancy_channel_posted
+from db import (
+    is_vacancy_channel_posted,
+    mark_vacancy_channel_posted,
+    release_vacancy_channel_post,
+    try_reserve_vacancy_channel_post,
+)
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
 from services.vacancy_public_text import sanitize_vacancy_public_body
@@ -83,6 +88,9 @@ async def post_vacancy_preview_to_channel(
             format_skip_reason(reason),
         )
         return False
+    if not force and not try_reserve_vacancy_channel_post(vacancy_id, category_code):
+        logger.info("Channel skip vacancy_id=%s — slot reserved or already posted", vacancy_id)
+        return False
     text = build_channel_preview_text(
         category_name=category_name,
         category_emoji=category_emoji,
@@ -109,5 +117,7 @@ async def post_vacancy_preview_to_channel(
         logger.info("Channel cross-post vacancy_id=%s cat=%s", vacancy_id, category_code)
         return True
     except Exception as e:
+        if not force:
+            release_vacancy_channel_post(vacancy_id)
         logger.exception("channel cross-post %s: %s", vacancy_id, e)
         return False

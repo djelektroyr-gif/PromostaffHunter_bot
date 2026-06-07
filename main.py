@@ -10,7 +10,6 @@ from aiogram.filters import Command
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand, BufferedInputFile, LabeledPrice, ChatMemberUpdated
 from aiogram import F
 from db import *
@@ -43,6 +42,7 @@ from config import (
 from profile_photos import (
     get_user_photos_dir, persist_user_photo, photo_health_loop, send_profile_photo,
 )
+from services.fsm_storage import create_fsm_storage
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -258,7 +258,7 @@ BTN_MY_DATA_LEGACY = "📞 Мои контакты"
 BTN_UNSUB_LEGACY = "❌ Отписаться"
 
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
+storage = create_fsm_storage()
 dp = Dispatcher(storage=storage)
 
 # Flood control для рассылки (пауза между отправками)
@@ -1900,12 +1900,14 @@ async def send_vacancy_to_subscribers(order: dict):
         if not vacancy_matches_user_metro(msg_text, address, subscriber.get('metro_zones')):
             skipped_metro += 1
             continue
+        if not try_reserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id']):
+            continue
         try:
             await send_vacancy_card(subscriber['user_id'], text, reply_markup=keyboard)
-            mark_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
             sent_count += 1
             await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
         except Exception as e:
+            unreserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
             if "bot was blocked by the user" in str(e):
                 logger.info(f"Пользователь {subscriber['user_id']} заблокировал бота")
                 _mark_subscriber_blocked_if_needed(subscriber['user_id'])
@@ -3098,6 +3100,40 @@ async def admin_response_card_callback(callback: types.CallbackQuery):
 
 # ========== ПАГИНАЦИЯ ДЛЯ ПРОСМОТРА ВАКАНСИЙ ==========
 
+def _cache_user_feed(user_id: int, data: dict, *, page: int | None = None) -> None:
+    if page is not None:
+        data = {**data, "page": page}
+    user_pages[user_id] = data
+    save_user_feed_session(
+        user_id,
+        data.get("feed_mode") or "fresh",
+        data.get("feed_filter"),
+        [v["id"] for v in data["vacancies"]],
+        data.get("page", 0),
+    )
+
+
+def _get_user_feed(user_id: int) -> dict | None:
+    cached = user_pages.get(user_id)
+    if cached:
+        return cached
+    session = load_user_feed_session(user_id)
+    if not session:
+        return None
+    vacancies = get_feed_vacancies_by_ids(session["vacancy_ids"])
+    if not vacancies:
+        return None
+    data = {
+        "vacancies": vacancies,
+        "total": len(vacancies),
+        "page": session.get("page", 0),
+        "feed_filter": session.get("feed_filter"),
+        "feed_mode": session.get("feed_mode") or "fresh",
+    }
+    user_pages[user_id] = data
+    return data
+
+
 def _feed_metro_context(user_id: int) -> tuple[bool, str | None]:
     profile = get_subscriber_profile(user_id)
     metro_zones = profile.get("metro_zones") if profile else None
@@ -3269,6 +3305,7 @@ async def open_feed_vacancies(
         "feed_filter": category_codes,
         "feed_mode": feed_mode,
     }
+    _cache_user_feed(user_id, user_pages[user_id])
     await send_vacancy_page(message, user_id, 0)
 
 
@@ -3313,7 +3350,7 @@ async def feed_archive_routes(callback: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "feed_menu")
 async def feed_menu_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
-    data = user_pages.get(callback.from_user.id) or {}
+    data = _get_user_feed(callback.from_user.id) or {}
     mode = data.get("feed_mode") or "fresh"
     await show_feed_category_menu(callback.message, callback.from_user.id, mode)
 
@@ -3321,10 +3358,11 @@ async def feed_menu_callback(callback: types.CallbackQuery):
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     from services.chat_feedback import typing_keepalive
 
-    data = user_pages.get(user_id)
+    data = _get_user_feed(user_id)
     if not data:
         await _offer_feed_session_restart(message)
         return
+    _cache_user_feed(user_id, data, page=page)
     vacancies = data["vacancies"]
     total = data["total"]
     start = page * 10
@@ -3350,7 +3388,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
             keyboard = build_vacancy_keyboard(vac["id"], vac.get("address"))
             try:
                 await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
-                mark_vacancy_sent_to_user(vac["id"], user_id)
+                try_reserve_vacancy_sent_to_user(vac["id"], user_id)
                 await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"Ошибка отправки вакансии: {e}")
@@ -3377,7 +3415,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_page_"))
 async def vacancy_page_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    if user_id not in user_pages:
+    if user_id not in user_pages and _get_user_feed(user_id) is None:
         await safe_callback_answer(
             callback,
             "Сессия ленты истекла — нажмите «Открыть ленту»",
@@ -3580,25 +3618,48 @@ def _is_metro_reset(text: str) -> bool:
     return text.strip().lower() in {"-", "0", "сброс", "reset", "отмена", "нет"}
 
 
+async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> bool:
+    """Отмена активного FSM и переход по кнопке reply-меню."""
+    text = (message.text or "").strip()
+    if text not in USER_MENU_BUTTONS:
+        return False
+    if message.from_user.id == YOUR_USER_ID:
+        return False
+    await state.clear()
+    user_id = message.from_user.id
+    if text == "🔍 Посмотреть новые вакансии":
+        await show_feed_mode_menu(message, user_id)
+    elif text == "📨 Мои отклики":
+        await send_responses_page(message, user_id, 0)
+    elif text in {BTN_MY_DATA, BTN_MY_DATA_LEGACY}:
+        await send_profile_data_screen(message.chat.id, user_id)
+    elif text == BTN_SETTINGS_CATEGORIES:
+        await send_category_picker(message.chat.id, user_id)
+    elif text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
+        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard())
+    elif text in {BTN_METRO, "📍 Мои районы"}:
+        await metro_zones_menu(message, state)
+    elif text == "💎 Подписка":
+        await subscription_menu(message)
+    elif text in {"📋 Мои категории", "✏️ Изменить категории"}:
+        await open_settings_menu(message, state)
+    elif text == "📖 Как пользоваться":
+        await send_user_help(message, user_id)
+    elif text == "❓ Поддержка":
+        keyboard, _ = get_main_keyboard(user_id)
+        await message.answer(
+            "↩️ Шаг отменён. Напишите «❓ Поддержка» ещё раз, чтобы задать вопрос.",
+            reply_markup=keyboard,
+        )
+    else:
+        keyboard, _ = get_main_keyboard(user_id)
+        await message.answer("↩️ Шаг отменён.", reply_markup=keyboard)
+    return True
+
+
 async def _cancel_metro_input(message: types.Message, state: FSMContext):
     """Выход из ввода метро без сохранения текста кнопки меню."""
-    await state.clear()
-    text = (message.text or "").strip()
-    user_id = message.from_user.id
-    if text in {BTN_MY_DATA, BTN_MY_DATA_LEGACY}:
-        await send_profile_data_screen(message.chat.id, user_id)
-        return
-    if text == BTN_SETTINGS_CATEGORIES:
-        await send_category_picker(message.chat.id, user_id)
-        return
-    if text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
-        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard())
-        return
-    if text == BTN_METRO or text == "📍 Мои районы":
-        await metro_zones_menu(message, state)
-        return
-    keyboard, status = get_main_keyboard(user_id)
-    await message.answer("Ввод станций отменён.", reply_markup=keyboard)
+    await user_fsm_menu_escape(message, state)
 
 
 @dp.message(lambda m: m.text in {BTN_METRO, "📍 Мои районы"})
@@ -5962,6 +6023,12 @@ async def on_shutdown():
     release_session_lock()
     await bot.session.close()
     logger.info("👋 Бот остановлен")
+
+
+from services.fsm_escape import UserMenuFsmEscapeMiddleware
+
+dp.message.middleware(UserMenuFsmEscapeMiddleware(USER_MENU_BUTTONS, user_fsm_menu_escape))
+
 
 async def main():
     try:

@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING
 from aiogram.types import InlineKeyboardMarkup
 
 from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
-from db import get_channel_promo_times, is_channel_promo_enabled, is_promo_sent_for_msk_date, mark_promo_sent, record_channel_post
+from db import (
+    get_channel_promo_times,
+    is_channel_promo_enabled,
+    is_promo_sent_for_msk_date,
+    record_channel_post,
+    release_promo_slot,
+    try_reserve_promo_slot,
+)
 from services.channel_policy import msk_now
 from services.channel_promo_texts import pick_promo_text
 from services.telegram_buttons import styled_inline_button
@@ -49,6 +56,11 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
     sent_date = now.strftime("%Y-%m-%d")
     if slot and not manual and is_promo_sent_for_msk_date(promo_slot, sent_date):
         return False
+    reserved = False
+    if slot and not manual:
+        if not try_reserve_promo_slot(promo_slot, sent_date):
+            return False
+        reserved = True
     times = get_channel_promo_times()
     idx = variant_index
     if idx is None:
@@ -63,8 +75,8 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
             reply_markup=markup,
             disable_web_page_preview=True,
         )
-        if slot and not manual:
-            mark_promo_sent(promo_slot, sent_date)
+        if slot and not manual and reserved:
+            pass  # already reserved before send
         post_key = (
             f"promo:manual:{msg.message_id}"
             if manual
@@ -80,6 +92,8 @@ async def post_channel_promo(bot: Bot, *, slot: str | None = None, variant_index
         logger.info("Channel promo posted slot=%s date=%s", promo_slot, sent_date)
         return True
     except Exception as e:
+        if reserved:
+            release_promo_slot(promo_slot, sent_date)
         logger.exception("channel promo slot=%s: %s", promo_slot, e)
         return False
 
