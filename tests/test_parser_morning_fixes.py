@@ -1,4 +1,4 @@
-"""Регрессии по утренней ленте 08.06.2026."""
+"""Регрессии по утренней ленте 08.06.2026 и аудиту хелперов 07–09.06."""
 
 from parser import (
     detect_category,
@@ -75,6 +75,90 @@ def test_event_helper_with_unload_prefers_helper():
     ok, cat, _, _ = evaluate_vacancy(text)
     assert ok is True
     assert cat == "helper"
+
+
+def test_krylatskoe_helper_loader_hybrid_accepted():
+    text = (
+        "Сегодня 19:30\n"
+        "м Крылатская \n"
+        "Дальше на такси на площадку ( 15 минут езды ) такси закажем \n\n"
+        "Нужно  4 хелпера - грузчика \n\n"
+        "Демонтаж декор, реквизит, стулья \n"
+        "Загрузка машины \n\n"
+        "Оплата   4000  - 5000\n"
+        "Работы на 8-10 часов \n\n"
+        "Возраст 18 + \n\n"
+        "Пишите telegram \n"
+        "+79262369170"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "helper"
+
+
+def test_bolotnaya_helper_functional_accepted():
+    text = (
+        "Дата : сегодня \n"
+        "Место : болотная площадь - Метро Третьяковская \n"
+        "Оплата: 500 рублей в час \n"
+        "Минималка 5 часов \n"
+        "Функционал: хелперский функционал : принеси, унести, помочь с расстановкой стульев\n"
+        "В лс пишем. +79991234567"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "helper"
+
+
+def test_valeria_helper_event_ls_contact():
+    text = (
+        "Хелперы на мероприятие  парни с 9,10 июня \n"
+        "Задачи: разгрузка коробок, помощь на регистрации \n"
+        "Ставка 400/час \n"
+        "Для записи в личные сообщения Фио, номер телефона. @valeria_hr"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "helper"
+
+
+def test_fried_eggs_montage_helper():
+    text = (
+        "Парк Митино\n"
+        "С 22:00 до 10:00\n"
+        "Помощь на монтаже ( принеси, подай , выгрузка машины)\n"
+        "Ставка 500 в час.\n"
+        "Пишите в ЛС @boss"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "helper"
+
+
+def test_elena_pomosh_masteram_loader():
+    text = (
+        "‼️завтра к 9:00‼️\n"
+        "🧍🏻 2 человека РФ РБ\n"
+        "🚇 Чкаловская\n"
+        "💸450/8/3600₽ после смены.\n"
+        "Фронт работы: помощь мастерам , работа на лесах\n"
+        "📲 писать в лс 89773120997 Елена"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "loader"
+
+
+def test_fd4daria_visiting_cards_promoter():
+    text = (
+        "Девушки! 14 июня \n"
+        "600 р/час 15-20:00\n"
+        "РАЗДАЧА ВИЗИТОК (работаем на улице)\n"
+        "☎️@Fd4Daria"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "promoter"
 
 
 def test_campaign_duplicate_same_channel(monkeypatch):

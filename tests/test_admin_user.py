@@ -61,3 +61,25 @@ def test_set_subscriber_active(monkeypatch, tmp_path):
     set_subscriber_active(uid, True)
     row = fetchone("SELECT is_active FROM subscribers WHERE user_id = ?", (uid,))
     assert row[0] in (1, True)
+
+
+def test_admin_gift_premium_helpers():
+    from main import (
+        GIFT_PRESET_DAYS,
+        admin_gift_days_keyboard,
+        format_gift_premium_user_message,
+        premium_request_admin_keyboard,
+    )
+
+    msg = format_gift_premium_user_message(14, "2026-07-01")
+    assert "14" in msg
+    assert "подарок" in msg.lower()
+    assert "2026-07-01" in msg
+    kb = admin_gift_days_keyboard(12345, cards_page=2)
+    data = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert f"adm_gd_12345_{GIFT_PRESET_DAYS[0]}_2" in data
+    assert "adm_gx_12345_2" in data
+    pr_kb = premium_request_admin_keyboard(99, 12345)
+    pr_data = [btn.callback_data for row in pr_kb.inline_keyboard for btn in row]
+    assert "pr_g_99_7" in pr_data
+    assert "pr_a_99" in pr_data

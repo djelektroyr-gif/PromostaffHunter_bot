@@ -288,6 +288,7 @@ _vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллель
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
+GIFT_PRESET_DAYS = (7, 14, 30, 90)
 _processing_finish: set[int] = set()
 _broadcast_lock = asyncio.Lock()
 
@@ -653,12 +654,26 @@ def premium_request_admin_keyboard(request_id: int, user_id: int) -> InlineKeybo
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text=f"✅ Активировать {PREMIUM_DEFAULT_DAYS} дн.",
+                text=f"✅ Оплата · {PREMIUM_DEFAULT_DAYS} дн.",
                 callback_data=f"pr_a_{request_id}",
             ),
             InlineKeyboardButton(
                 text="❌ Отклонить",
                 callback_data=f"pr_r_{request_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🎁 +7 дн.",
+                callback_data=f"pr_g_{request_id}_7",
+            ),
+            InlineKeyboardButton(
+                text="🎁 +14 дн.",
+                callback_data=f"pr_g_{request_id}_14",
+            ),
+            InlineKeyboardButton(
+                text="🎁 +30 дн.",
+                callback_data=f"pr_g_{request_id}_30",
             ),
         ],
         [
@@ -774,6 +789,66 @@ async def activate_premium_for_user(target_id: int, days: int) -> bool:
     except Exception as e:
         logger.warning(f"Не удалось уведомить {target_id} о Premium: {e}")
         return False
+
+
+def format_gift_premium_user_message(days: int, paid_until: str | None) -> str:
+    until_line = f"\nДействует до: *{paid_until}*" if paid_until else ""
+    return (
+        f"🎁 *Premium продлён на {days} дн.*{until_line}\n\n"
+        "Мы добавили дни в подарок — спасибо, что пользуетесь ботом!\n\n"
+        "• моментальные push-уведомления\n"
+        "• все категории без лимита\n"
+        "• фильтр по метро (⚙️ Настройки → 📍 Станции метро)\n\n"
+        "Категории — кнопка «⚙️ Настройки»."
+    )
+
+
+async def gift_premium_for_user(target_id: int, days: int) -> bool:
+    """Продлить Premium админом с текстом «в подарок» (trial/компенсация)."""
+    if days <= 0 or days > 365:
+        return False
+    set_user_plan(target_id, plan="premium", days=days, extend=True)
+    resolve_premium_requests(target_id)
+    profile = get_subscriber_profile(target_id)
+    paid_until = format_db_date_short(profile.get("paid_until")) if profile else ""
+    try:
+        await bot.send_message(
+            target_id,
+            format_gift_premium_user_message(days, paid_until),
+            parse_mode="Markdown",
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Не удалось уведомить {target_id} о подарке Premium: {e}")
+        return False
+
+
+def admin_gift_days_keyboard(user_id: int, cards_page: int = 0) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for days in GIFT_PRESET_DAYS:
+        row.append(InlineKeyboardButton(
+            text=f"🎁 +{days} дн.",
+            callback_data=f"adm_gd_{user_id}_{days}_{cards_page}",
+        ))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton(
+            text="✏️ Другое число дней",
+            callback_data=f"adm_gx_{user_id}_{cards_page}",
+        ),
+    ])
+    rows.append([
+        InlineKeyboardButton(
+            text="◀️ К карточке",
+            callback_data=f"adm_u_{user_id}_{cards_page}",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def safe_callback_answer(
@@ -1244,6 +1319,10 @@ class DeleteVacancyState(StatesGroup):
 class ChannelPromoTextState(StatesGroup):
     waiting_text = State()
 
+
+class AdminGiftPremiumState(StatesGroup):
+    waiting_for_days = State()
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
@@ -1366,7 +1445,8 @@ def build_admin_help_html() -> str:
         + "\n\n"
         "<b>👥 Пользователи</b>\n"
         "• «🗂️ Карточки пользователей» — профиль, категории, Premium, отклики.\n"
-        "• «💎 Запросы Premium» — чек на оплату, кнопки ✅/❌.\n"
+        "• «⏳ Premium истекает» — trial/подписка кончается в ближайшие 7 дн.; кнопка «🎁 Подарить дни».\n"
+        "• «💎 Запросы Premium» — чек на оплату, ✅ оплата или 🎁 подарок N дн.\n"
         "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
         "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения; push + кнопка «✉️ Ответить».\n"
         "• «📣 Техсообщение» — рассылка в топик «❓ Поддержка» (техработы, важное).\n"
@@ -1534,13 +1614,10 @@ def admin_user_detail_keyboard(user_id: int, profile: dict, cards_page: int = 0)
     active = bool(profile.get("is_active"))
     p = cards_page
     rows = [
-        [
-            InlineKeyboardButton(
-                text=f"💎 +{PREMIUM_DEFAULT_DAYS} дн.",
-                callback_data=f"adm_p_{user_id}_{PREMIUM_DEFAULT_DAYS}_{p}",
-            ),
-            InlineKeyboardButton(text="💎 +90 дн.", callback_data=f"adm_p_{user_id}_90_{p}"),
-        ],
+        [InlineKeyboardButton(
+            text="🎁 Подарить Premium",
+            callback_data=f"adm_gt_{user_id}_{p}",
+        )],
         [InlineKeyboardButton(text="🆓 Снять Premium", callback_data=f"adm_f_{user_id}_{p}")],
         [
             InlineKeyboardButton(
@@ -2282,7 +2359,8 @@ def get_admin_users_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="🗂️ Карточки пользователей")],
-            [KeyboardButton(text="💎 Запросы Premium"), KeyboardButton(text="📋 Список откликов")],
+            [KeyboardButton(text="⏳ Premium истекает"), KeyboardButton(text="💎 Запросы Premium")],
+            [KeyboardButton(text="📋 Список откликов")],
             [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
             [KeyboardButton(text="📣 Техсообщение")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
@@ -3782,6 +3860,45 @@ async def premium_payment_receipt(message: types.Message, state: FSMContext):
         )
     await message.answer(confirm, parse_mode="HTML")
     await send_admin_premium_request_alert(request_id)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("pr_g_"))
+async def premium_request_gift_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback, "Нет доступа", show_alert=True)
+        return
+    try:
+        parts = callback.data.split("_")
+        request_id = int(parts[2])
+        days = int(parts[3])
+    except (ValueError, IndexError):
+        await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
+        return
+    req = approve_premium_request(request_id)
+    if not req:
+        await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
+        return
+    target_id = req["user_id"]
+    notified = await gift_premium_for_user(target_id, days)
+    await safe_callback_answer(
+        callback,
+        f"🎁 Подарено +{days} дн." + ("" if notified else " (уведомление не доставлено)"),
+        show_alert=not notified,
+    )
+    try:
+        suffix = f"\n\n🎁 Подарено +{days} дн. Premium"
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + suffix,
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + suffix,
+                reply_markup=None,
+            )
+    except TelegramBadRequest:
+        pass
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("pr_a_"))
@@ -5659,6 +5776,53 @@ async def admin_broadcast_button(message: types.Message, state: FSMContext):
     )
     await state.set_state(BroadcastState.waiting_for_text)
 
+async def show_admin_premium_expiring(message: types.Message, within_days: int = 7, edit: bool = False):
+    await bot.send_chat_action(message.chat.id, "typing")
+    candidates = await run_db(list_premium_renewal_reminder_candidates, within_days)
+    if not candidates:
+        text = f"✅ Нет активных Premium, которые истекают в ближайшие {within_days} дн."
+        if edit:
+            await message.edit_text(text)
+        else:
+            await message.answer(text)
+        return
+    lines = [
+        f"⏳ *Premium истекает* (≤ {within_days} дн.) — {len(candidates)} чел.",
+        "",
+    ]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for item in candidates[:15]:
+        uid = item["user_id"]
+        profile = get_subscriber_profile(uid)
+        if not profile:
+            continue
+        label = _admin_user_short_label(profile)
+        until = format_db_date_short(item.get("paid_until"))
+        left = item.get("days_left", "?")
+        trial = " · trial" if item.get("trial_used") else ""
+        lines.append(f"• *{escape_markdown(label)}* — {left} дн.{trial}, до {escape_markdown(until or '—')}")
+        buttons.append([
+            InlineKeyboardButton(text=f"👤 {label}", callback_data=f"adm_u_{uid}_0"),
+            InlineKeyboardButton(text="🎁 +7", callback_data=f"adm_gd_{uid}_7_0"),
+            InlineKeyboardButton(text="+14", callback_data=f"adm_gd_{uid}_14_0"),
+        ])
+    if len(candidates) > 15:
+        lines.append(f"\n… ещё {len(candidates) - 15} — смотрите карточки или /user ID")
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    body = "\n".join(lines)
+    if edit:
+        await message.edit_text(body, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await message.answer(body, parse_mode="Markdown", reply_markup=markup)
+
+
+@dp.message(lambda m: m.text == "⏳ Premium истекает")
+async def admin_premium_expiring_button(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await show_admin_premium_expiring(message)
+
+
 async def show_admin_user_cards(message: types.Message, page: int = 0, edit: bool = False):
     limit = 5
     offset = page * limit
@@ -5780,6 +5944,108 @@ async def admin_user_open_callback(callback: types.CallbackQuery):
     await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
 
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_gt_"))
+async def admin_gift_menu_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    cards_page = int(parts[3]) if len(parts) > 3 else 0
+    profile = get_subscriber_profile(target_id)
+    label = _admin_user_short_label(profile or {"user_id": target_id})
+    await safe_callback_answer(callback)
+    text = (
+        f"🎁 *Подарить Premium*\n\n"
+        f"Пользователь: *{escape_markdown(label)}*\n"
+        f"ID: `{target_id}`\n\n"
+        "Выберите срок или «✏️ Другое число дней»."
+    )
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=admin_gift_days_keyboard(target_id, cards_page),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            text,
+            parse_mode="Markdown",
+            reply_markup=admin_gift_days_keyboard(target_id, cards_page),
+        )
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_gd_"))
+async def admin_gift_days_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    days = int(parts[3])
+    cards_page = int(parts[4]) if len(parts) > 4 else 0
+    notified = await gift_premium_for_user(target_id, days)
+    await safe_callback_answer(
+        callback,
+        f"🎁 Подарено +{days} дн." + ("" if notified else " (уведомление не доставлено)"),
+        show_alert=not notified,
+    )
+    await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_gx_"))
+async def admin_gift_custom_start_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    target_id = int(parts[2])
+    cards_page = int(parts[3]) if len(parts) > 3 else 0
+    await state.set_state(AdminGiftPremiumState.waiting_for_days)
+    await state.update_data(gift_user_id=target_id, gift_cards_page=cards_page)
+    await safe_callback_answer(callback)
+    await callback.message.answer(
+        f"✏️ Сколько дней Premium подарить пользователю `{target_id}`?\n"
+        "Отправьте число от 1 до 365 или «◀️ Назад» для отмены.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(AdminGiftPremiumState.waiting_for_days)
+async def admin_gift_custom_days_message(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    if message.text == ADMIN_BTN_BACK:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=get_admin_users_keyboard())
+        return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Введите число дней (1–365) или «◀️ Назад».")
+        return
+    days = int(raw)
+    if days < 1 or days > 365:
+        await message.answer("Допустимо от 1 до 365 дней.")
+        return
+    data = await state.get_data()
+    target_id = int(data.get("gift_user_id", 0))
+    cards_page = int(data.get("gift_cards_page", 0))
+    await state.clear()
+    if not target_id:
+        await message.answer("Сессия истекла — откройте карточку пользователя снова.")
+        return
+    notified = await gift_premium_for_user(target_id, days)
+    note = "" if notified else " (уведомление пользователю не доставлено)"
+    await message.answer(
+        f"🎁 Пользователю `{target_id}` подарено +{days} дн. Premium{note}.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_users_keyboard(),
+    )
+    await show_admin_user_detail(message, target_id, cards_page=cards_page, edit=False)
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("adm_p_"))
 async def admin_user_premium_callback(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_USER_ID:
@@ -5789,11 +6055,12 @@ async def admin_user_premium_callback(callback: types.CallbackQuery):
     target_id = int(parts[2])
     days = int(parts[3])
     cards_page = int(parts[4]) if len(parts) > 4 else 0
-    was_active = is_user_premium(target_id)
-    notified = await activate_premium_for_user(target_id, days)
-    mode = "продлён" if was_active else "выдан"
-    note = "" if notified else " (уведомление не доставлено)"
-    await safe_callback_answer(callback, f"Premium {mode} +{days} дн.{note}", show_alert=not notified)
+    notified = await gift_premium_for_user(target_id, days)
+    await safe_callback_answer(
+        callback,
+        f"🎁 Подарено +{days} дн." + ("" if notified else " (уведомление не доставлено)"),
+        show_alert=not notified,
+    )
     await show_admin_user_detail(callback.message, target_id, cards_page=cards_page, edit=True)
 
 
