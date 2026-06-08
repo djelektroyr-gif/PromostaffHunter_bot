@@ -52,7 +52,7 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
         return text, build_closed_vacancy_markup()
     message_text = row[0]
     source_chat_title = row[2]
-    address = row[4]
+    address = (row[13] if len(row) > 13 else None) or row[4]
     category_code = row[5] or "promoter"
     text = format_closed_vacancy_notice_html(
         category_emoji=_CATEGORY_EMOJI.get(category_code, "📌"),

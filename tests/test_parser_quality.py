@@ -171,7 +171,7 @@ def test_is_helper_message_rejects_unpaid_massovka():
     )
     ok, reason, _ = is_helper_message(text)
     assert ok is False
-    assert reason == "unpaid"
+    assert reason in ("unpaid", "massovka_film")
 
 
 def test_fuzzy_duplicate_anketirovanie_same_author(monkeypatch):

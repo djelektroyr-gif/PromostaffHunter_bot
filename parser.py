@@ -1552,6 +1552,29 @@ def _extract_phone_digits(text: str) -> str:
         digits = "7" + digits[1:]
     return digits if len(digits) == 11 else None
 
+def _extract_campaign_fingerprint(text: str) -> str | None:
+    """Заголовок кампании (промо-проект) для дедупа коротких дублей из одного канала."""
+    if not text:
+        return None
+    for line in text.splitlines()[:6]:
+        stripped = line.strip().strip("*_").strip()
+        if len(stripped) < 18:
+            continue
+        tl = stripped.lower()
+        if not any(
+            w in tl for w in (
+                "раздача листовок", "промоутер", "супервайзер", "требуются",
+                "большой проект", "длительный проект",
+            )
+        ):
+            continue
+        norm = re.sub(r"[^\w\sа-яё\-]", " ", tl, flags=re.I)
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if len(norm) >= 18:
+            return norm[:140]
+    return None
+
+
 def detect_duplicate_type(
     text: str,
     author_contact: str,
@@ -1569,7 +1592,18 @@ def detect_duplicate_type(
     phone_digits = _extract_phone_digits(text)
     usernames = _extract_telegram_usernames(text, author_contact)
     normalized_contact = (author_contact or "").strip().lower()
+    campaign_fp = _extract_campaign_fingerprint(text)
     recent = get_recent_open_vacancies_for_dedupe(max_age_days=1, limit=250)
+    if campaign_fp and source_chat_title:
+        src = source_chat_title.strip()
+        for row in recent:
+            if category_code and row.get("category_code") and category_code != row.get("category_code"):
+                continue
+            if (row.get("source_chat_title") or "").strip() != src:
+                continue
+            cand_fp = _extract_campaign_fingerprint(row.get("message_text", ""))
+            if cand_fp and SequenceMatcher(None, campaign_fp, cand_fp).ratio() >= 0.55:
+                return "campaign"
     for row in recent:
         candidate_text = _normalize_for_dedupe(row.get("message_text", ""))
         if not candidate_text:
@@ -1586,6 +1620,12 @@ def detect_duplicate_type(
         same_username = bool(usernames & candidate_usernames)
         if not (same_contact or same_phone or same_username):
             continue
+        if campaign_fp:
+            cand_fp = _extract_campaign_fingerprint(row.get("message_text", ""))
+            if cand_fp:
+                fp_sim = SequenceMatcher(None, campaign_fp, cand_fp).ratio()
+                if fp_sim >= 0.55:
+                    return "campaign"
         similarity = SequenceMatcher(None, normalized_text, candidate_text).ratio()
         fuzzy_similarity = SequenceMatcher(
             None, fuzzy_text, _normalize_for_fuzzy_dedupe(row.get("message_text", ""))
@@ -1633,7 +1673,7 @@ def extract_metro_tokens(text: str) -> list:
         if metro_in_addr:
             tokens.add(_normalize_metro_token(metro_in_addr.group(1)))
     for match in re.finditer(
-        r"(?:м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁ\-A-Za-z\s]{2,40})",
+        r"(?:Ⓜ️\s*|м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁ\-A-Za-z\s]{2,40})",
         text,
         re.IGNORECASE,
     ):
@@ -1783,7 +1823,7 @@ _CATEGORY_KEYWORDS = {
     "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
     "animator": [
         "аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун",
-        "ростовые куклы", "массовк", "массовка",
+        "ростовые куклы",
     ],
     "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
     "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
@@ -1796,17 +1836,24 @@ _CATEGORY_KEYWORDS = {
     ],
     "helper": [
         "хелпер", "хэлпер", "хелперы", "хэлперы",
-        "помощник", "#помощник",
+        "требуются хелпер", "требуются хэлпер",
+        "#помощник",
         # «мероприят» — намеренный стем: мероприятие / мероприятия / мероприятий
         "хелпер на мероприят", "хэлпер на мероприят",
         "хелпер на мероприятие", "хэлпер на мероприятие",
         "помощник на мероприятие", "помощник организатора",
         "помощь на площадке", "помощники на площадке",
+        "к мероприятию", "деловое мероприятие", "приготовить площадку",
         "бекфотограф", "бэкстейдж", "бэкстейж",
         "ассистент по акт", "ассистент на площадке",
         "волонтер", "волонтёр",
     ],
 }
+
+_HELPER_EVENT_HINTS = (
+    "мероприят", "площадк", "хелпер", "хэлпер", "регистрац", "конференц",
+    "саммит", "summit", "к мероприятию",
+)
 
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
@@ -1874,6 +1921,9 @@ def _score_categories(text_lower: str) -> dict:
     scores = {}
     for category, keywords in _CATEGORY_KEYWORDS.items():
         for kw in keywords:
+            if category == "driver" and kw.startswith("водител"):
+                if re.search(r"водител\w*\s+забер", text_lower) and "грузчик" in text_lower:
+                    continue
             if _keyword_in_text(kw, text_lower):
                 scores[category] = scores.get(category, 0) + len(kw)
     if any(marker in text_lower for marker in _NON_SUPERVISOR_COORDINATOR):
@@ -1884,14 +1934,28 @@ def _score_categories(text_lower: str) -> dict:
 def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if not scores:
         return None
-    if scores.get("loader") and scores.get("helper") and any(w in text_lower for w in _LABOR_HINTS):
-        return "loader"
+    if scores.get("loader") and scores.get("helper"):
+        if any(w in text_lower for w in ("хелпер", "хэлпер", "хелперы", "хэлперы")):
+            if any(w in text_lower for w in _HELPER_EVENT_HINTS):
+                return "helper"
+        if any(w in text_lower for w in _LABOR_HINTS):
+            return "loader"
     if scores.get("promoter") and scores.get("helper") and any(w in text_lower for w in _PROMO_HINTS):
         return "promoter"
     if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
+    if scores.get("driver") and scores.get("loader") and "грузчик" in text_lower:
+        if re.search(r"водител\w*\s+забер", text_lower) or re.search(
+            r"\d+\s*грузчик", text_lower,
+        ):
+            return "loader"
     if scores.get("driver") and scores.get("helper") and "водител" in text_lower:
         return "driver"
+    if scores.get("loader") and scores.get("helper"):
+        if any(w in text_lower for w in _HELPER_EVENT_HINTS) and any(
+            w in text_lower for w in ("хелпер", "хэлпер", "помощник на мероприят", "к мероприятию")
+        ):
+            return "helper"
 
     max_score = max(scores.values())
     winners = [cat for cat, score in scores.items() if score == max_score]
@@ -1948,10 +2012,21 @@ _SERVICE_REQUEST_RES = (
 
 _PERMANENT_JOB_MARKERS = (
     "на постоянную работу", "на постоянку", "постоянная работа",
-    "вахта 30", "вахта 60", "вахта 90", "на вахту",
+    "на постоянную основу", "постоянную основу",
+    "вахта 30", "вахта 60", "вахта 90", "вахта от", "на вахту",
     "оформление по тк", "оформление по тк рф", "по тк рф",
     "ежемесячн", "два раза в месяц", "график 5/2", "график 6/1",
     "набор на вахту", "проживание и питание бесплатно",
+    "с заселением", "заселени",
+)
+_MASSOVKA_FILM_MARKERS = (
+    "массовк", "на съёмках", "на съемках", "съемки клипа", "съёмки клипа",
+    "съемки фильма", "съёмки фильма", "статист", "эпизодник", "на съемки клипа",
+)
+_DIGITAL_WORK_MARKERS = (
+    "удаленн", "удалённ", "со смартфона", "с телефона", "из дома",
+    "публиковать материал", "готовый контент", "готовым контентом",
+    "работа с телефона", "подработка: помощник",
 )
 _SHIFT_JOB_MARKERS = (
     "на сегодня", "на завтра", "на сейчас", "срочно",
@@ -2031,11 +2106,42 @@ def is_closed_vacancy_post(text: str) -> bool:
     return head.startswith("❌") and "закрыто" in head
 
 
+def is_massovka_or_film_extras(text: str) -> bool:
+    """Массовка / съёмки — не event-staff аниматор."""
+    if not text:
+        return False
+    tl = text.lower()
+    if not any(m in tl for m in _MASSOVKA_FILM_MARKERS):
+        return False
+    if "аниматор" in tl and any(w in tl for w in ("детск", "праздник", "ростовые")):
+        return False
+    return True
+
+
+def is_digital_work_spam(text: str) -> bool:
+    """Удалённая «подработка с телефона» — не хелпер на площадке."""
+    if not text:
+        return False
+    tl = text.lower()
+    if not any(m in tl for m in _DIGITAL_WORK_MARKERS):
+        return False
+    if any(w in tl for w in ("мероприят", "площадк", "на смену", "хелпер", "хэлпер")):
+        if not any(m in tl for m in _DIGITAL_WORK_MARKERS[:4]):
+            return False
+    return True
+
+
 def is_permanent_job_spam(text: str) -> bool:
     """Вахта/ТК — не разовая смена для бота."""
     if not text:
         return False
     tl = text.lower()
+    if re.search(r"\d{2,3}[\s\d]*000\s*(?:-|–|—)?\s*\d{0,3}[\s\d]*000\s*(?:руб|₽|р)?\s*(?:в\s+)?месяц", tl):
+        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+            return True
+    if re.search(r"(?:от\s*)?\+\s*\d{2,3}[\s.]*000.*месяц", tl):
+        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+            return True
     if not any(m in tl for m in _PERMANENT_JOB_MARKERS):
         return False
     if any(m in tl for m in _SHIFT_JOB_MARKERS):
@@ -2258,12 +2364,16 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "closed_vacancy", []
     if is_chat_listing_noise(text):
         return False, "chat_noise", []
+    if is_massovka_or_film_extras(text):
+        return False, "massovka_film", []
     if is_permanent_job_spam(text):
         return False, "permanent_job", []
     if is_unpaid_vacancy(text):
         return False, "unpaid", []
     if is_academic_writing_spam(text):
         return False, "academic_writing_spam", []
+    if is_digital_work_spam(text):
+        return False, "digital_work_spam", []
     if is_remote_office_job_spam(text):
         return False, "remote_office_job", []
     if is_professional_casting_spam(text):
@@ -2316,12 +2426,15 @@ def passes_quality_gate(category: str, text: str) -> bool:
 
     if category == "helper":
         helper_markers = (
-            "хелпер", "хэлпер",
-            "помощник", "#помощник",
+            "хелпер", "хэлпер", "хелперы", "хэлперы",
+            "требуются хелпер", "требуются хэлпер",
+            "#помощник",
             "хелпер на мероприят", "хэлпер на мероприят",
             "хелпер на мероприятие", "хэлпер на мероприятие",
             "помощник на мероприят", "помощник организатора",
             "помощь на площадке", "помощники на площадке",
+            "к мероприятию", "деловое мероприятие", "приготовить площадку",
+            "расставить", "площадку к мероприятию",
             "бекфотограф", "бэкстейдж", "бэкстейж", "ассистент по акт", "ассистент на площадке",
         )
         if not any(m in tl for m in helper_markers):
@@ -2342,7 +2455,9 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if re.search(r"позиция\s*[:\s].*хелпер", tl) and "промо" not in tl and "промоутер" not in tl:
             return False
     elif category == "animator":
-        if not any(w in tl for w in ("аниматор", "анимац", "массовк", "клоун", "ростовые")):
+        if is_massovka_or_film_extras(text):
+            return False
+        if not any(w in tl for w in ("аниматор", "анимац", "клоун", "ростовые")):
             return False
         if is_service_request(text):
             return False
@@ -2356,7 +2471,11 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if not any(w in tl for w in ("официант", "бармен", "обслуживание гостей")):
             return False
     elif category == "driver":
+        if "грузчик" in tl and re.search(r"водител\w*\s+забер", tl):
+            return False
         if not any(w in tl for w in ("водител", "курьер", "экспедитор")):
+            return False
+        if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False
     elif category == "security":
         if not any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити", "пропускной")):

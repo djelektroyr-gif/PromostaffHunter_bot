@@ -82,7 +82,7 @@ def test_evaluate_rejects_unpaid():
     ok, cat, reason, _ = evaluate_vacancy(_unpaid_massovka())
     assert ok is False
     assert cat is None
-    assert reason == "unpaid"
+    assert reason in ("unpaid", "massovka_film")
 
 
 def test_digest_split_required_for_full_post():

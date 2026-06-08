@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 
+_TRIPLE_RATE_RE = re.compile(
+    r"(\d{3,4})\s*/\s*(\d{1,2})\s*/\s*(\d{3,5})",
+    re.I,
+)
+
 _HOURLY_PATTERNS = (
     re.compile(r"(\d{3,4})\s*[₽р]\s*/\s*ч(?:ас)?", re.I),
     re.compile(r"(\d{3,4})\s*/\s*ч(?:ас|\.|\b)", re.I),
@@ -38,6 +43,14 @@ def extract_hourly_rate_rub(text: str) -> int | None:
     if not text:
         return None
     found: list[int] = []
+    triple = _TRIPLE_RATE_RE.search(text)
+    if triple:
+        try:
+            hourly = int(triple.group(1))
+            if 200 <= hourly <= 5000:
+                found.append(hourly)
+        except (ValueError, IndexError):
+            pass
     for pattern in _HOURLY_PATTERNS:
         for match in pattern.finditer(text):
             try:
@@ -53,6 +66,14 @@ def extract_shift_rate_rub(text: str) -> int | None:
     if not text:
         return None
     found: list[int] = []
+    triple = _TRIPLE_RATE_RE.search(text)
+    if triple:
+        try:
+            shift = int(triple.group(3))
+            if 1000 <= shift <= 100000:
+                found.append(shift)
+        except (ValueError, IndexError):
+            pass
     for pattern in _SHIFT_PATTERNS:
         for match in pattern.finditer(text):
             try:
@@ -67,6 +88,14 @@ def extract_shift_rate_rub(text: str) -> int | None:
 def extract_min_hours(text: str) -> int | None:
     if not text:
         return None
+    triple = _TRIPLE_RATE_RE.search(text)
+    if triple:
+        try:
+            hours = int(triple.group(2))
+            if 1 <= hours <= 16:
+                return hours
+        except (ValueError, IndexError):
+            pass
     for pattern in _MIN_HOURS_PATTERNS:
         match = pattern.search(text)
         if match:

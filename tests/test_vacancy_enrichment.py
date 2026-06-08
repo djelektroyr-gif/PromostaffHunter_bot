@@ -127,7 +127,7 @@ def test_backfill_updates_recent_vacancies(monkeypatch, tmp_path):
     )
     assert row[0] is not None
     assert row[1] == 500
-    assert row[2] == 3
+    assert row[2] == 4
 
 
 def test_extract_address_freeform_scattered():
@@ -156,3 +156,48 @@ def test_extract_address_pin_inline_one_line():
     addr = extract_address_normalized(text)
     assert addr is not None
     assert "Профсоюзная" in addr
+
+
+def test_extract_address_chuykova_bare_line():
+    text = (
+        "Здравствуйте, на 11:00\n"
+        "Маршала Чуйкова 6к1 - требуется грузчик.\n"
+        "Оплата 400р час\n"
+        "@boss"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Чуйкова" in addr
+    assert build_maps_url(address_normalized=addr) is not None
+
+
+def test_extract_address_korolev_not_mo_only():
+    text = (
+        "**__Сегодня 10:10\n"
+        "2 человека\n"
+        "Московская область, Королёв, микрорайон Первомайский, Советская улица, 27\n"
+        "Оплата:500/4/2000__**"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Королёв" in addr or "Королев" in addr
+    assert addr != "Мо"
+
+
+def test_extract_address_yandex_whatshere_point():
+    text = (
+        "https://yandex.ru/maps?whatshere%5Bpoint%5D=37.59939273397594%2C55.731794895917375\n"
+        "На сегодня 2 человека\n"
+        "550 р/ч\n"
+        "@geo_boss"
+    )
+    lat, lon = extract_coordinates_from_text(text)
+    assert lat is not None and lon is not None
+    assert build_maps_url(location_lat=lat, location_lon=lon) is not None
+
+
+def test_channel_rate_triple_format():
+    text = "Оплата:500/4/2000, разгрузка коробок"
+    assert extract_hourly_rate_rub(text) == 500
+    assert extract_min_hours(text) == 4
+    assert extract_shift_rate_rub(text) == 2000

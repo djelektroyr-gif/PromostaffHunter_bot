@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from services.channel_rate import extract_hourly_rate_rub, extract_min_hours, extract_shift_rate_rub
 
-ENRICHMENT_VERSION = 3
+ENRICHMENT_VERSION = 4
 
 _CITY_STREET_RE = re.compile(
     r"\b("
@@ -37,7 +37,25 @@ _EXPLICIT_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 _METRO_ADDR_RE = re.compile(
-    r"(?:м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁA-Za-z\- ]{2,40})",
+    r"(?:Ⓜ️\s*|м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁA-Za-z\- ]{2,40})",
+    re.IGNORECASE,
+)
+_BARE_LINE_ADDRESS_RE = re.compile(
+    r"(?:^|\n)\s*("
+    r"(?:ул\.|улица|пер\.|переулок|наб\.|набережная|шоссе|проспект|бульвар|проезд|аллея)\s+"
+    r"[^\n,]{3,70}\d+[^\n]{0,15}|"
+    r"(?:маршала|генерала|академика)\s+[А-Яа-яёЁ\-]+\s+\d+[^\n]{0,20}|"
+    r"[А-Яа-яёЁ][а-яёЁ\-]+\s+(?:набережная|шоссе|переулок|проспект|бульвар)\s+\d+[^\n]{0,15}|"
+    r"[А-Яа-яёЁ][А-Яа-яёЁ\-\s]{2,35}\s+\d+[а-яёa-z]?(?:/?\d*)?(?:с\d+)?"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MO_REGION_LINE_RE = re.compile(
+    r"московск(?:ая|ой)\s+област[ьи][^\n]{0,120}",
+    re.IGNORECASE,
+)
+_YANDEX_POINT_RE = re.compile(
+    r"whatshere(?:%5B|\[)point(?:%5D|\])=(\d{1,3}\.\d+)[,%]2?C(\d{1,3}\.\d+)",
     re.IGNORECASE,
 )
 _LOCATION_HEADER_RE = re.compile(
@@ -126,9 +144,25 @@ def _load_city_catalog() -> list[tuple[str, tuple[str, ...]]]:
     return out
 
 
+def _city_display_name(slug: str, names: tuple[str, ...]) -> str:
+    if slug == "mo":
+        return "Московская область"
+    if slug == "moscow":
+        return "Москва"
+    return names[0].title() if names else slug.title()
+
+
 def extract_coordinates_from_text(text: str) -> tuple[float | None, float | None]:
     if not text:
         return None, None
+    point = _YANDEX_POINT_RE.search(text)
+    if point:
+        try:
+            lon, lat = float(point.group(1)), float(point.group(2))
+            if 40.0 <= lat <= 60.0 and 30.0 <= lon <= 50.0:
+                return lat, lon
+        except (ValueError, IndexError):
+            pass
     for pattern in (_YANDEX_LL_RE, _GEO_URI_RE, _GOOGLE_COORD_RE, _RAW_COORD_RE):
         match = pattern.search(text)
         if not match:
@@ -171,8 +205,8 @@ def _compose_location_address(parts: list[str]) -> str:
     for p in cleaned:
         p = re.sub(r"^🚇\s*", "", p).strip()
         pl = p.lower()
-        if re.match(r"^(?:м\.|метро)\b", pl):
-            station = re.sub(r"^(?:м\.|метро)\s*", "", p, flags=re.I).strip()
+        if re.match(r"^(?:Ⓜ️\s*|м\.|метро)\b", pl):
+            station = re.sub(r"^(?:Ⓜ️\s*|м\.|метро)\s*", "", p, flags=re.I).strip()
             if station:
                 metro = f"метро {station}"
             continue
@@ -267,6 +301,38 @@ def _extract_pin_inline_address(text: str) -> str | None:
     return None
 
 
+def _extract_bare_line_address(text: str) -> str | None:
+    """Строка вида «Маршала Чуйкова 6к1» или «Курьяновская набережная 6с1» без префикса «ул.»."""
+    if not text:
+        return None
+    for match in _BARE_LINE_ADDRESS_RE.finditer(text):
+        candidate = match.group(1).strip(" .,-—")
+        if len(candidate) < 8:
+            continue
+        if re.search(r"\d{3,4}\s*/\s*\d", candidate):
+            continue
+        if re.search(r"(?:оплат|ставк|руб|₽|р/ч|час)", candidate, re.I):
+            continue
+        if re.search(r"\bмосква\b", text, re.I):
+            return f"Москва, {candidate}"
+        return candidate
+    return None
+
+
+def _extract_mo_region_address(text: str) -> str | None:
+    """«Московская область, Королёв, … Советская улица, 27»."""
+    if not text:
+        return None
+    region = _MO_REGION_LINE_RE.search(text)
+    if not region:
+        return None
+    fragment = region.group(0).strip(" .,")
+    fragment = re.split(r"(?:оплат|ставк|☎|телефон)", fragment, maxsplit=1, flags=re.I)[0].strip(" .,")
+    if len(fragment) >= 12:
+        return fragment[:140]
+    return None
+
+
 def _extract_freeform_address(text: str) -> str | None:
     """Свободная форма: склеивает улицу/бульвар/ТЦ и метро из разных мест текста."""
     if not text:
@@ -311,12 +377,10 @@ def _extract_freeform_address(text: str) -> str | None:
         venue = venues[0]
         city_slug = _match_city_slug(text)
         if city_slug and city_slug not in ("moscow", "mo"):
-            for slug, names in _load_city_catalog():
-                if slug == city_slug:
-                    display = names[0].title()
-                    break
-            else:
-                display = city_slug.title()
+            display = _city_display_name(city_slug, next(
+                (names for slug, names in _load_city_catalog() if slug == city_slug),
+                (city_slug,),
+            ))
             base = f"{display}, {venue}"
         elif has_moscow:
             base = f"Москва, {venue}"
@@ -357,12 +421,18 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
         venue_text = venue.group(1).strip()
         city_match = _match_city_slug(text)
         if city_match and city_match != "moscow":
-            display = next(
-                (n for slug, names in _load_city_catalog() if slug == city_match for n in names),
-                city_match,
+            names = next(
+                (names for slug, names in _load_city_catalog() if slug == city_match),
+                (city_match,),
             )
-            return f"{display.title()}, {venue_text}"
+            return f"{_city_display_name(city_match, names)}, {venue_text}"
         return venue_text
+    mo_region = _extract_mo_region_address(text)
+    if mo_region:
+        return mo_region
+    bare = _extract_bare_line_address(text)
+    if bare:
+        return bare
     freeform = _extract_freeform_address(text)
     if freeform:
         return freeform
@@ -381,7 +451,7 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
     if city_only:
         for slug, names in _load_city_catalog():
             if slug == city_only:
-                return names[0].title()
+                return _city_display_name(slug, names)
     return None
 
 
