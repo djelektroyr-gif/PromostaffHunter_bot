@@ -81,6 +81,17 @@ async def send_push_digest_if_pending(bot: Bot, user_id: int) -> bool:
         return False
 
 
+async def resume_push_notifications(bot: Bot, user_id: int) -> bool:
+    """Digest и отложенные «вакансия закрыта» после выхода из quiet/busy."""
+    from services.vacancy_closed_notify import send_pending_closed_notices
+
+    closed_sent = await send_pending_closed_notices(bot, user_id)
+    digest_sent = await send_push_digest_if_pending(bot, user_id)
+    if digest_sent:
+        await asyncio.sleep(PUSH_DIGEST_NOTIFY_DELAY_SEC)
+    return closed_sent > 0 or digest_sent
+
+
 async def process_push_digest_transitions(bot: Bot) -> int:
     """Проверяет выход из quiet/busy и шлёт digest."""
     sent = 0
@@ -98,9 +109,8 @@ async def process_push_digest_transitions(bot: Bot) -> int:
         blocked = is_push_blocked(prefs)
         was_blocked = bool(notify.get("push_block_was_active"))
         if was_blocked and not blocked:
-            if await send_push_digest_if_pending(bot, user_id):
+            if await resume_push_notifications(bot, user_id):
                 sent += 1
-                await asyncio.sleep(PUSH_DIGEST_NOTIFY_DELAY_SEC)
         if was_blocked != blocked:
             patch_subscriber_notify_prefs(user_id, {"push_block_was_active": blocked})
 

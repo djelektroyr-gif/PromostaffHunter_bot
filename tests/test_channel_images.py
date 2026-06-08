@@ -9,9 +9,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from services.channel_images import (
+    DEFAULT_VACANCY_IMAGES,
     PROMO_IMAGE_BY_VARIANT,
+    VACANCY_IMAGES_BY_CATEGORY,
     VACANCY_IMAGE_BY_CATEGORY,
     get_channel_images_dir,
+    next_vacancy_image_variant_index,
     resolve_promo_image_path,
     resolve_vacancy_image_path,
     send_channel_post,
@@ -21,21 +24,60 @@ from services.channel_images import (
 @pytest.mark.parametrize(
     ("category_code", "expected_name"),
     [
-        ("loader", "vacancy-loader.png"),
-        ("helper", "vacancy-helper.png"),
-        ("promoter", "vacancy-promoter.png"),
-        ("supervisor", "vacancy-supervisor.png"),
-        ("wardrobe", "vacancy-wardrobe.png"),
-        ("parking", "vacancy-parking.png"),
-        ("hostess", "vacancy-default.png"),
-        ("unknown_cat", "vacancy-default.png"),
+        ("loader", "vacancy-loader-1.png"),
+        ("helper", "vacancy-helper-1.png"),
+        ("promoter", "vacancy-promoter-1.png"),
+        ("supervisor", "vacancy-supervisor-1.png"),
+        ("wardrobe", "vacancy-wardrobe-1.png"),
+        ("parking", "vacancy-parking-1.png"),
+        ("hostess", "vacancy-hostess-1.png"),
+        ("driver", "vacancy-driver-1.png"),
+        ("unknown_cat", "vacancy-default-1.png"),
     ],
 )
 def test_resolve_vacancy_image_path(category_code, expected_name):
-    path = resolve_vacancy_image_path(category_code)
+    path = resolve_vacancy_image_path(category_code, "vac_test_123")
     assert path is not None
-    assert path.name == expected_name
     assert path.is_file()
+    allowed = VACANCY_IMAGES_BY_CATEGORY.get(category_code) or DEFAULT_VACANCY_IMAGES
+    assert path.name in allowed
+
+
+def test_resolve_vacancy_image_rotates_by_vacancy_id():
+    p1 = resolve_vacancy_image_path("loader", "vac_a")
+    p2 = resolve_vacancy_image_path("loader", "vac_b")
+    assert p1 is not None and p2 is not None
+    assert p1.name in VACANCY_IMAGES_BY_CATEGORY["loader"]
+    assert p2.name in VACANCY_IMAGES_BY_CATEGORY["loader"]
+
+
+def test_resolve_vacancy_image_path_by_variant_index():
+    p0 = resolve_vacancy_image_path("loader", variant_index=0)
+    p1 = resolve_vacancy_image_path("loader", variant_index=1)
+    p2 = resolve_vacancy_image_path("loader", variant_index=2)
+    assert p0 is not None and p1 is not None and p2 is not None
+    assert p0.name == "vacancy-loader-1.png"
+    assert p1.name == "vacancy-loader-2.png"
+    assert p2.name == "vacancy-loader-3.png"
+
+
+def test_next_vacancy_image_variant_index_rotates(monkeypatch):
+    counts = {"loader": 0}
+
+    def fake_count(category_code: str) -> int:
+        return counts.get(category_code, 0)
+
+    monkeypatch.setattr(
+        "db.count_published_channel_vacancy_posts",
+        fake_count,
+    )
+    assert next_vacancy_image_variant_index("loader") == 0
+    counts["loader"] = 1
+    assert next_vacancy_image_variant_index("loader") == 1
+    counts["loader"] = 2
+    assert next_vacancy_image_variant_index("loader") == 2
+    counts["loader"] = 3
+    assert next_vacancy_image_variant_index("loader") == 0
 
 
 @pytest.mark.parametrize(
@@ -56,11 +98,14 @@ def test_resolve_promo_image_path(variant_index, expected_name):
 
 def test_channel_images_dir_has_all_mapped_files():
     images_dir = get_channel_images_dir()
-    for filename in VACANCY_IMAGE_BY_CATEGORY.values():
+    for code, filenames in VACANCY_IMAGES_BY_CATEGORY.items():
+        for filename in filenames:
+            assert (images_dir / filename).is_file(), f"{code}:{filename}"
+    for filename in DEFAULT_VACANCY_IMAGES:
         assert (images_dir / filename).is_file(), filename
-    assert (images_dir / "vacancy-default.png").is_file()
     for filename in PROMO_IMAGE_BY_VARIANT:
         assert (images_dir / filename).is_file(), filename
+    assert VACANCY_IMAGE_BY_CATEGORY["loader"] == "vacancy-loader-1.png"
 
 
 def test_send_channel_post_with_photo(tmp_path):

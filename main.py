@@ -598,12 +598,29 @@ async def edit_category_picker(message: types.Message, selected_codes: list, use
             logger.warning(f"edit_category_picker: {e}")
 
 
-async def send_category_picker(chat_id: int, user_id: int, selected_codes: list = None):
+async def send_category_picker(
+    chat_id: int,
+    user_id: int,
+    selected_codes: list = None,
+    *,
+    hint: str = "",
+    deeplink_category: str | None = None,
+):
+    if deeplink_category and not get_user_categories(user_id):
+        from services.onboarding_deeplink import apply_vacancy_deeplink_category_preselect
+        pre_hint = await run_db(
+            apply_vacancy_deeplink_category_preselect,
+            user_id,
+            deeplink_category,
+            free_limit=FREE_CATEGORY_LIMIT,
+        )
+        if pre_hint:
+            hint = f"{pre_hint}\n\n{hint}" if hint else pre_hint
     if selected_codes is None:
         selected_codes = [c["code"] for c in get_user_categories(user_id)]
     return await bot.send_message(
         chat_id,
-        category_picker_text(len(selected_codes), user_id),
+        category_picker_text(len(selected_codes), user_id, hint),
         parse_mode="Markdown",
         reply_markup=build_categories_markup(selected_codes, user_id),
     )
@@ -632,7 +649,7 @@ def subscription_action_buttons(user_id: int) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
 
-def premium_request_admin_keyboard(request_id: int) -> InlineKeyboardMarkup:
+def premium_request_admin_keyboard(request_id: int, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -644,20 +661,56 @@ def premium_request_admin_keyboard(request_id: int) -> InlineKeyboardMarkup:
                 callback_data=f"pr_r_{request_id}",
             ),
         ],
+        [
+            InlineKeyboardButton(
+                text="👤 Карточка",
+                callback_data=f"adm_u_{user_id}_0",
+            ),
+        ],
     ])
 
 
+def format_premium_payment_details_html(user_id: int) -> str:
+    """Реквизиты + сумма + ID для экрана подписки и запроса Premium."""
+    lines = []
+    if SUBSCRIPTION_CARD_HINT:
+        lines.append(f"💳 <b>Реквизиты:</b> {escape_html(SUBSCRIPTION_CARD_HINT)}")
+    lines.append(f"💰 <b>Сумма:</b> {escape_html(SUBSCRIPTION_PRICE_RUB)} ₽/мес")
+    lines.append(f"В комментарии к переводу укажите ID: <code>{user_id}</code>")
+    return "\n".join(lines)
+
+
 def format_premium_request_admin_caption(req: dict) -> str:
+    """Legacy Markdown — предпочтительно HTML-версия ниже."""
     title = "💳 *Запрос продления Premium*" if req.get("is_renewal") else "💳 *Запрос Premium*"
     pending = count_pending_premium_requests()
+    uname = req.get("username")
+    uname_line = f"@{escape_markdown(uname)}" if uname else "—"
     return (
         f"{title} #{req['id']} (в очереди: {pending})\n\n"
         f"👤 {escape_markdown(req.get('full_name') or '—')}\n"
         f"ID: `{req['user_id']}`\n"
-        f"Username: @{req.get('username') or '—'}\n"
+        f"Username: {uname_line}\n"
         f"📞 {escape_markdown(str(req.get('phone') or '—'))}\n"
         f"📋 {escape_markdown(str(req.get('category_codes') or '—'))}\n"
         f"🕐 {req.get('created_at') or '—'}"
+    )
+
+
+def format_premium_request_admin_caption_html(req: dict) -> str:
+    title = "💳 <b>Запрос продления Premium</b>" if req.get("is_renewal") else "💳 <b>Запрос Premium</b>"
+    pending = count_pending_premium_requests()
+    uname = req.get("username")
+    uname_line = f"@{escape_html(uname)}" if uname else "—"
+    return (
+        f"{title} #{req['id']} (в очереди: {pending})\n\n"
+        f"👤 {escape_html(req.get('full_name') or '—')}\n"
+        f"ID: <code>{req['user_id']}</code>\n"
+        f"Username: {uname_line}\n"
+        f"📞 {escape_html(str(req.get('phone') or '—'))}\n"
+        f"📋 {escape_html(str(req.get('category_codes') or '—'))}\n"
+        f"🕐 {escape_html(str(req.get('created_at') or '—'))}\n\n"
+        f"📎 Чек во вложении"
     )
 
 
@@ -666,28 +719,39 @@ async def send_admin_premium_request_alert(request_id: int):
         return
     req = get_premium_request(request_id)
     if not req or req.get("status") != "pending":
+        logger.warning(
+            "premium alert skip #%s: status=%s",
+            request_id,
+            req.get("status") if req else None,
+        )
         return
-    caption = format_premium_request_admin_caption(req)
-    markup = premium_request_admin_keyboard(request_id)
+    caption_html = format_premium_request_admin_caption_html(req)
+    caption_plain = re.sub(r"<[^>]+>", "", caption_html)
+    markup = premium_request_admin_keyboard(request_id, req["user_id"])
     file_id = req.get("receipt_file_id")
     kind = req.get("receipt_kind")
-    try:
+
+    async def _deliver(caption: str, parse_mode: str | None):
+        kwargs = {"caption": caption, "reply_markup": markup}
+        if parse_mode:
+            kwargs["parse_mode"] = parse_mode
         if file_id and kind == "photo":
-            await bot.send_photo(
-                YOUR_USER_ID, file_id, caption=caption,
-                parse_mode="Markdown", reply_markup=markup,
-            )
+            await bot.send_photo(YOUR_USER_ID, file_id, **kwargs)
         elif file_id and kind == "document":
-            await bot.send_document(
-                YOUR_USER_ID, file_id, caption=caption,
-                parse_mode="Markdown", reply_markup=markup,
-            )
+            await bot.send_document(YOUR_USER_ID, file_id, **kwargs)
         else:
-            await bot.send_message(
-                YOUR_USER_ID, caption, parse_mode="Markdown", reply_markup=markup,
-            )
+            await bot.send_message(YOUR_USER_ID, caption, reply_markup=markup, parse_mode=parse_mode)
+
+    try:
+        await _deliver(caption_html, "HTML")
+    except TelegramBadRequest as e:
+        logger.warning("premium alert #%s HTML failed: %s — retry plain", request_id, e)
+        try:
+            await _deliver(caption_plain, None)
+        except Exception as e2:
+            logger.exception("premium_request notify admin #%s: %s", request_id, e2)
     except Exception as e:
-        logger.warning(f"premium_request notify admin: {e}")
+        logger.exception("premium_request notify admin #%s: %s", request_id, e)
 
 
 async def activate_premium_for_user(target_id: int, days: int) -> bool:
@@ -946,6 +1010,47 @@ async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message
         await asyncio.sleep(BROADCAST_DELAY)
     return sent, failed, None
 
+
+async def run_topic_broadcast(
+    admin_chat_id: int,
+    text: str,
+    *,
+    topic_key: str,
+    body_prefix: str,
+    status_msg: types.Message = None,
+):
+    """Рассылка всем подписчикам в forum-топик (support и т.д.)."""
+    subscribers = get_all_subscribers()
+    if not subscribers:
+        return 0, 0, "Нет подписчиков."
+    if not status_msg:
+        status_msg = await bot.send_message(
+            admin_chat_id,
+            f"📣 Рассылка в топик «{topic_key}» — {len(subscribers)} подписчиков…",
+        )
+    sent, failed = 0, 0
+    body = f"{body_prefix}{text}"
+    for i, uid in enumerate(subscribers, 1):
+        try:
+            await send_user_message(uid, topic_key=topic_key, text=body, parse_mode="Markdown")
+            sent += 1
+        except Exception as e:
+            failed += 1
+            if "bot was blocked" in str(e).lower():
+                logger.info(f"Тopic-рассылка: {uid} заблокировал бота")
+                _mark_subscriber_blocked_if_needed(uid)
+            else:
+                logger.warning(f"Topic-рассылка: ошибка {uid}: {e}")
+        if i % 25 == 0 or i == len(subscribers):
+            try:
+                await status_msg.edit_text(
+                    f"📣 Рассылка… {i}/{len(subscribers)}\n✅ {sent} | ❌ {failed}"
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(BROADCAST_DELAY)
+    return sent, failed, None
+
 def format_subscription_screen(user_id: int) -> str:
     premium = is_user_premium(user_id)
     profile = get_subscriber_profile(user_id)
@@ -980,11 +1085,7 @@ def format_subscription_screen(user_id: int) -> str:
             from services.filter_prefs import format_prefs_summary
 
             status += f"\n\n🎯 Фильтры: {escape_html(format_prefs_summary(prefs))}"
-    pay_lines = []
-    if SUBSCRIPTION_CARD_HINT:
-        pay_lines.append(f"💳 <b>Реквизиты:</b> {escape_html(SUBSCRIPTION_CARD_HINT)}")
-    pay_lines.append(f"💰 <b>Сумма:</b> {escape_html(SUBSCRIPTION_PRICE_RUB)} ₽/мес")
-    pay_lines.append(f"В комментарии к переводу укажите ваш Telegram ID: <code>{user_id}</code>")
+    pay_lines = [format_premium_payment_details_html(user_id)]
     if SUBSCRIPTION_PAY_URL:
         pay_lines.append(f"Или оплатите по ссылке:\n{escape_html(SUBSCRIPTION_PAY_URL)}")
     else:
@@ -1073,6 +1174,12 @@ class RegistrationState(StatesGroup):
     waiting_for_photo = State()
 
 class BroadcastState(StatesGroup):
+    waiting_for_text = State()
+
+class TechBroadcastState(StatesGroup):
+    waiting_for_text = State()
+
+class AdminSupportReplyState(StatesGroup):
     waiting_for_text = State()
 
 class ComplaintState(StatesGroup):
@@ -1261,7 +1368,8 @@ def build_admin_help_html() -> str:
         "• «🗂️ Карточки пользователей» — профиль, категории, Premium, отклики.\n"
         "• «💎 Запросы Premium» — чек на оплату, кнопки ✅/❌.\n"
         "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
-        "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения пользователей.\n"
+        "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения; push + кнопка «✉️ Ответить».\n"
+        "• «📣 Техсообщение» — рассылка в топик «❓ Поддержка» (техработы, важное).\n"
         "• /user USER_ID — карточка по ID · /setplan USER_ID premium 30 — выдать Premium.\n\n"
         "<b>📥 Excel</b>\n"
         "Выгрузки: подписчики, вакансии, заказчики, отклики, «не подходит» (feedback с причинами).\n\n"
@@ -2075,53 +2183,10 @@ async def send_vacancy_to_subscribers(order: dict):
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
-def build_closed_vacancy_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Мои отклики", callback_data="resp_list_0")],
-    ])
-
-
-def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMarkup]:
-    from services.vacancy_closed_notice import format_closed_vacancy_notice_html
-
-    row = get_vacancy_push_row(vacancy_id)
-    if not row:
-        text = (
-            "🔒 <b>Вакансия закрыта</b>\n\n"
-            "Смена, на которую вы откликались или получали push, больше не актуальна.\n"
-            "Подробности — в «📨 Мои отклики»."
-        )
-        return text, build_closed_vacancy_markup()
-    message_text = row[0]
-    source_chat_title = row[2]
-    address = row[4]
-    category_code = row[5] or "promoter"
-    text = format_closed_vacancy_notice_html(
-        category_emoji=get_category_emoji(category_code),
-        category_name=get_category_name(category_code),
-        body=message_text,
-        address=address,
-        source_chat_title=source_chat_title,
-    )
-    return text, build_closed_vacancy_markup()
-
-
 async def notify_closed_vacancies(closed_data: list):
-    for vacancy_id, user_ids in closed_data:
-        if not vacancy_id or not user_ids:
-            continue
-        text, markup = build_closed_vacancy_notice(vacancy_id)
-        for uid in user_ids:
-            try:
-                await bot.send_message(
-                    uid,
-                    text,
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                logger.error(f"Не удалось уведомить пользователя {uid}: {e}")
+    from services.vacancy_closed_notify import deliver_closed_vacancy_notices
+
+    await deliver_closed_vacancy_notices(bot, closed_data)
 
 # ========== КЛАВИАТУРЫ ==========
 
@@ -2219,6 +2284,7 @@ def get_admin_users_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="👥 Список подписчиков"), KeyboardButton(text="🗂️ Карточки пользователей")],
             [KeyboardButton(text="💎 Запросы Premium"), KeyboardButton(text="📋 Список откликов")],
             [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
+            [KeyboardButton(text="📣 Техсообщение")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
         resize_keyboard=True,
@@ -2404,7 +2470,7 @@ ADMIN_MENU_BUTTONS = {
     ADMIN_BTN_BACK,
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
     "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
-    "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "➕ Добавить чат",
+    "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "📣 Техсообщение", "➕ Добавить чат",
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
@@ -2477,10 +2543,16 @@ async def start_cmd(message: types.Message, state: FSMContext):
     if start_payload == "employer":
         set_subscriber_role(user_id, "employer")
 
+    deeplink_category = None
     if start_payload.startswith("vac_"):
         vacancy_id = start_payload[4:].strip()
         if vacancy_id:
+            row = get_vacancy_push_row(vacancy_id)
+            if row:
+                deeplink_category = row[5] or "promoter"
             await show_vacancy_by_deeplink(message, user_id, vacancy_id)
+    if deeplink_category:
+        await state.update_data(deeplink_category=deeplink_category)
 
     expired_msg = downgrade_expired_premium(user_id)
     if expired_msg:
@@ -2515,7 +2587,12 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 reply_markup=keyboard
             )
             return
-        await send_category_picker(message.chat.id, user_id)
+        fsm_data = await state.get_data()
+        await send_category_picker(
+            message.chat.id,
+            user_id,
+            deeplink_category=fsm_data.get("deeplink_category"),
+        )
         return
 
     if role == "employer" or start_payload == "employer":
@@ -2851,7 +2928,11 @@ async def process_photo(message: types.Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await send_category_picker(message.chat.id, user_id)
+    await send_category_picker(
+        message.chat.id,
+        user_id,
+        deeplink_category=data.get("deeplink_category"),
+    )
     await state.clear()
 
 
@@ -3636,11 +3717,7 @@ async def subscription_request_callback(callback: types.CallbackQuery, state: FS
     )
     await state.set_state(PremiumPaymentState.waiting_for_receipt)
     await state.update_data(premium_request_id=request_id, premium_is_renewal=is_renewal)
-    pay_hint = (
-        f"Переведите <b>{escape_html(SUBSCRIPTION_PRICE_RUB)} ₽</b> "
-        f"по реквизитам из раздела 💎 Подписка.\n"
-        f"В комментарии укажите ID: <code>{user_id}</code>\n\n"
-    )
+    pay_hint = format_premium_payment_details_html(user_id) + "\n\n"
     if is_renewal:
         intro = "✅ <b>Запрос на продление Premium</b>\n\n"
         tail = "После проверки срок Premium будет <b>продлён</b>."
@@ -4108,12 +4185,15 @@ async def support_menu(message: types.Message, state: FSMContext):
 async def process_support_question(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username
-    add_support_request(user_id, message.text, username)
+    req_id = add_support_request(user_id, message.text, username)
     await send_user_message(
         user_id,
         topic_key="support",
         text="✅ Ваш вопрос отправлен администратору. Ответ придёт в эту тему.",
     )
+    from services.admin_inbox_alerts import notify_admin_support_request
+
+    await notify_admin_support_request(bot, req_id, user_id, username, message.text or "")
     await state.clear()
 
 
@@ -4504,6 +4584,25 @@ async def setchatroles_cmd(message: types.Message):
     )
 
 
+async def _submit_complaint_and_notify(
+    user_id: int,
+    vacancy_id: str,
+    reason: str,
+    complaint_text: str | None = None,
+) -> None:
+    from services.admin_inbox_alerts import notify_admin_complaint
+
+    cid = add_complaint(user_id, vacancy_id, reason, complaint_text)
+    await notify_admin_complaint(
+        bot,
+        cid,
+        user_id,
+        vacancy_id or "",
+        reason,
+        complaint_text,
+    )
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("complain_"))
 async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
     vacancy_id = callback.data.replace("complain_", "")
@@ -4540,7 +4639,7 @@ async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
         data = await state.get_data()
         vacancy_id = data.get("vacancy_id")
         user_id = callback.from_user.id
-        add_complaint(user_id, vacancy_id, reason)
+        await _submit_complaint_and_notify(user_id, vacancy_id, reason)
         await callback.message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
         await state.clear()
         await safe_callback_answer(callback, "Жалоба принята")
@@ -4551,7 +4650,7 @@ async def complaint_text(message: types.Message, state: FSMContext):
     vacancy_id = data.get("vacancy_id")
     reason = data.get("reason")
     user_id = message.from_user.id
-    add_complaint(user_id, vacancy_id, reason, message.text)
+    await _submit_complaint_and_notify(user_id, vacancy_id, reason, message.text)
     await message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
     await state.clear()
 
@@ -5270,6 +5369,93 @@ async def broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
         pass
     await callback.answer()
 
+@dp.message(lambda m: m.text == "📣 Техсообщение")
+async def admin_tech_broadcast_button(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    await message.answer(
+        "📣 *Техсообщение всем подписчикам*\n\n"
+        "Текст уйдёт в топик «❓ Поддержка» у каждого пользователя "
+        "(техработы, тестирование, важные объявления).\n\n"
+        "Введите текст одним сообщением:",
+        parse_mode="Markdown",
+    )
+    await state.set_state(TechBroadcastState.waiting_for_text)
+
+
+@dp.message(TechBroadcastState.waiting_for_text)
+async def tech_broadcast_text_received(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    preview = message.text[:500]
+    await state.update_data(tech_broadcast_text=message.text)
+    await message.answer(
+        f"📣 *Предпросмотр техсообщения* (топик «Поддержка»):\n\n{escape_markdown(preview)}"
+        + ("…" if len(message.text) > 500 else "")
+        + "\n\nОтправить всем подписчикам?",
+        parse_mode="MarkdownV2",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Отправить", callback_data="tech_broadcast_confirm"),
+                    InlineKeyboardButton(text="❌ Отмена", callback_data="tech_broadcast_cancel"),
+                ]
+            ]
+        ),
+    )
+
+
+@dp.callback_query(lambda c: c.data == "tech_broadcast_confirm")
+async def tech_broadcast_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    if _broadcast_lock.locked():
+        await callback.answer("Рассылка уже выполняется", show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get("tech_broadcast_text")
+    if not text:
+        await callback.answer("Текст не найден", show_alert=True)
+        return
+    await state.clear()
+    await callback.answer("Рассылка запущена")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    status_msg = await callback.message.edit_text("📣 Техсообщение отправляется…")
+    async with _broadcast_lock:
+        sent, failed, err = await run_topic_broadcast(
+            callback.from_user.id,
+            text,
+            topic_key="support",
+            body_prefix="🔧 *Сообщение от техподдержки:*\n\n",
+            status_msg=status_msg,
+        )
+    if err:
+        await status_msg.edit_text(err)
+    else:
+        await status_msg.edit_text(
+            f"✅ Техсообщение отправлено.\nДоставлено: {sent}\nОшибок: {failed}",
+            reply_markup=None,
+        )
+
+
+@dp.callback_query(lambda c: c.data == "tech_broadcast_cancel")
+async def tech_broadcast_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Техсообщение отменено.", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
 @dp.message(Command("clean_old"))
 async def clean_old_vacancies(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
@@ -5528,23 +5714,34 @@ async def admin_premium_requests_button(message: types.Message):
         return
     await message.answer(f"💳 *Запросы Premium* — {len(requests)} в очереди:", parse_mode="Markdown")
     for req in requests:
-        caption = format_premium_request_admin_caption(req)
-        markup = premium_request_admin_keyboard(req["id"])
+        caption = format_premium_request_admin_caption_html(req)
+        markup = premium_request_admin_keyboard(req["id"], req["user_id"])
         file_id = req.get("receipt_file_id")
         kind = req.get("receipt_kind")
         try:
             if file_id and kind == "photo":
                 await bot.send_photo(
                     message.chat.id, file_id, caption=caption,
-                    parse_mode="Markdown", reply_markup=markup,
+                    parse_mode="HTML", reply_markup=markup,
                 )
             elif file_id and kind == "document":
                 await bot.send_document(
                     message.chat.id, file_id, caption=caption,
-                    parse_mode="Markdown", reply_markup=markup,
+                    parse_mode="HTML", reply_markup=markup,
                 )
             else:
-                await message.answer(caption, parse_mode="Markdown", reply_markup=markup)
+                await message.answer(caption, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest:
+            plain = re.sub(r"<[^>]+>", "", caption)
+            try:
+                if file_id and kind == "photo":
+                    await bot.send_photo(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                elif file_id and kind == "document":
+                    await bot.send_document(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                else:
+                    await message.answer(plain, reply_markup=markup)
+            except Exception as e:
+                logger.warning(f"admin premium request card #{req['id']}: {e}")
         except Exception as e:
             logger.warning(f"admin premium request card #{req['id']}: {e}")
 
@@ -5674,7 +5871,104 @@ async def admin_support_button(message: types.Message):
     for req in requests:
         text += f"ID: {req[0]}, от {req[2] or req[1]} (user {req[1]})\nСообщение: {req[3]}\nДата: {req[4]}\n\n"
     await send_long_message(message.chat.id, text, parse_mode="Markdown")
-    await message.answer("Чтобы ответить, используйте команду `/answer ID_обращения ответ`")
+    await message.answer(
+        "Новые обращения приходят push-уведомлением с кнопкой «✉️ Ответить».\n"
+        "Или команда: `/answer ID_обращения текст_ответа`",
+        parse_mode="Markdown",
+    )
+
+
+async def deliver_support_answer(req_id: int, answer_text: str) -> tuple[bool, str | int]:
+    """Отправляет ответ пользователю. (ok, user_id или код ошибки)."""
+    from db import get_support_request
+
+    req = get_support_request(req_id)
+    if not req or req.get("answered"):
+        return False, "not_found"
+    user_id = req["user_id"]
+    mark_support_answered(req_id, answer_text)
+    await send_user_message(
+        user_id,
+        topic_key="support",
+        text=f"📞 *Ответ от администратора:*\n\n{answer_text}",
+        parse_mode="Markdown",
+    )
+    return True, user_id
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("sup_r:"))
+async def admin_support_reply_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        req_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    from db import get_support_request
+
+    req = get_support_request(req_id)
+    if not req or req.get("answered"):
+        await callback.answer("Обращение не найдено или уже отвечено", show_alert=True)
+        return
+    await state.update_data(support_reply_id=req_id)
+    await state.set_state(AdminSupportReplyState.waiting_for_text)
+    await callback.answer()
+    preview = (req.get("message_text") or "")[:200]
+    await callback.message.answer(
+        f"✉️ *Ответ на обращение #{req_id}*\n"
+        f"От: `{req['user_id']}`\n"
+        f"Вопрос: _{escape_markdown(preview)}_\n\n"
+        "Введите текст ответа одним сообщением:",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(AdminSupportReplyState.waiting_for_text)
+async def admin_support_reply_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    data = await state.get_data()
+    req_id = data.get("support_reply_id")
+    if not req_id:
+        await state.clear()
+        await message.answer("❌ Обращение не выбрано.")
+        return
+    ok, result = await deliver_support_answer(int(req_id), message.text or "")
+    await state.clear()
+    if ok:
+        await message.answer(f"✅ Ответ на #{req_id} отправлен пользователю {result}")
+    else:
+        await message.answer("❌ Обращение не найдено или уже отвечено.")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("cmp_ok:"))
+async def admin_complaint_resolve(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        complaint_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    from db import get_complaint, resolve_complaint
+
+    complaint = get_complaint(complaint_id)
+    if not complaint or complaint.get("resolved"):
+        await callback.answer("Жалоба не найдена или уже обработана", show_alert=True)
+        return
+    resolve_complaint(complaint_id)
+    await callback.answer("Отмечено как обработано")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await callback.message.answer(f"✅ Жалоба #{complaint_id} отмечена обработанной.")
+
 
 @dp.message(Command("answer"))
 async def answer_support(message: types.Message):
@@ -5687,28 +5981,14 @@ async def answer_support(message: types.Message):
     try:
         req_id = int(parts[1])
         answer_text = parts[2]
-    except:
+    except Exception:
         await message.answer("❌ Неверный ID обращения")
         return
-    row = fetchone(
-        f"SELECT user_id FROM support_requests WHERE id = ? AND answered = {bool_false()}",
-        (req_id,),
-    )
-    if not row:
+    ok, result = await deliver_support_answer(req_id, answer_text)
+    if ok:
+        await message.answer(f"✅ Ответ отправлен пользователю {result}")
+    else:
         await message.answer("❌ Обращение не найдено или уже отвечено.")
-        return
-    user_id = row[0]
-    mark_support_answered(req_id, answer_text)
-    try:
-        await send_user_message(
-            user_id,
-            topic_key="support",
-            text=f"📞 *Ответ от администратора:*\n\n{answer_text}",
-            parse_mode="Markdown",
-        )
-        await message.answer(f"✅ Ответ отправлен пользователю {user_id}")
-    except Exception as e:
-        await message.answer(f"❌ Не удалось отправить ответ: {e}")
 
 @dp.message(lambda m: m.text == "➕ Добавить чат")
 async def admin_add_chat_button(message: types.Message, state: FSMContext):

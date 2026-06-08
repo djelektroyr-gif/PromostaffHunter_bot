@@ -32,6 +32,34 @@ def test_format_subscription_screen_escapes_special_env(monkeypatch):
     assert "<code>999888777</code>" in text
 
 
+def test_premium_payment_details_in_request_flow(monkeypatch):
+    import main as main_module
+
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_CARD_HINT", "Т Банк 2200 0000")
+    monkeypatch.setattr(main_module, "SUBSCRIPTION_PRICE_RUB", "299")
+    details = main_module.format_premium_payment_details_html(335505123)
+    assert "Т Банк" in details
+    assert "299" in details
+    assert "335505123" in details
+
+
+def test_premium_admin_caption_html_escapes_username(monkeypatch):
+    import main as main_module
+
+    text = main_module.format_premium_request_admin_caption_html({
+        "id": 5,
+        "user_id": 123,
+        "username": "So_SmiK0m",
+        "full_name": "Test User",
+        "phone": "7903",
+        "category_codes": "Хелпер",
+        "created_at": "2026-06-08",
+        "is_renewal": True,
+    })
+    assert "So_SmiK0m" in text
+    assert "<b>Запрос продления" in text
+
+
 def test_parse_paid_until_datetime():
     dt = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
     assert _parse_paid_until(dt) == dt

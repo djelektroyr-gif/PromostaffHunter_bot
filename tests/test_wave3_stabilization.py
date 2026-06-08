@@ -27,7 +27,7 @@ from db import (
     try_reserve_promo_slot,
     try_reserve_vacancy_channel_post,
     delete_vacancy_completely,
-    get_vacancy_channel_message_id,
+    count_published_channel_vacancy_posts,
     try_reserve_vacancy_sent_to_user,
     unreserve_vacancy_sent_to_user,
     update_last_processed_id,
@@ -151,6 +151,15 @@ def test_release_vacancy_channel_post_on_failure(tmp_db):
     assert try_reserve_vacancy_channel_post("vac_ch2", "helper") is True
     release_vacancy_channel_post("vac_ch2")
     assert try_reserve_vacancy_channel_post("vac_ch2", "helper") is True
+
+
+def test_count_published_channel_vacancy_posts(tmp_db):
+    assert count_published_channel_vacancy_posts("loader") == 0
+    mark_vacancy_channel_posted("v1", category_code="loader", message_id=1)
+    mark_vacancy_channel_posted("v2", category_code="loader", message_id=2)
+    mark_vacancy_channel_posted("v3", category_code="helper", message_id=3)
+    assert count_published_channel_vacancy_posts("loader") == 2
+    assert count_published_channel_vacancy_posts("helper") == 1
 
 
 def test_try_reserve_promo_slot(tmp_db):

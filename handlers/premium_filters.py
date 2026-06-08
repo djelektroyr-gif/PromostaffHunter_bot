@@ -293,14 +293,14 @@ def build_catpush_keyboard(user_id: int, prefs: dict) -> InlineKeyboardMarkup:
 
 
 async def _resume_push_and_digest(user_id: int, bot) -> None:
-    from services.push_digest_scheduler import send_push_digest_if_pending
+    from services.push_digest_scheduler import resume_push_notifications
 
     patch_subscriber_notify_prefs(user_id, {
         "paused_until": None,
         "push_block_was_active": False,
     })
     if bot:
-        await send_push_digest_if_pending(bot, user_id)
+        await resume_push_notifications(bot, user_id)
 
 
 def build_geo_keyboard(prefs: dict) -> InlineKeyboardMarkup:

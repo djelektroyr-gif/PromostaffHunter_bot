@@ -233,6 +233,15 @@ def init_db():
         """)
 
         cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS closed_notice_pending (
+                user_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, vacancy_id)
+            )
+        """)
+
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS employers (
                 id {serial_pk()},
                 telegram_user_id INTEGER UNIQUE,
@@ -908,6 +917,20 @@ def count_channel_vacancy_posts_in_msk_hour(category_code: str | None = None) ->
     return count
 
 
+def count_published_channel_vacancy_posts(category_code: str) -> int:
+    """Сколько вакансий категории уже опубликовано в канале (для ротации обложек)."""
+    row = fetchone(
+        """
+        SELECT COUNT(*) FROM vacancy_channel_posts
+        WHERE COALESCE(post_kind, 'vacancy') = 'vacancy'
+          AND message_id IS NOT NULL
+          AND category_code = ?
+        """,
+        (category_code,),
+    )
+    return int(row[0]) if row else 0
+
+
 def _parse_db_timestamp_msk(raw) -> datetime | None:
     from zoneinfo import ZoneInfo
 
@@ -1295,6 +1318,45 @@ def clear_push_digest_pending(user_id: int) -> int:
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(q("DELETE FROM push_digest_pending WHERE user_id = ?"), (user_id,))
+        return cur.rowcount
+
+
+def add_closed_notice_pending(user_id: int, vacancy_id: str) -> bool:
+    """Отложить уведомление «вакансия закрыта» (тихие часы / занят). False если уже в очереди."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "INSERT INTO closed_notice_pending (user_id, vacancy_id) VALUES (?, ?) "
+                "ON CONFLICT(user_id, vacancy_id) DO NOTHING"
+            ),
+            (user_id, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
+def list_closed_notice_pending(user_id: int) -> list[str]:
+    rows = fetchall(
+        "SELECT vacancy_id FROM closed_notice_pending WHERE user_id = ? ORDER BY queued_at",
+        (user_id,),
+    )
+    return [r[0] for r in rows]
+
+
+def remove_closed_notice_pending(user_id: int, vacancy_id: str) -> bool:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q("DELETE FROM closed_notice_pending WHERE user_id = ? AND vacancy_id = ?"),
+            (user_id, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
+def clear_closed_notice_pending(user_id: int) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(q("DELETE FROM closed_notice_pending WHERE user_id = ?"), (user_id,))
         return cur.rowcount
 
 
@@ -2717,11 +2779,53 @@ def get_response_photo(user_id: int, vacancy_id: str) -> str:
 
 
 # ========== ЖАЛОБЫ ==========
-def add_complaint(user_id: int, vacancy_id: str, reason: str, complaint_text: str = None):
-    execute("""
-        INSERT INTO complaints (user_id, vacancy_id, reason, complaint_text)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, vacancy_id, reason, complaint_text))
+def add_complaint(user_id: int, vacancy_id: str, reason: str, complaint_text: str = None) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            cur.execute(
+                q("""
+                    INSERT INTO complaints (user_id, vacancy_id, reason, complaint_text)
+                    VALUES (?, ?, ?, ?)
+                    RETURNING id
+                """),
+                (user_id, vacancy_id, reason, complaint_text),
+            )
+            return int(cur.fetchone()[0])
+        cur.execute(
+            q("""
+                INSERT INTO complaints (user_id, vacancy_id, reason, complaint_text)
+                VALUES (?, ?, ?, ?)
+            """),
+            (user_id, vacancy_id, reason, complaint_text),
+        )
+        return int(cur.lastrowid)
+
+
+def get_complaint(complaint_id: int) -> dict | None:
+    row = fetchone(
+        """
+        SELECT c.id, c.user_id, s.full_name, s.username, c.vacancy_id,
+               c.reason, c.complaint_text, c.created_at, c.resolved
+        FROM complaints c
+        LEFT JOIN subscribers s ON c.user_id = s.user_id
+        WHERE c.id = ?
+        """,
+        (complaint_id,),
+    )
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "full_name": row[2],
+        "username": row[3],
+        "vacancy_id": row[4],
+        "reason": row[5],
+        "complaint_text": row[6],
+        "created_at": row[7],
+        "resolved": bool(row[8]) if row[8] is not None else False,
+    }
 
 
 def get_recent_complaints(limit: int = 20):
@@ -2740,11 +2844,48 @@ def resolve_complaint(complaint_id: int):
 
 
 # ========== ПОДДЕРЖКА ==========
-def add_support_request(user_id: int, message_text: str, username: str = None):
-    execute("""
-        INSERT INTO support_requests (user_id, message_text, user_username)
-        VALUES (?, ?, ?)
-    """, (user_id, message_text, username))
+def add_support_request(user_id: int, message_text: str, username: str = None) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            cur.execute(
+                q("""
+                    INSERT INTO support_requests (user_id, message_text, user_username)
+                    VALUES (?, ?, ?)
+                    RETURNING id
+                """),
+                (user_id, message_text, username),
+            )
+            return int(cur.fetchone()[0])
+        cur.execute(
+            q("""
+                INSERT INTO support_requests (user_id, message_text, user_username)
+                VALUES (?, ?, ?)
+            """),
+            (user_id, message_text, username),
+        )
+        return int(cur.lastrowid)
+
+
+def get_support_request(request_id: int) -> dict | None:
+    row = fetchone(
+        f"""
+        SELECT id, user_id, user_username, message_text, created_at, answered, admin_response
+        FROM support_requests WHERE id = ?
+        """,
+        (request_id,),
+    )
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "username": row[2],
+        "message_text": row[3],
+        "created_at": row[4],
+        "answered": bool(row[5]) if row[5] is not None else False,
+        "admin_response": row[6],
+    }
 
 
 def get_unanswered_support_requests(limit: int = 20):

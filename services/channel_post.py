@@ -16,7 +16,11 @@ from db import (
     try_reserve_vacancy_channel_post,
 )
 from parser import evaluate_vacancy
-from services.channel_images import resolve_vacancy_image_path, send_channel_post
+from services.channel_images import (
+    next_vacancy_image_variant_index,
+    resolve_vacancy_image_path,
+    send_channel_post,
+)
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
 from services.vacancy_public_text import sanitize_vacancy_public_body
@@ -121,7 +125,12 @@ async def post_vacancy_preview_to_channel(
         freshness=freshness,
     )
     markup = build_channel_preview_keyboard(vacancy_id)
-    photo_path = resolve_vacancy_image_path(category_code)
+    variant_idx = next_vacancy_image_variant_index(category_code)
+    photo_path = resolve_vacancy_image_path(
+        category_code,
+        vacancy_id,
+        variant_index=variant_idx,
+    )
     try:
         msg = await send_channel_post(
             bot,
@@ -137,7 +146,12 @@ async def post_vacancy_preview_to_channel(
             message_id=msg.message_id,
             preview_text=snippet,
         )
-        logger.info("Channel cross-post vacancy_id=%s cat=%s", vacancy_id, category_code)
+        logger.info(
+            "Channel cross-post vacancy_id=%s cat=%s image=%s",
+            vacancy_id,
+            category_code,
+            photo_path.name if photo_path else None,
+        )
         return True
     except Exception as e:
         if not force:

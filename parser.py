@@ -837,7 +837,8 @@ async def _audit_evaluate_message(message, chat_title: str, stats: dict | None):
         if stats is not None:
             stats["digest_posts"] = stats.get("digest_posts", 0) + 1
         for block in split_vacancy_blocks(message.text)[:MAX_DIGEST_BLOCKS]:
-            _audit_record_eval(stats, chat_title, block, poster)
+            enriched = enrich_digest_block(block, message.text)
+            _audit_record_eval(stats, chat_title, enriched, poster)
         return
     _audit_record_eval(stats, chat_title, message.text, poster)
 
@@ -1472,27 +1473,10 @@ def _extract_message_geo(message) -> tuple[float | None, float | None]:
 def extract_address_from_text(text: str) -> str:
     if not text:
         return None
-    direct_match = re.search(r'(?:адрес|локация|место)\s*[:\-]\s*([^\n]{6,120})', text, re.IGNORECASE)
-    if direct_match:
-        return direct_match.group(1).strip(" .,")
-    metro_match = re.search(r'(?:м\.|метро)\s*[:\-]?\s*(?:🚇\s*)?([А-Яа-яёЁ\-\s]{2,50})', text, re.IGNORECASE)
-    if metro_match:
-        return f"метро {metro_match.group(1).strip(' .,')}"
-    street_match = re.search(
-        r'((?:ул\.|улица|пр-т|проспект|пер\.|переулок|шоссе|наб\.|набережная)\s+[А-Яа-яёЁ0-9\-\.\s]{3,80}(?:,\s*\d+[А-Яа-яёЁA-Za-z0-9\/-]*)?)',
-        text,
-        re.IGNORECASE
-    )
-    if street_match:
-        return street_match.group(1).strip(" .,")
-    city_match = re.search(
-        r'\b(Москва|МО|Подольск|Химки|Мытищи|Красногорск|Люберцы|Балашиха|Корол[её]в|Одинцово|Домодедово|Железнодорожный|Видное|Щ[её]лково|Электросталь|Коломна|Серпухов)\b',
-        text,
-        re.IGNORECASE
-    )
-    if city_match:
-        return city_match.group(1)
-    return None
+    from services.vacancy_enrichment import extract_address_normalized
+
+    return extract_address_normalized(text)
+
 
 _ORDER_NUMBER_RE = re.compile(
     r"(?:автопост\s*)?[№#]\s*(\d{4,7})\b",
@@ -1812,6 +1796,7 @@ _CATEGORY_KEYWORDS = {
     ],
     "helper": [
         "хелпер", "хэлпер", "хелперы", "хэлперы",
+        "помощник", "#помощник",
         # «мероприят» — намеренный стем: мероприятие / мероприятия / мероприятий
         "хелпер на мероприят", "хэлпер на мероприят",
         "хелпер на мероприятие", "хэлпер на мероприятие",
@@ -1858,18 +1843,19 @@ def split_vacancy_blocks(text: str) -> list:
 
 
 def enrich_digest_block(block_text: str, full_text: str) -> str:
-    """Подмешивает оплату/контакт из шапки digest в блок без своих."""
-    parts = [block_text.strip()]
-    if not has_payment_signal(block_text):
-        for line in full_text.splitlines():
-            if has_payment_signal(line):
-                parts.append(line.strip())
-                break
-    if not extract_contact_from_text(block_text) and not has_ls_contact_phrase(block_text):
-        contact = extract_contact_from_text(full_text)
-        if contact:
-            parts.append(contact)
-    return "\n".join(parts)
+    """Подмешивает роль/ставку/контакт из шапки digest в блок без своих."""
+    from services.post_header_context import enrich_block_with_header_context
+
+    return enrich_block_with_header_context(
+        block_text,
+        full_text,
+        category_scorer=_detect_category_scored,
+        payment_checker=has_payment_signal,
+        has_payment=has_payment_signal,
+        has_contact=lambda t: bool(extract_contact_from_text(t)),
+        extract_contact=extract_contact_from_text,
+        has_ls_contact=has_ls_contact_phrase,
+    )
 
 
 def _numbered_vacancy_count(text: str) -> int:
@@ -1924,6 +1910,8 @@ _STAFF_HIRING_EXTRA = (
 _PAYMENT_RATE_RE = re.compile(
     r"(?:"
     r"\d[\d\s.,]*\s*(?:руб\.?|₽|р\.?\/?\s*ч)|"
+    r"\d{3,4}\s*р/ч|"
+    r"\d{3,5}\s*р(?:\.|\b)(?:\s*\+|\s*за|\s*/|\s|$)|"
     r"₽\/?\s*ч|р\/\s*ч|руб\.?\s*/\s*ч|"
     r"ставка\s*[:\s]?\s*\d|минималка|"
     r"оплат\w*\s*[:\s].*\d|\d[\d\s.,]*\s*(?:₽|руб)|"
@@ -2081,11 +2069,37 @@ def is_chat_listing_noise(text: str) -> bool:
     return False
 
 
+def _score_categories_weighted(text: str) -> dict:
+    """Scoring по всему тексту + усиление шапки (первые строки / блок до «1.»)."""
+    if not text:
+        return {}
+    text_lower = text.lower()
+    scores = _score_categories(text_lower)
+
+    from services.post_header_context import extract_leading_header_lines, extract_shared_header
+
+    boost_chunks: list[str] = []
+    leading = "\n".join(extract_leading_header_lines(text)[:3])
+    if leading.strip():
+        boost_chunks.append(leading)
+    shared = extract_shared_header(text)
+    if shared.strip() and shared.strip() != leading.strip():
+        boost_chunks.append(shared)
+
+    for chunk in boost_chunks:
+        for cat, pts in _score_categories(chunk.lower()).items():
+            scores[cat] = scores.get(cat, 0) + pts * 2
+
+    if any(marker in text_lower for marker in _NON_SUPERVISOR_COORDINATOR):
+        scores.pop("supervisor", None)
+    return scores
+
+
 def _detect_category_scored(text: str) -> str | None:
     if not text:
         return None
     text_lower = text.lower()
-    return _pick_category_from_scores(_score_categories(text_lower), text_lower)
+    return _pick_category_from_scores(_score_categories_weighted(text), text_lower)
 
 
 def detect_category(text: str) -> str | None:
@@ -2152,6 +2166,10 @@ def has_payment_signal(text: str) -> bool:
     for token in ("ставка", "минималка", "гонорар", "зарплат", "з/п"):
         if token in tl:
             return True
+    from services.channel_rate import extract_hourly_rate_rub, extract_shift_rate_rub
+
+    if extract_hourly_rate_rub(text) or extract_shift_rate_rub(text):
+        return True
     return False
 
 
@@ -2219,7 +2237,8 @@ def evaluate_digest_blocks(text: str, poster: dict | None = None) -> list[tuple[
     """Принятые блоки digest: [(category, block_text), …]."""
     accepted = []
     for block in split_vacancy_blocks(text)[:MAX_DIGEST_BLOCKS]:
-        ok, cat, _, _ = evaluate_vacancy(block, poster)
+        enriched = enrich_digest_block(block, text)
+        ok, cat, _, _ = evaluate_vacancy(enriched, poster)
         if ok and cat:
             accepted.append((cat, block))
     return accepted
@@ -2298,6 +2317,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
     if category == "helper":
         helper_markers = (
             "хелпер", "хэлпер",
+            "помощник", "#помощник",
             "хелпер на мероприят", "хэлпер на мероприят",
             "хелпер на мероприятие", "хэлпер на мероприятие",
             "помощник на мероприят", "помощник организатора",

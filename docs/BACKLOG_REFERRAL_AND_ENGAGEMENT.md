@@ -29,6 +29,7 @@
 - Персональная ссылка: `https://t.me/PromostaffHunter_bot?start=ref_{user_id}`  
   (опционально позже: короткий код `ref_a3f9` в БД).
 - При **первом** `/start` с `ref_` — записать `subscribers.referred_by` (не перезаписывать).
+- **Категорию по ref_ не предвыбирать** — в отличие от `vac_*` из канала, у реферала роль неизвестна до явного выбора пользователя (реализовано: `services/onboarding_deeplink.py` только для `vac_`).
 - Статусы в таблице `referrals`: `clicked` → `registered` → `qualified` → `rewarded`.
 
 ### 1.2 Когда засчитывать invite (**qualified**)

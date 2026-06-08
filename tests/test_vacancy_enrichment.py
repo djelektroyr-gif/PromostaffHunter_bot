@@ -17,7 +17,32 @@ def test_extract_address_city_and_street():
     assert extract_address_normalized(text) == "Москва, ул. Ленина, 15"
 
 
-def test_extract_address_explicit_label():
+def test_extract_address_location_block_multiline():
+    text = (
+        "**2 парня хелпера**\n"
+        "📅 **ДАТА:** Сегодня\n"
+        "💰 **ОПЛАТА**\n"
+        "450 р/ч\n"
+        "📍 **ЛОКАЦИЯ**\n"
+        "Страстной бульвар\n"
+        "Тверская\n"
+        "📋 **ТРЕБОВАНИЯ И ФУНКЦИОНАЛ**\n"
+        "Помощь флористам"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Страстной бульвар" in addr
+    assert "метро" in addr.lower() and "тверская" in addr.lower()
+    assert "Москва" in addr
+    url = build_maps_url(address_normalized=addr)
+    assert url is not None
+    assert "yandex.ru/maps" in url
+
+
+def test_extract_address_boulevard_without_block():
+    text = "Срочно на Страстной бульвар, оплата 450 р/ч"
+    addr = extract_address_normalized(text)
+    assert addr == "Москва, Страстной бульвар"
     text = "Адрес: Балашиха, шоссе Энтузиастов, 12\nОплата 480 р/ч"
     assert "Балашиха" in extract_address_normalized(text)
 
@@ -102,4 +127,32 @@ def test_backfill_updates_recent_vacancies(monkeypatch, tmp_path):
     )
     assert row[0] is not None
     assert row[1] == 500
-    assert row[2] == 1
+    assert row[2] == 3
+
+
+def test_extract_address_freeform_scattered():
+    """Улица и метро в разных местах текста без единого блока."""
+    text = (
+        "Нужны 2 хелпера на сегодня\n"
+        "450 р/ч, выход на Страстной бульвар\n"
+        "сбор у м. Тверская\n"
+        "пишите в лс"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Страстной бульвар" in addr
+    assert "тверская" in addr.lower()
+
+
+def test_extract_address_where_label_multiline():
+    text = "Где:\nТЦ Авиапарк\nм. Сокол\n450 р/ч"
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Авиапарк" in addr
+
+
+def test_extract_address_pin_inline_one_line():
+    text = "Срочно\n📍 Москва, ул. Профсоюзная, 56\n500 р/ч"
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Профсоюзная" in addr

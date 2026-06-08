@@ -8,6 +8,8 @@ _HOURLY_PATTERNS = (
     re.compile(r"(\d{3,4})\s*[₽р]\s*/\s*ч(?:ас)?", re.I),
     re.compile(r"(\d{3,4})\s*/\s*ч(?:ас|\.|\b)", re.I),
     re.compile(r"(\d{3,4})\s*(?:руб|₽|р\.?)\s*/?\s*(?:ч(?:ас)?|ч\.?)", re.I),
+    re.compile(r"(\d{3,4})\s*р/ч", re.I),
+    re.compile(r"(\d{3,4})\s*руб\.?\s*/?\s*ч(?:ас)?\s+по\s+окончан", re.I),
     re.compile(r"ставка\s*(\d{3,4})\s*[₽р]?\s*/?\s*ч", re.I),
     re.compile(r"(\d{3,4})\s*р\.?\s*/\s*ч", re.I),
     re.compile(r"(\d{3,4})\s*(?:руб|₽|р\.?)\.?\s*час", re.I),
@@ -17,6 +19,9 @@ _SHIFT_PATTERNS = (
     re.compile(r"(\d{3,5})\s*[₽р]\s*/\s*смен", re.I),
     re.compile(r"(\d{3,5})\s*(?:руб|₽|р\.?)\s*/?\s*смен", re.I),
     re.compile(r"(\d{3,5})\s*[₽р]?\s*за\s+смен", re.I),
+    re.compile(r"(\d{3,5})\s*р\s*\+\s*костюм", re.I),
+    re.compile(r":\s*(\d{3,5})\s*р(?:\.|\b)", re.I),
+    re.compile(r"(\d{3,5})\s*р(?:\.|\b)(?:\s*\+|\s*за|\s*$)", re.I),
     re.compile(r"ставка\s*(\d{3,5})\s*[₽р]?(?:\s|$|/|\.)", re.I),
     re.compile(r"(\d{3,5})\s*(?:руб|₽|р\.?)\s*\+\s*костюм", re.I),
 )

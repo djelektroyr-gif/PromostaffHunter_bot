@@ -3,7 +3,17 @@
 > Живой конспект проекта. Обновлять при каждой заметной доработке бота, парсера или продуктовых решений.  
 > Репозиторий: **PromostaffHunter_bot** (не путать с **promostaff-agency-bot** и **promostaff-bot**).
 
-Последнее обновление: **2026-06-07** (сборка **`tool-v4`**, PostgreSQL на Bothost prod)
+Последнее обновление: **2026-06-08** (сборка **`tool-v4`**, PostgreSQL на Bothost prod)
+
+### Сделано за сессию (2026-06-08)
+
+| Область | Что |
+|---------|-----|
+| **Парсер / адрес** | Многострочная «ЛОКАЦИЯ», свободная форма, `enrichment_version` 3, `/enrich_backfill` |
+| **Парсер / digest** | Шапка поста → роль и ставка в блок; усиление категории по заголовку (`post_header_context.py`) |
+| **Админ** | Push support/complaint, «📣 Техсообщение», Premium-реквизиты + алерт на чек |
+| **UX** | `vac_*` → предвыбор категории; тихие часы + «закрыта»; ротация обложек канала 1→2→3 |
+| **Доки** | Критерии переноса Hunter на Timeweb — § [Хостинг](#хостинг-bothost-сейчас--timeweb-цель) ниже |
 
 ### Сделано за сессию (tool-v4)
 
@@ -251,6 +261,39 @@ Inline-кнопки на карточках вакансий: Bot API 9.4 `style
 **Bothost / тексты промо:** версионируемый файл — **`assets/channel_promo_texts.json`**. `data/` на Bothost — persistent volume, не из git. Приоритет: БД (админка) → assets → дефолты в коде.
 
 **Bothost / фото профилей:** jpg в **`/app/shared/user_photos`** (если «Общее хранилище») или **`/app/data/user_photos`**. Не в git. В логах при старте: `User photos dir: … (N jpg)`.
+
+### Хостинг: Bothost сейчас → Timeweb (цель)
+
+**Текущая схема (осознанный компромисс, не технический долг):**
+
+| Компонент | Хостинг | Зачем |
+|-----------|---------|--------|
+| **promostaff-web**, Mini App | Timeweb (`promostaff.pro`) | HTTPS, кабинет, «лицо» |
+| **Agency TG Bot** | Timeweb App Platform | Общая БД с вебом, ERP |
+| **PromostaffHunter** | **Bothost** | Дешевле 24/7 (Telethon + polling + планировщики), пока бот не окупает Timeweb + Cursor |
+
+Hunter на Bothost — **не блокер** для Timeweb **AI Gateway** (`api.timeweb.ai`): LLM-запросы идут по HTTPS с Bothost, перенос бота для этого не обязателен.
+
+**Polling vs webhook:** Hunter и agency сейчас на **long polling** (бот сам опрашивает Telegram). **Webhook (HTTPS)** — опция при переносе на Timeweb и росте нагрузки; handlers не переписываются, меняется только способ доставки апдейтов. Подробнее: promostaff-agency-bot → `TELEGRAM_MODERN_BOT_PLAYBOOK.md`.
+
+**Когда переносить Hunter на Timeweb** (решение «да», если выполнено **≥2** пункта):
+
+1. **Монетизация:** стабильные **≥3–5 тыс. ₽/мес** от Premium/Stars (или иной прямой выручки Hunter), чтобы покрывать Timeweb + Bothost + инструменты разработки.
+2. **Bothost мешает:** лимиты RAM/диска, частые падения, нет нужных env/volume для `user_session.session`.
+3. **Интеграция с agency:** общая PostgreSQL/очередь между Hunter и agency-bot на одной площадке.
+4. **Операционка:** один мониторинг, один ручной деплoy, один счёт (App Platform + managed PG).
+5. **Webhook:** нужен единый домен `promostaff.pro` для Mini App + webhook Bot API (не «ради модности»).
+
+**До переноса не трогать без причины:** автодеплой на каждый коммит; Amsterdam VDS для LLM (замена — Timeweb AI Gateway); webhook только ради «современности».
+
+**Чеклист миграции Hunter → Timeweb** (когда критерии выполнены):
+
+- [ ] App Platform: сервис Hunter, volume для `user_session.session` и `user_photos`
+- [ ] `DATABASE_URL` — та же PG или отдельный инстанс; миграция данных
+- [ ] Env: те же переменные, что на Bothost; smoke Telethon + polling
+- [ ] DNS/webhook (опционально): path на `promostaff.pro` или `*.twc1.net` App Platform
+- [ ] Параллельный прогон 3–7 дней или cutover в окно; отключить Bothost
+- [ ] Обновить этот раздел и `TIMEWEB`/Bothost заметки в деплой-доках
 
 ### Фильтр метро (Premium)
 

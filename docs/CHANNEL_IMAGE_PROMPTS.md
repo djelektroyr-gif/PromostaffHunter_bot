@@ -109,38 +109,66 @@ only near magnifying glass.
 
 Соответствие текстам в `assets/channel_promo_texts.json` (слот 0 → 09:00, 1 → 14:00, 2 → 20:00).
 
-| index | Файл | Тема поста |
-|-------|------|------------|
-| 0 | `promo-categories.png` | Вакансии под вашу роль |
-| 1 | `promo-subscribe.png` | Подпишитесь на бота |
-| 2 | `promo-premium.png` | Ищете смену / Premium push |
+| index | Файл | Три карточки категорий | Тема поста |
+|-------|------|------------------------|------------|
+| 0 | `promo-categories.png` | **ПРОМОУТЕР**, **ХОСТЕС**, **АНИМАТОР** | Вакансии под вашу роль |
+| 1 | `promo-subscribe.png` | **ОФИЦИАНТ**, **ВОДИТЕЛЬ**, **ОХРАННИК** | Подпишитесь на бота |
+| 2 | `promo-premium.png` | **ГАРДЕРОБ**, **ПАРКОВЩИК**, **СУПЕРВАЙЗЕР** | Ищете смену / Premium push |
 
-### Промо 0 — категории
+> **Не дублировать** на всех трёх слотах одну связку «хелпер + грузчик + супервайзер».  
+> Хелпер и грузчик — на **вакансийных** карточках `vacancy-helper-*.png`, `vacancy-loader-*.png`.  
+> Константа в коде: `PROMO_ROLE_TRIO_BY_VARIANT` в `services/channel_images.py`.
 
-```
-[BASE STYLE — no ОТКРЫТО vacancy button]
-Recruiter pointing at three filter cards: green ХЕЛПЕР, orange ГРУЗЧИК, pink ПРОМОУТЕР
-with checkmarks. Headline ВАКАНСИИ ПОД ВАШУ РОЛЬ. Subline выберите категорию в боте.
-Badge PROMOSTAFF HUNTER. Marketing promo, not vacancy card.
-```
-
-### Промо 1 — подписка
+### Промо 0 — категории (09:00)
 
 ```
-[BASE STYLE]
-Character pointing at large smartphone showing PROMOSTAFF HUNTER BOT chat with
-vacancy list and «Настроить подписку» button. Headline ПОДПИШИТЕСЬ НА БОТА.
-Badge push по категориям и метро. Handle @PromostaffHunter_bot.
+[BASE STYLE — no ОТКРЫТО, no corner circular logo]
+Recruiter pointing at three filter cards with checkmarks:
+pink ПРОМОУТЕР, white ХОСТЕС, purple АНИМАТОР.
+Headline ВАКАНСИИ ПОД ВАШУ РОЛЬ. Subline выберите категорию в боте.
+White PROMOSTAFF text patch on cap only — NO extra badge in corner.
 ```
 
-### Промо 2 — Premium
+### Промо 1 — подписка (14:00)
 
 ```
 [BASE STYLE]
-Character with PREMIUM badge on shirt, phone showing instant push «НОВАЯ СМЕНА»
-and metro pin. Headline ИЩЕТЕ СМЕНУ? Box PREMIUM — МОМЕНТАЛЬНЫЙ PUSH. Lightning
-near phone, tiny sparkles only there.
+Character pointing at smartphone; three small role chips on screen or beside phone:
+blue ОФИЦИАНТ, navy ВОДИТЕЛЬ, grey ОХРАННИК.
+Headline ПОДПИШИТЕСЬ НА БОТА. Chat «Настроить подписку».
+NO corner circular logo. PROMOSTAFF on cap only.
 ```
+
+### Промо 2 — Premium (20:00)
+
+```
+[BASE STYLE]
+Character with PREMIUM diamond badge; three role chips:
+teal ГАРДЕРОБ, yellow ПАРКОВЩИК, purple СУПЕРВАЙЗЕР.
+Headline ИЩЕТЕ СМЕНУ? Box PREMIUM — МОМЕНТАЛЬНЫЙ PUSH.
+NO corner circular logo.
+```
+
+### Логотип `promostaff-hunter-logo.png`
+
+| Накладывать склейку | Не накладывать |
+|---------------------|----------------|
+| `promo-maintenance.png` | все `vacancy-*.png` (PROMOSTAFF на форме) |
+| `promo-update-premium-filters.png` | `promo-categories/subscribe/premium` (есть PROMOSTAFF) |
+
+Скрипт: `python scripts/apply_channel_logo.py` (только whitelist). `--force` — на все PNG, не рекомендуется.
+
+---
+
+### Дефолт (fallback, неизвестная категория)
+
+Три варианта `vacancy-default-{1,2,3}.png` — **разные** тройки карточек, не только хелпер/грузчик/супервайзер:
+
+| файл | три карточки |
+|------|----------------|
+| `-1` | хелпер, грузчик, промоутер |
+| `-2` | официант, водитель, охранник |
+| `-3` | гардероб, парковщик, аниматор |
 
 ---
 
