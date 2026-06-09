@@ -1067,6 +1067,16 @@ async def admin_fsm_menu_escape(message: types.Message, state: FSMContext) -> bo
     text = message.text
     if text == ADMIN_BTN_BACK:
         await message.answer("🏠 Главное админ-меню", reply_markup=get_admin_hub_keyboard())
+    elif text == "📊 Статистика" or text == ADMIN_BTN_STATS_24H:
+        await send_admin_stats_screen(message)
+    elif text == ADMIN_BTN_STATS_TOTAL:
+        from services.admin_activity_digest import build_admin_totals_html
+        await message.answer(
+            build_admin_totals_html(),
+            parse_mode="HTML",
+            reply_markup=get_admin_stats_keyboard(),
+            disable_web_page_preview=True,
+        )
     elif text == "📝 Отчёт парсера":
         await send_parser_debug_report(message)
     elif text == "📊 Шум по чатам":
@@ -1332,6 +1342,45 @@ class RegistrationState(StatesGroup):
     waiting_for_birthdate = State()
     waiting_for_phone = State()
     waiting_for_photo = State()
+
+
+_reg_validation_alert_sent: set[int] = set()
+
+
+async def _maybe_alert_reg_validation(message: types.Message, step: str, detail: str = "") -> None:
+    from services.admin_ops_alerts import notify_admin_registration_validation_loop
+    from services.bot_events import record_reg_validation_fail
+
+    user = message.from_user
+    count = record_reg_validation_fail(user.id, step, detail)
+    if count >= 5 and user.id not in _reg_validation_alert_sent:
+        _reg_validation_alert_sent.add(user.id)
+        await notify_admin_registration_validation_loop(
+            bot,
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            step=step,
+            fail_count=count,
+        )
+
+
+async def send_admin_stats_screen(message: types.Message, *, hours: int = 24) -> None:
+    from services.admin_activity_digest import build_activity_digest_html
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    text = build_activity_digest_html(hours=hours)
+    try:
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_stats_keyboard(),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        plain = re.sub(r"<[^>]*>", "", text)
+        await message.answer(plain, reply_markup=get_admin_stats_keyboard())
+
 
 class BroadcastState(StatesGroup):
     waiting_for_text = State()
@@ -2314,7 +2363,29 @@ async def send_vacancy_to_subscribers(order: dict):
         if not try_reserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id']):
             continue
         try:
-            await send_vacancy_card(subscriber['user_id'], text, reply_markup=keyboard)
+            uid = subscriber['user_id']
+            if FORUM_TOPICS_ENABLED:
+                from services.forum_vacancy_pin import send_vacancy_push_pinned_general
+
+                def _rebuild_kb(vid: str):
+                    r = get_vacancy_push_row(vid)
+                    if not r:
+                        return None
+                    return build_vacancy_preview_keyboard(vid, **_map_fields_from_push_row(r))
+
+                ok = await send_vacancy_push_pinned_general(
+                    bot,
+                    uid,
+                    vacancy_id,
+                    text,
+                    keyboard,
+                    rebuild_keyboard=_rebuild_kb,
+                    ensure_topics=setup_forum_topics_for_user,
+                )
+                if not ok:
+                    raise RuntimeError("pinned general push failed")
+            else:
+                await send_vacancy_card(uid, text, reply_markup=keyboard, topic_key=None)
             sent_count += 1
             await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
         except Exception as e:
@@ -2406,6 +2477,11 @@ USER_MENU_BUTTONS = {
 }
 
 from services.ux_middleware import ChatActivityMiddleware
+from services.handler_error_middleware import HandlerErrorAlertMiddleware
+from services.subscriber_activity_middleware import SubscriberActivityMiddleware
+
+dp.update.outer_middleware(HandlerErrorAlertMiddleware())
+dp.update.outer_middleware(SubscriberActivityMiddleware())
 dp.update.outer_middleware(ChatActivityMiddleware())
 
 ADMIN_BTN_HUB_PARSER = "📡 Парсер"
@@ -2413,6 +2489,8 @@ ADMIN_BTN_HUB_USERS = "👥 Пользователи"
 ADMIN_BTN_HUB_EXPORT = "📥 Excel"
 ADMIN_BTN_HUB_MOD = "📝 Модерация"
 ADMIN_BTN_BACK = "◀️ Назад"
+ADMIN_BTN_STATS_24H = "📈 За 24 часа"
+ADMIN_BTN_STATS_TOTAL = "📋 Сводка всего"
 
 
 def get_admin_hub_keyboard() -> ReplyKeyboardMarkup:
@@ -2427,12 +2505,23 @@ def get_admin_hub_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def get_admin_stats_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=ADMIN_BTN_STATS_24H), KeyboardButton(text=ADMIN_BTN_STATS_TOTAL)],
+            [KeyboardButton(text="📊 Шум по чатам"), KeyboardButton(text="📡 Покрытие каналов")],
+            [KeyboardButton(text="📋 Примеры отсева"), KeyboardButton(text="📊 Статистика канала")],
+            [KeyboardButton(text="📝 Отчёт парсера")],
+            [KeyboardButton(text=ADMIN_BTN_BACK)],
+        ],
+        resize_keyboard=True,
+    )
+
+
 def get_admin_parser_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Ручная проверка"), KeyboardButton(text="🔬 Аудит фильтра")],
-            [KeyboardButton(text="📝 Отчёт парсера"), KeyboardButton(text="📋 Примеры отсева")],
-            [KeyboardButton(text="📡 Покрытие каналов"), KeyboardButton(text="📊 Шум по чатам")],
             [KeyboardButton(text="📋 Список чатов парсинга")],
             [KeyboardButton(text="➕ Добавить чат"), KeyboardButton(text="📤 Отправить вакансию")],
             [KeyboardButton(text="🧭 Маппинг категорий")],
@@ -2632,7 +2721,7 @@ def get_admin_keyboard():
 
 ADMIN_MENU_BUTTONS = {
     ADMIN_BTN_HUB_PARSER, ADMIN_BTN_HUB_USERS, ADMIN_BTN_HUB_EXPORT, ADMIN_BTN_HUB_MOD,
-    ADMIN_BTN_BACK,
+    ADMIN_BTN_BACK, ADMIN_BTN_STATS_24H, ADMIN_BTN_STATS_TOTAL,
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
     "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
     "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "📣 Техсообщение", "➕ Добавить чат",
@@ -2705,6 +2794,8 @@ async def start_cmd(message: types.Message, state: FSMContext):
         return
 
     add_subscriber(user_id, username, first_name, last_name)
+    from services.bot_events import EVENT_START, record_bot_event
+    record_bot_event(user_id, EVENT_START)
     if start_payload == "employer":
         set_subscriber_role(user_id, "employer")
 
@@ -2785,6 +2876,8 @@ async def role_candidate_pick(callback: types.CallbackQuery, state: FSMContext):
     await safe_callback_answer(callback)
     user_id = callback.from_user.id
     set_subscriber_role(user_id, "candidate")
+    from services.bot_events import EVENT_REG_ROLE_CANDIDATE, record_bot_event
+    record_bot_event(user_id, EVENT_REG_ROLE_CANDIDATE)
     await callback.message.edit_text(
         "👷 *Режим исполнителя*\n\n"
         "Помогу находить вакансии и откликаться в один клик.\n\n"
@@ -2805,6 +2898,8 @@ async def role_employer_pick(callback: types.CallbackQuery, state: FSMContext):
     await safe_callback_answer(callback)
     user_id = callback.from_user.id
     set_subscriber_role(user_id, "employer")
+    from services.bot_events import EVENT_REG_ROLE_EMPLOYER, record_bot_event
+    record_bot_event(user_id, EVENT_REG_ROLE_EMPLOYER)
     await callback.message.edit_text(
         "🏢 *Режим заказчика*\n\n"
         "Как вас представить? (компания или ФИО контактного лица)",
@@ -2858,6 +2953,16 @@ async def employer_reg_phone(message: types.Message, state: FSMContext):
         contact_source=contact_source or "profile_phone",
         category_code=None,
         bot_user_id=user.id,
+    )
+    from services.admin_ops_alerts import notify_admin_registration_success
+    from services.bot_events import EVENT_REG_EMPLOYER_COMPLETE, record_bot_event
+    record_bot_event(user.id, EVENT_REG_EMPLOYER_COMPLETE)
+    await notify_admin_registration_success(
+        bot,
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        role="employer",
     )
     await state.clear()
     await message.answer(
@@ -2967,12 +3072,16 @@ async def employer_switch_to_candidate(message: types.Message, state: FSMContext
 async def process_name(message: types.Message, state: FSMContext):
     full_name = message.text.strip()
     if len(full_name.split()) < 2:
+        await _maybe_alert_reg_validation(message, "имя", "мало слов")
         await message.answer("❌ Пожалуйста, введите полное имя и фамилию (минимум 2 слова).")
         return
     if not re.match(r'^[a-zA-Zа-яА-ЯёЁ\s\-\.]+$', full_name):
+        await _maybe_alert_reg_validation(message, "имя", "недопустимые символы")
         await message.answer("❌ Имя может содержать только буквы, пробелы, дефисы и точки.")
         return
     await state.update_data(full_name=full_name)
+    from services.bot_events import EVENT_REG_NAME_OK, record_bot_event
+    record_bot_event(message.from_user.id, EVENT_REG_NAME_OK)
     await message.answer(
         "🎂 *Дата рождения*\n\n"
         "Введите вашу дату рождения в формате: **ДД.ММ.ГГГГ**\n\n"
@@ -2987,6 +3096,7 @@ async def process_name(message: types.Message, state: FSMContext):
 async def process_birthdate(message: types.Message, state: FSMContext):
     birth_date_str = message.text.strip()
     if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', birth_date_str):
+        await _maybe_alert_reg_validation(message, "дата рождения", "формат")
         await message.answer(
             "❌ Неверный формат!\n\n"
             "Пожалуйста, введите дату в формате: **ДД.ММ.ГГГГ**\n\n"
@@ -2996,6 +3106,7 @@ async def process_birthdate(message: types.Message, state: FSMContext):
         return
     age = calculate_age(birth_date_str)
     if age is None:
+        await _maybe_alert_reg_validation(message, "дата рождения", "неверная дата")
         await message.answer(
             "❌ Неверная дата! Проверьте, что:\n"
             "- День от 1 до 31\n"
@@ -3006,10 +3117,12 @@ async def process_birthdate(message: types.Message, state: FSMContext):
         )
         return
     if age < 16 or age > 100:
+        await _maybe_alert_reg_validation(message, "дата рождения", f"возраст {age}")
         await message.answer(f"❌ Возраст должен быть от 16 до 100 лет. Ваш возраст: {age}.", parse_mode="Markdown")
         return
     await state.update_data(birth_date=birth_date_str, age=age)
-    
+    from services.bot_events import EVENT_REG_BIRTHDATE_OK, record_bot_event
+    record_bot_event(message.from_user.id, EVENT_REG_BIRTHDATE_OK)
     phone_keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Отправить мой номер телефона", request_contact=True)]],
         resize_keyboard=True,
@@ -3035,6 +3148,7 @@ async def process_phone(message: types.Message, state: FSMContext):
         phone = message.text.strip()
         digits_only = re.sub(r'\D', '', phone)
         if len(digits_only) < 10 or len(digits_only) > 15:
+            await _maybe_alert_reg_validation(message, "телефон", "формат")
             await message.answer(
                 "❌ Пожалуйста, введите корректный номер телефона.\n\n"
                 "Примеры: +7 999 123-45-67 или 89991234567\n\n"
@@ -3053,7 +3167,8 @@ async def process_phone(message: types.Message, state: FSMContext):
         user_id, data['full_name'], data['age'], phone, birth_date=data['birth_date'],
     )
     update_candidate_questionnaire(user_id, rebuild_candidate_questionnaire(user_id))
-    
+    from services.bot_events import EVENT_REG_PHONE_OK, record_bot_event
+    record_bot_event(user_id, EVENT_REG_PHONE_OK)
     # Запрос фото (необязательно)
     await message.answer(
         "📸 *Фото для отклика*\n\n"
@@ -3097,6 +3212,16 @@ async def process_photo(message: types.Message, state: FSMContext):
         message.chat.id,
         user_id,
         deeplink_category=data.get("deeplink_category"),
+    )
+    from services.admin_ops_alerts import notify_admin_registration_success
+    from services.bot_events import EVENT_REG_COMPLETE, record_bot_event
+    record_bot_event(user_id, EVENT_REG_COMPLETE)
+    await notify_admin_registration_success(
+        bot,
+        user_id=user_id,
+        username=message.from_user.username,
+        first_name=message.from_user.first_name,
+        role="candidate",
     )
     await state.clear()
 
@@ -3249,6 +3374,17 @@ async def finish_categories(callback: types.CallbackQuery):
             f"Используйте кнопки меню:",
             parse_mode="Markdown",
             reply_markup=keyboard,
+        )
+        from services.admin_ops_alerts import notify_admin_registration_success
+        from services.bot_events import EVENT_REG_CATEGORIES_DONE, record_bot_event
+        record_bot_event(user_id, EVENT_REG_CATEGORIES_DONE)
+        await notify_admin_registration_success(
+            bot,
+            user_id=user_id,
+            username=callback.from_user.username,
+            first_name=callback.from_user.first_name,
+            role="candidate",
+            categories=[c["name"] for c in categories],
         )
     finally:
         _processing_finish.discard(user_id)
@@ -3720,6 +3856,8 @@ async def open_feed_vacancies(
         "feed_mode": feed_mode,
     }
     _cache_user_feed(user_id, user_pages[user_id])
+    from services.bot_events import EVENT_FEED_OPEN, record_bot_event
+    record_bot_event(user_id, EVENT_FEED_OPEN, {"mode": feed_mode})
     await send_vacancy_page(message, user_id, 0)
 
 
@@ -4483,6 +4621,8 @@ async def vacancy_card_open(callback: types.CallbackQuery):
     if not await _edit_vacancy_card_message(callback, vacancy_id, expanded=True):
         await safe_callback_answer(callback, "Вакансия недоступна", show_alert=True)
         return
+    from services.bot_events import EVENT_VAC_OPEN, record_bot_event
+    record_bot_event(callback.from_user.id, EVENT_VAC_OPEN, {"vacancy_id": vacancy_id})
     await safe_callback_answer(callback)
 
 
@@ -4958,6 +5098,8 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         ):
             await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
             return
+        from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
+        record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id, "via": "admin_forward"})
         await _mark_vacancy_card_responded(callback, vacancy_id, address)
         await send_to_admin(
             callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
@@ -4975,6 +5117,8 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     ):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
+    from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
+    record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id})
     await _mark_vacancy_card_responded(callback, vacancy_id, address)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
@@ -5388,13 +5532,7 @@ async def already_responded(callback: types.CallbackQuery):
 async def admin_menu(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
-    await bot.send_chat_action(message.chat.id, "typing")
-    text = await run_db(build_admin_dashboard_text)
-    await message.answer(
-        f"{text}\n\n📖 Справка — «Как пользоваться» или /help",
-        parse_mode="Markdown",
-        reply_markup=get_admin_keyboard(),
-    )
+    await send_admin_stats_screen(message)
 
 @dp.message(Command("status"))
 async def status_cmd(message: types.Message):
@@ -5874,7 +6012,30 @@ async def admin_chats_button(message: types.Message):
 @dp.message(lambda m: m.text == "📊 Статистика")
 async def admin_stats_button(message: types.Message):
     if message.from_user.id == YOUR_USER_ID:
-        await admin_menu(message)
+        await send_admin_stats_screen(message)
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_STATS_24H)
+async def admin_stats_24h_button(message: types.Message):
+    await send_admin_stats_screen(message)
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == ADMIN_BTN_STATS_TOTAL)
+async def admin_stats_totals_button(message: types.Message):
+    from services.admin_activity_digest import build_admin_totals_html
+
+    await bot.send_chat_action(message.chat.id, "typing")
+    text = build_admin_totals_html()
+    try:
+        await message.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=get_admin_stats_keyboard(),
+            disable_web_page_preview=True,
+        )
+    except TelegramBadRequest:
+        await message.answer(re.sub(r"<[^>]*>", "", text), reply_markup=get_admin_stats_keyboard())
+
 
 @dp.message(lambda m: m.text == "🔍 Ручная проверка")
 async def admin_check_button(message: types.Message):
@@ -6988,6 +7149,10 @@ async def on_startup():
     from services.push_digest_scheduler import push_digest_scheduler_loop
     spawn_background_task(push_digest_scheduler_loop(bot))
     logger.info("🔔 Планировщик push-digest: каждую минуту (quiet / «занят»)")
+
+    from services.admin_digest_scheduler import admin_digest_scheduler_loop
+    spawn_background_task(admin_digest_scheduler_loop(bot))
+    logger.info("📊 Планировщик дайджеста админа: 10:00 МСК + зависшие регистрации")
 
     async def channel_snapshot_loop():
         import asyncio

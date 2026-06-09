@@ -67,12 +67,19 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
 async def send_closed_notice(bot: Bot, user_id: int, vacancy_id: str) -> bool:
     text, markup = build_closed_vacancy_notice(vacancy_id)
     try:
+        from config import FORUM_TOPICS_ENABLED
+        from services.forum_topics import TOPIC_RESPONSES, topic_message_kwargs
+
+        extra = {}
+        if FORUM_TOPICS_ENABLED:
+            extra = topic_message_kwargs(user_id, TOPIC_RESPONSES)
         await bot.send_message(
             user_id,
             text,
             parse_mode="HTML",
             reply_markup=markup,
             disable_web_page_preview=True,
+            **extra,
         )
         return True
     except Exception as e:

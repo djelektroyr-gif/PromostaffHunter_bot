@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import shutil
@@ -213,6 +214,40 @@ def init_db():
             "ALTER TABLE subscribers ADD COLUMN premium_renewal_warn_for TIMESTAMP DEFAULT NULL",
             cur=cur,
         )
+        add_column_if_missing(
+            "subscribers", "last_seen_at",
+            "ALTER TABLE subscribers ADD COLUMN last_seen_at TIMESTAMP DEFAULT NULL",
+            cur=cur,
+        )
+        add_column_if_missing(
+            "subscribers", "reg_stuck_notified_at",
+            "ALTER TABLE subscribers ADD COLUMN reg_stuck_notified_at TIMESTAMP DEFAULT NULL",
+            cur=cur,
+        )
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS bot_events (
+                id {serial_pk()},
+                user_id INTEGER,
+                event TEXT NOT NULL,
+                meta_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_events_created ON bot_events(created_at)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_events_event_created ON bot_events(event, created_at)"
+        )
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_scheduler_flags (
+                flag_key TEXT PRIMARY KEY,
+                flag_value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS subscriber_filter_prefs (
@@ -366,6 +401,16 @@ def init_db():
                 thread_id INTEGER NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, topic_key)
+            )
+        """)
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS user_general_vacancy_pin (
+                user_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                card_text TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -1891,6 +1936,43 @@ def save_user_topic_thread(user_id: int, topic_key: str, thread_id: int):
     )
 
 
+def get_general_vacancy_pin(user_id: int) -> dict | None:
+    row = fetchone(
+        q("""
+            SELECT message_id, vacancy_id, card_text
+            FROM user_general_vacancy_pin WHERE user_id = ?
+        """),
+        (user_id,),
+    )
+    if not row:
+        return None
+    return {"message_id": row[0], "vacancy_id": row[1], "card_text": row[2]}
+
+
+def set_general_vacancy_pin(
+    user_id: int,
+    message_id: int,
+    vacancy_id: str,
+    card_text: str,
+) -> None:
+    execute(
+        q("""
+            INSERT INTO user_general_vacancy_pin (user_id, message_id, vacancy_id, card_text, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                message_id = excluded.message_id,
+                vacancy_id = excluded.vacancy_id,
+                card_text = excluded.card_text,
+                updated_at = CURRENT_TIMESTAMP
+        """),
+        (user_id, message_id, vacancy_id, card_text),
+    )
+
+
+def clear_general_vacancy_pin(user_id: int) -> None:
+    execute(q("DELETE FROM user_general_vacancy_pin WHERE user_id = ?"), (user_id,))
+
+
 def is_vacancy_channel_posted(vacancy_id: str) -> bool:
     row = fetchone(
         "SELECT 1 FROM vacancy_channel_posts WHERE vacancy_id = ? AND message_id IS NOT NULL",
@@ -3114,6 +3196,206 @@ def get_admin_stats() -> dict:
         "responses": total_responses, "pending_vacancies": pending_vacancies,
         "total_vacancies": total_vacancies, "pending_complaints": pending_complaints,
         "pending_support": pending_support
+    }
+
+
+def log_bot_event(user_id: int | None, event: str, meta: dict | None = None) -> None:
+    meta_json = json.dumps(meta, ensure_ascii=False) if meta else None
+    execute(
+        q("INSERT INTO bot_events (user_id, event, meta_json) VALUES (?, ?, ?)"),
+        (user_id, event, meta_json),
+    )
+
+
+def count_bot_events_since(event: str, since_utc: datetime) -> int:
+    row = fetchone(
+        q("SELECT COUNT(*) FROM bot_events WHERE event = ? AND created_at >= ?"),
+        (event, since_utc),
+    )
+    return int(row[0]) if row else 0
+
+
+def count_bot_events_grouped_since(since_utc: datetime) -> dict[str, int]:
+    rows = fetchall(
+        q("""
+            SELECT event, COUNT(*) FROM bot_events
+            WHERE created_at >= ?
+            GROUP BY event
+        """),
+        (since_utc,),
+    )
+    return {r[0]: int(r[1]) for r in rows}
+
+
+def count_distinct_active_users_since(since_utc: datetime) -> int:
+    row = fetchone(
+        q("""
+            SELECT COUNT(DISTINCT user_id) FROM bot_events
+            WHERE user_id IS NOT NULL AND created_at >= ?
+        """),
+        (since_utc,),
+    )
+    return int(row[0]) if row and row[0] else 0
+
+
+def count_reg_validation_fails_since(user_id: int, since_utc: datetime) -> int:
+    return count_bot_events_since_for_user(user_id, "reg_validation_fail", since_utc)
+
+
+def count_bot_events_since_for_user(user_id: int, event: str, since_utc: datetime) -> int:
+    row = fetchone(
+        q("""
+            SELECT COUNT(*) FROM bot_events
+            WHERE user_id = ? AND event = ? AND created_at >= ?
+        """),
+        (user_id, event, since_utc),
+    )
+    return int(row[0]) if row else 0
+
+
+def touch_subscriber_last_seen(user_id: int) -> None:
+    execute(
+        q("UPDATE subscribers SET last_seen_at = CURRENT_TIMESTAMP WHERE user_id = ?"),
+        (user_id,),
+    )
+
+
+def count_subscribers_last_seen_since(since_utc: datetime) -> int:
+    row = fetchone(
+        q(f"""
+            SELECT COUNT(*) FROM subscribers
+            WHERE is_active = {bool_true()} AND last_seen_at >= ?
+        """),
+        (since_utc,),
+    )
+    return int(row[0]) if row else 0
+
+
+def count_responses_since(since_utc: datetime) -> int:
+    row = fetchone(
+        q("SELECT COUNT(*) FROM responses WHERE responded_at >= ?"),
+        (since_utc,),
+    )
+    return int(row[0]) if row else 0
+
+
+def count_support_since(since_utc: datetime) -> int:
+    row = fetchone(
+        q("SELECT COUNT(*) FROM support_requests WHERE created_at >= ?"),
+        (since_utc,),
+    )
+    return int(row[0]) if row else 0
+
+
+def count_complaints_since(since_utc: datetime) -> int:
+    row = fetchone(
+        q("SELECT COUNT(*) FROM complaints WHERE created_at >= ?"),
+        (since_utc,),
+    )
+    return int(row[0]) if row else 0
+
+
+def get_scheduler_flag(key: str) -> str | None:
+    row = fetchone(q("SELECT flag_value FROM app_scheduler_flags WHERE flag_key = ?"), (key,))
+    return row[0] if row else None
+
+
+def set_scheduler_flag(key: str, value: str) -> None:
+    if IS_POSTGRES:
+        execute(
+            """
+            INSERT INTO app_scheduler_flags (flag_key, flag_value, updated_at)
+            VALUES (%s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (flag_key) DO UPDATE SET
+                flag_value = EXCLUDED.flag_value,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (key, value),
+        )
+    else:
+        execute(
+            q("""
+                INSERT INTO app_scheduler_flags (flag_key, flag_value, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(flag_key) DO UPDATE SET
+                    flag_value = excluded.flag_value,
+                    updated_at = CURRENT_TIMESTAMP
+            """),
+            (key, value),
+        )
+
+
+def mark_reg_stuck_notified(user_id: int) -> None:
+    execute(
+        q("UPDATE subscribers SET reg_stuck_notified_at = CURRENT_TIMESTAMP WHERE user_id = ?"),
+        (user_id,),
+    )
+
+
+def get_stuck_registrations(*, older_than_hours: int = 24) -> list[dict]:
+    """Профиль не завершён или нет категорий после анкеты."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=older_than_hours)
+    stuck: list[dict] = []
+    with db_conn(commit=False) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(f"""
+                SELECT user_id, username, first_name, user_role, registered_at
+                FROM subscribers
+                WHERE is_active = {bool_true()}
+                  AND (full_name IS NULL OR TRIM(full_name) = '')
+                  AND registered_at < ?
+                  AND (reg_stuck_notified_at IS NULL OR reg_stuck_notified_at < registered_at)
+            """),
+            (cutoff,),
+        )
+        for row in cur.fetchall():
+            stuck.append({
+                "user_id": row[0],
+                "username": row[1],
+                "first_name": row[2],
+                "user_role": row[3] or "candidate",
+                "registered_at": row[4],
+                "reason": "не завершил анкету",
+            })
+        cur.execute(
+            q(f"""
+                SELECT s.user_id, s.username, s.first_name, s.user_role, s.registered_at
+                FROM subscribers s
+                LEFT JOIN user_categories uc ON uc.user_id = s.user_id
+                WHERE s.is_active = {bool_true()}
+                  AND s.user_role = 'candidate'
+                  AND s.full_name IS NOT NULL AND TRIM(s.full_name) != ''
+                  AND s.phone IS NOT NULL AND TRIM(s.phone) != ''
+                  AND (s.reg_stuck_notified_at IS NULL OR s.reg_stuck_notified_at < s.registered_at)
+                GROUP BY s.user_id, s.username, s.first_name, s.user_role, s.registered_at
+                HAVING COUNT(uc.category_code) = 0
+                   AND MAX(s.registered_at) < ?
+            """),
+            (cutoff,),
+        )
+        for row in cur.fetchall():
+            stuck.append({
+                "user_id": row[0],
+                "username": row[1],
+                "first_name": row[2],
+                "user_role": row[3] or "candidate",
+                "registered_at": row[4],
+                "reason": "не выбрал категории",
+            })
+    return stuck
+
+
+def get_activity_digest_data(*, since_utc: datetime) -> dict:
+    events = count_bot_events_grouped_since(since_utc)
+    return {
+        "events": events,
+        "active_users_events": count_distinct_active_users_since(since_utc),
+        "active_users_seen": count_subscribers_last_seen_since(since_utc),
+        "responses": count_responses_since(since_utc),
+        "support": count_support_since(since_utc),
+        "complaints": count_complaints_since(since_utc),
+        "stats": get_admin_stats(),
     }
 
 

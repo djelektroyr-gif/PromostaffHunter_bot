@@ -63,11 +63,18 @@ async def send_push_digest_if_pending(bot: Bot, user_id: int) -> bool:
     if count <= 0:
         return False
     try:
+        from config import FORUM_TOPICS_ENABLED
+        from services.forum_topics import TOPIC_VACANCIES, topic_message_kwargs
+
+        extra = {}
+        if FORUM_TOPICS_ENABLED:
+            extra = topic_message_kwargs(user_id, TOPIC_VACANCIES)
         await bot.send_message(
             user_id,
             format_push_digest_message(count),
             parse_mode="Markdown",
             reply_markup=build_push_digest_keyboard(),
+            **extra,
         )
         clear_push_digest_pending(user_id)
         return True
