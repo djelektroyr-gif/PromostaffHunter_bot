@@ -71,6 +71,15 @@ def test_settings_markup_has_disable_feed():
     assert "disable_feed" in callbacks
 
 
+def test_user_category_advisory_lock_key_large_telegram_id():
+    from db import _user_category_advisory_lock_key
+
+    uid = 7_673_656_496  # prod: pg_advisory_xact_lock(1, uid) → UndefinedFunction
+    key = _user_category_advisory_lock_key(uid)
+    assert key > uid
+    assert key < 2**63
+
+
 def test_toggle_user_category_atomic():
     from db import get_user_categories, toggle_user_category
 

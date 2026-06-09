@@ -1547,9 +1547,17 @@ def set_user_categories(user_id: int, category_codes: list):
             )
 
 
+def _user_category_advisory_lock_key(user_id: int) -> int:
+    """Ключ для pg_advisory_xact_lock(bigint): Telegram user_id > int32 не влезает в (int, int)."""
+    return (1 << 40) | int(user_id)
+
+
 def _lock_user_categories(cur, user_id: int) -> None:
     if IS_POSTGRES:
-        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (1, int(user_id)))
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(%s::bigint)",
+            (_user_category_advisory_lock_key(user_id),),
+        )
     else:
         cur.execute("BEGIN IMMEDIATE")
 
