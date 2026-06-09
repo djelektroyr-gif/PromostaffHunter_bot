@@ -75,6 +75,18 @@ def test_channel_preview_no_publication_line():
     assert "на завтра" in text
 
 
+def test_preview_negotiated_rate_when_no_digits():
+    inp = VacancyCardInput(
+        category_code="driver",
+        category_name="Водитель",
+        category_emoji="🚐",
+        body="Ищу водителя на своём авто, по договорённости. @boss",
+        freshness="🟢 Свежая",
+    )
+    text = build_vacancy_preview_html(inp)
+    assert "договорённости" in text.lower()
+
+
 def test_preview_fallback_when_sparse_body():
     inp = VacancyCardInput(
         category_code="promoter",

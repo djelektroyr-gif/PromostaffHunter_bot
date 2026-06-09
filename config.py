@@ -24,6 +24,11 @@ VACANCY_MAX_AGE_HOURS = int(os.getenv("VACANCY_MAX_AGE_HOURS", "36"))
 # Лента «Посмотреть новые»: свежие (ч) и архив (макс. возраст, ч)
 FEED_FRESH_HOURS = int(os.getenv("FEED_FRESH_HOURS", "24"))
 FEED_ARCHIVE_MAX_HOURS = int(os.getenv("FEED_ARCHIVE_MAX_HOURS", "168"))
+# История доставленных вакансий (ч) — «📜 История»
+FEED_HISTORY_MAX_HOURS = int(os.getenv("FEED_HISTORY_MAX_HOURS", "720"))
+
+# Premium: заявок на добавление канала в мониторинг (шт. / 24 ч)
+CHAT_SUGGEST_DAILY_LIMIT = int(os.getenv("CHAT_SUGGEST_DAILY_LIMIT", "3"))
 
 # Пробный Premium при первой регистрации (дней, 0 = отключить)
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))

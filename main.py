@@ -36,7 +36,7 @@ from config import (
     SUBSCRIPTION_PRICE_RUB, SUBSCRIPTION_CARD_HINT, TRIAL_DAYS, PREMIUM_RENEWAL_REMIND_DAYS,
     FREE_CATEGORY_LIMIT,
     VACANCY_MAX_AGE_HOURS,
-    FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS,
+    FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS, FEED_HISTORY_MAX_HOURS,
     FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID,
     LLM_ENABLED, LLM_DAILY_LIMIT_PREMIUM, STARS_ENABLED, STARS_EXTENDED_RESPONSE_PRICE,
 )
@@ -277,9 +277,12 @@ storage = create_fsm_storage()
 dp = Dispatcher(storage=storage)
 
 from handlers.premium_filters import router as premium_filters_router
+from handlers.chat_suggestions import router as chat_suggestions_router, BTN_SUGGEST_CHAT
 
 if premium_filters_router.parent_router is None:
     dp.include_router(premium_filters_router)
+if chat_suggestions_router.parent_router is None:
+    dp.include_router(chat_suggestions_router)
 
 # Flood control для рассылки (пауза между отправками)
 SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
@@ -430,9 +433,9 @@ def build_vacancy_keyboard(
 ) -> InlineKeyboardMarkup:
     """Полная карточка: отклик, карта, свернуть."""
     if responded:
-        buttons = [[InlineKeyboardButton(text="✅ Отклик отправлен", callback_data="already_responded")]]
+        buttons = [[_inline_btn("✅ Отклик отправлен", callback_data="already_responded")]]
     else:
-        buttons = [[_inline_btn("Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
+        buttons = [[_inline_btn("✅ Откликнуться", callback_data=f"respond_{vacancy_id}", style="success")]]
     maps_url = build_maps_url(
         address,
         address_normalized=address_normalized,
@@ -440,10 +443,10 @@ def build_vacancy_keyboard(
         location_lon=location_lon,
     )
     if maps_url:
-        buttons.append([_inline_btn("На карте", url=maps_url, style="primary")])
+        buttons.append([_inline_btn("🗺 На карте", url=maps_url, style="primary")])
     buttons.append([
-        _inline_btn("Не подходит", callback_data=f"notfit_{vacancy_id}"),
-        _inline_btn("Жалоба", callback_data=f"complain_{vacancy_id}", style="danger"),
+        _inline_btn("🟡 Не подходит", callback_data=f"notfit_{vacancy_id}"),
+        _inline_btn("⚠️ Жалоба", callback_data=f"complain_{vacancy_id}", style="danger"),
     ])
     if collapsed:
         buttons.append([_inline_btn("◀️ Свернуть", callback_data=f"vac_close_{vacancy_id}")])
@@ -1457,12 +1460,16 @@ class ChannelPromoTextState(StatesGroup):
 class AdminGiftPremiumState(StatesGroup):
     waiting_for_days = State()
 
+
+class HistorySearchState(StatesGroup):
+    waiting_for_query = State()
+
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
     emojis = {
         "promoter": "📢", "hostess": "👩‍💼", "wardrobe": "🧥", "animator": "🎭",
-        "helper": "👷", "loader": "📦", "waiter": "🍽️", "driver": "🚐",
+        "helper": "👷", "loader": "📦", "handyman": "🧹", "waiter": "🍽️", "driver": "🚐",
         "security": "🛡️", "parking": "🚗", "supervisor": "👨‍💼"
     }
     return emojis.get(category_code, "📌")
@@ -1472,6 +1479,7 @@ def get_category_name(category_code: str) -> str:
     names = {
         "promoter": "Промоутер", "hostess": "Хостес", "wardrobe": "Гардеробщик",
         "animator": "Аниматор", "helper": "Хелпер", "loader": "Грузчик",
+        "handyman": "Разнорабочий / клининг",
         "waiter": "Официант", "driver": "Водитель", "security": "Охранник",
         "parking": "Парковщик", "supervisor": "Супервайзер",
     }
@@ -1500,7 +1508,18 @@ def build_user_help_html(user_id: int) -> str:
     if not premium and not trial_used and TRIAL_DAYS > 0:
         trial_block = (
             f"\n\n🎁 После «✅ Завершить выбор» категорий — пробный Premium "
-            f"<b>{TRIAL_DAYS} дн.</b> (push + метро)."
+            f"<b>{TRIAL_DAYS} дн.</b> (push + фильтры)."
+        )
+
+    premium_extra = ""
+    if premium:
+        from config import CHAT_SUGGEST_DAILY_LIMIT
+        premium_extra = (
+            f"\n\n<b>9. Предложить канал (Premium)</b>\n"
+            f"«⚙️ Настройки» → «📡 Предложить канал» — отправьте @username или ссылку "
+            f"на Telegram-чат с вакансиями. Заявка уходит администратору; после проверки "
+            f"канал добавляют в мониторинг или сообщат причину отказа. "
+            f"Не более {CHAT_SUGGEST_DAILY_LIMIT} заявок в сутки."
         )
 
     return (
@@ -1509,26 +1528,35 @@ def build_user_help_html(user_id: int) -> str:
         "и показывает только те роли, которые вы выбрали.\n\n"
         "<b>1. Настройки</b>\n"
         f"Кнопка «⚙️ Настройки» — категории вакансий "
-        f"(хелпер, промо, грузчик…). Free: {_free_category_hint_short()}, "
+        f"(промо, хелпер, грузчик, разнорабочий/клининг 🧹 и др.). "
+        f"Free: {_free_category_hint_short()}, "
         f"2+ категории — Premium.\n"
+        "«🎯 Фильтры Premium» — geo, ставка, режим push (только Premium).\n"
         "Нажмите «✅ Завершить выбор». Отключить рассылку — «🔕 Отключить рассылку».\n\n"
         "<b>2. Смотреть вакансии</b>\n"
-        "«🔍 Посмотреть новые вакансии» — лента по вашим категориям. "
-        "Можно выбрать одну категорию или «Все».\n\n"
+        "«🔍 Посмотреть новые вакансии» — выберите период:\n"
+        "• <b>📋 Все за 7 дн.</b> — всё непросмотренное по категориям;\n"
+        "• <b>🟢 Свежие</b> — за последние 24 ч;\n"
+        "• <b>📂 Вчера и ранее</b> — архив до 7 дней;\n"
+        "• <b>📜 История</b> — вакансии, которые уже приходили в push/ленту "
+        "(до 30 дн.), с поиском по тексту.\n"
+        "На карточке: «✅ Откликнуться», «🟡 Не подходит», «⚠️ Жалоба». "
+        "Ставка «по договорённости» показывается, если в посте нет цифры.\n\n"
         "<b>3. Push-уведомления</b>\n"
         f"{push_block}{trial_block}\n\n"
         "<b>4. Отклик на вакансию</b>\n"
-        "На карточке — «✋ Откликнуться». Бот отправит заказчику вашу анкету "
+        "На карточке — «✅ Откликнуться». Бот отправит заказчику вашу анкету "
         "(ФИО, возраст, телефон, фото если добавляли).\n\n"
         "<b>5. Мои отклики</b>\n"
         "«📨 Мои отклики» — история, статус вакансии, ссылка на пост.\n\n"
-        "<b>6. Районы (Premium)</b>\n"
-        "«📍 Станции метро» в ⚙️ Настройках — push и лента только по выбранным станциям "
-        "(если метро в вакансии не указано — не отсекаем).\n\n"
+        "<b>6. Фильтры Premium</b>\n"
+        "«🎯 Фильтры Premium» в настройках — станции метро, минимальная ставка, "
+        "режим push по категориям; в ленте фильтры тоже учитываются (если включено).\n\n"
         "<b>7. Подписка</b>\n"
         "«💎 Подписка» — тариф, продление, оплата по реквизитам.\n\n"
         "<b>8. Мои данные</b>\n"
-        "«👤 Мои данные» — ФИО, телефон, фото и доп. информация для откликов. Можно редактировать.\n\n"
+        "«👤 Мои данные» — ФИО, телефон, фото и доп. информация для откликов. Можно редактировать."
+        f"{premium_extra}\n\n"
         "<b>Список команд</b>\n"
         "/help — эта инструкция\n"
         "/start — главное меню\n\n"
@@ -1564,7 +1592,10 @@ def build_admin_parser_help_html() -> str:
         "<b>Чаты и роли</b>\n"
         "• Чат с ❌ в списке — аккаунт парсера не в группе или нет доступа.\n"
         "• <code>/setchatroles @channel promoter,helper,loader</code> — ожидаемые роли для чата.\n"
-        "• <code>/addchat</code>, <code>/removechat</code> — добавить/убрать чат.\n\n"
+        "• <code>/addchat</code>, <code>/removechat</code> — добавить/убрать чат.\n"
+        "• <b>Заявки Premium</b> — push «📡 Новая заявка на мониторинг»: "
+        "«✅ Добавить» (в target_chats + уведомление пользователю) или "
+        "«❌ Отклонить» (короткая причина). После добавления проверьте Telethon в списке чатов.\n\n"
         "<b>Команды парсера</b>\n"
         "/check_now — ручная проверка · /audit_filter — аудит · /debug_last — отчёт"
     )
@@ -1583,6 +1614,8 @@ def build_admin_help_html() -> str:
         "• «💎 Запросы Premium» — чек на оплату, ✅ оплата или 🎁 подарок N дн.\n"
         "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
         "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения; push + кнопка «✉️ Ответить».\n"
+        "• Push «📡 Заявка на мониторинг канала» — от Premium-пользователей; "
+        "кнопки «✅ Добавить» / «❌ Отклонить».\n"
         "• «📣 Техсообщение» — рассылка в топик «❓ Поддержка» (техработы, важное).\n"
         "• /user USER_ID — карточка по ID · /setplan USER_ID premium 30 — выдать Premium.\n\n"
         "<b>📥 Excel</b>\n"
@@ -1882,6 +1915,10 @@ def _vacancy_age_hours(vac: dict) -> float | None:
 
 def _vacancy_in_feed_mode(vac: dict, feed_mode: str) -> bool:
     age = _vacancy_age_hours(vac)
+    if feed_mode == "all":
+        if age is None:
+            return True
+        return age <= FEED_ARCHIVE_MAX_HOURS
     if age is None:
         return feed_mode == "fresh"
     if feed_mode == "fresh":
@@ -2455,7 +2492,10 @@ def get_main_keyboard(user_id: int):
     return keyboard, status_text
 
 
-def get_settings_keyboard() -> ReplyKeyboardMarkup:
+def get_settings_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    if user_id is not None:
+        from handlers.chat_suggestions import get_settings_keyboard_for_user
+        return get_settings_keyboard_for_user(user_id)
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SETTINGS_CATEGORIES)],
@@ -2470,6 +2510,7 @@ USER_MENU_BUTTONS = {
     "🔍 Посмотреть новые вакансии",
     "📨 Мои отклики", BTN_SETTINGS, BTN_SETTINGS_LEGACY,
     BTN_SETTINGS_CATEGORIES, BTN_PREMIUM_FILTERS, BTN_METRO, BTN_SETTINGS_BACK,
+    BTN_SUGGEST_CHAT,
     "📍 Мои районы",
     "💎 Подписка", BTN_MY_DATA, BTN_MY_DATA_LEGACY,
     "📖 Как пользоваться", "❓ Поддержка",
@@ -3344,8 +3385,12 @@ async def finish_categories(callback: types.CallbackQuery):
         await safe_callback_answer(callback, "⏳ Оформляем…")
         categories_text = "\n".join([f"• {c['emoji']} {c['name']}" for c in categories])
         keyboard, _ = get_main_keyboard(user_id)
-        from services.chat_feedback import typing_keepalive
-        async with typing_keepalive(bot, callback.message.chat.id):
+        from services.chat_feedback import thread_id_from_message, typing_keepalive
+        async with typing_keepalive(
+            bot,
+            callback.message.chat.id,
+            message_thread_id=thread_id_from_message(callback.message),
+        ):
             trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
             await setup_forum_topics_for_user(user_id)
         trial_line = ""
@@ -3398,9 +3443,11 @@ def _response_status_label(is_closed: bool) -> str:
 
 async def send_responses_page(message: types.Message, user_id: int, page: int = 0):
     from services.response_cards import format_response_list_row, response_short_title
-    from services.chat_feedback import send_typing
+    from services.chat_feedback import send_typing, thread_id_from_message, topic_thread_id
+    from services.forum_topics import TOPIC_RESPONSES
 
-    await send_typing(bot, message.chat.id)
+    resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(message)
+    await send_typing(bot, message.chat.id, message_thread_id=resp_thread)
     total = count_user_responses(user_id)
     if total == 0:
         await message.answer(
@@ -3698,8 +3745,6 @@ def _feed_vacancies_for_category(
     for vac in vacancies:
         if not _vacancy_in_feed_mode(vac, feed_mode):
             continue
-        if not vacancy_matches_category(vac.get("text") or "", cat["code"]):
-            continue
         if apply_filters and not _vacancy_passes_feed_filters(vac, cat["code"], prefs):
             continue
         vac["category"] = cat
@@ -3733,26 +3778,82 @@ def _feed_count_for_category(
     return len(_feed_vacancies_for_category(user_id, cat, apply_filters, prefs, feed_mode))
 
 
-def _feed_mode_totals(user_id: int) -> tuple[int, int]:
+
+def _history_total_for_user(user_id: int, search: str | None = None) -> int:
+    total = 0
+    for cat in get_user_categories(user_id):
+        total += count_history_vacancies_for_user(
+            user_id, cat["code"], search=search, max_hours=FEED_HISTORY_MAX_HOURS,
+        )
+    return total
+
+
+def _history_vacancies_for_category(
+    user_id: int, cat: dict, search: str | None = None,
+) -> list:
+    rows = get_history_vacancies_for_user(
+        user_id, cat["code"], search=search, max_hours=FEED_HISTORY_MAX_HOURS,
+    )
+    for vac in rows:
+        vac["category"] = cat
+    return rows
+
+
+def _collect_history_vacancies(
+    user_id: int,
+    category_codes: list[str] | None = None,
+    search: str | None = None,
+) -> list:
+    user_categories = get_user_categories(user_id)
+    if category_codes is not None:
+        codes = set(category_codes)
+        user_categories = [c for c in user_categories if c["code"] in codes]
+    all_vacancies: list = []
+    for cat in user_categories:
+        all_vacancies.extend(_history_vacancies_for_category(user_id, cat, search))
+    all_vacancies.sort(key=lambda v: v.get("sent_at") or "", reverse=True)
+    return all_vacancies
+
+
+def _history_count_for_category(
+    user_id: int, cat: dict, search: str | None = None,
+) -> int:
+    return count_history_vacancies_for_user(
+        user_id, cat["code"], search=search, max_hours=FEED_HISTORY_MAX_HOURS,
+    )
+
+def _feed_mode_totals(user_id: int) -> tuple[int, int, int, int]:
     apply_filters, prefs = _feed_filter_context(user_id)
-    fresh_total = archive_total = 0
+    fresh_total = archive_total = all_total = history_total = 0
     for cat in get_user_categories(user_id):
         fresh_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "fresh")
         archive_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "archive")
-    return fresh_total, archive_total
+        all_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "all")
+        history_total += _history_count_for_category(user_id, cat)
+    return fresh_total, archive_total, all_total, history_total
 
 
-def build_feed_mode_keyboard(fresh_total: int, archive_total: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def build_feed_mode_keyboard(fresh_total: int, archive_total: int, all_total: int, history_total: int,) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📋 Все за {FEED_ARCHIVE_MAX_HOURS // 24} дн. ({all_total})",
+            callback_data="feed_mode_all",
+        )],
         [InlineKeyboardButton(
             text=f"🟢 Свежие до {FEED_FRESH_HOURS} ч ({fresh_total})",
             callback_data="feed_mode_fresh",
         )],
         [InlineKeyboardButton(
-            text=f"📂 Ранее {FEED_FRESH_HOURS}–{FEED_ARCHIVE_MAX_HOURS // 24} дн. ({archive_total})",
+            text=f"📂 Вчера и ранее ({archive_total})",
             callback_data="feed_mode_archive",
         )],
-    ])
+    ]
+    if history_total > 0:
+        rows.append([InlineKeyboardButton(
+            text=f"📜 История ({history_total})",
+            callback_data="feed_mode_history",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKeyboardMarkup, int]:
@@ -3760,7 +3861,7 @@ def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKe
     apply_filters, prefs = _feed_filter_context(user_id)
     buttons, row = [], []
     total = 0
-    mode_label = "свежие" if feed_mode == "fresh" else "ранее"
+    mode_label = {"fresh": "свежие", "archive": "ранее", "all": "все"}.get(feed_mode, "все")
     for i, cat in enumerate(user_categories):
         count = _feed_count_for_category(user_id, cat, apply_filters, prefs, feed_mode)
         total += count
@@ -3780,27 +3881,124 @@ def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKe
     return InlineKeyboardMarkup(inline_keyboard=buttons), total
 
 
+def build_history_category_keyboard(
+    user_id: int, search: str | None = None,
+) -> tuple[InlineKeyboardMarkup, int]:
+    user_categories = get_user_categories(user_id)
+    buttons, row = [], []
+    total = 0
+    for i, cat in enumerate(user_categories):
+        count = _history_count_for_category(user_id, cat, search)
+        total += count
+        row.append(InlineKeyboardButton(
+            text=f"{cat['emoji']} {cat['name']} ({count})",
+            callback_data=f"feed_history_{cat['code']}",
+        ))
+        if len(row) == 2 or i == len(user_categories) - 1:
+            buttons.append(row)
+            row = []
+    if total > 0:
+        buttons.append([InlineKeyboardButton(
+            text=f"📋 Вся история ({total})",
+            callback_data="feed_history_all",
+        )])
+    search_label = "🔎 Изменить поиск" if search else "🔎 Поиск по тексту"
+    buttons.append([InlineKeyboardButton(text=search_label, callback_data="history_search_start")])
+    if search:
+        buttons.append([InlineKeyboardButton(
+            text="✖️ Сбросить поиск", callback_data="history_search_clear",
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Период", callback_data="feed_pick_mode")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons), total
+
+
+async def show_history_category_menu(
+    message: types.Message, user_id: int, search: str | None = None,
+):
+    user_categories = get_user_categories(user_id)
+    if not user_categories:
+        await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
+        return
+    markup, total = build_history_category_keyboard(user_id, search)
+    days = FEED_HISTORY_MAX_HOURS // 24
+    search_hint = f"\n🔎 Поиск: «{search}»" if search else ""
+    if total == 0:
+        await message.answer(
+            f"📜 *История* за {days} дн. пуста.{search_hint}\n\n"
+            "Сюда попадают вакансии из push и просмотренной ленты.",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
+    await message.answer(
+        f"📜 *История* ({total} за {days} дн.) — выберите категорию:{search_hint}",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+async def open_history_vacancies(
+    message: types.Message,
+    user_id: int,
+    category_codes: list[str] | None = None,
+    search: str | None = None,
+):
+    from services.chat_feedback import topic_thread_id, thread_id_from_message, typing_keepalive
+    from services.forum_topics import TOPIC_VACANCIES
+
+    feed_thread = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
+    async with typing_keepalive(bot, message.chat.id, message_thread_id=feed_thread):
+        all_vacancies = _collect_history_vacancies(user_id, category_codes, search)
+    if not all_vacancies:
+        hint = f"\n🔎 Поиск: «{search}»" if search else ""
+        await message.answer(f"📜 В истории ничего не найдено.{hint}", parse_mode="Markdown")
+        return
+    user_pages[user_id] = {
+        "vacancies": all_vacancies,
+        "page": 0,
+        "total": len(all_vacancies),
+        "feed_filter": category_codes,
+        "feed_mode": "history",
+        "history_search": search,
+    }
+    _cache_user_feed(user_id, user_pages[user_id])
+    from services.bot_events import EVENT_FEED_OPEN, record_bot_event
+    record_bot_event(user_id, EVENT_FEED_OPEN, {"mode": "history", "search": search or ""})
+    await send_vacancy_page(message, user_id, 0)
+
+
 async def show_feed_mode_menu(message: types.Message, user_id: int):
     user_categories = get_user_categories(user_id)
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
-    fresh_total, archive_total = _feed_mode_totals(user_id)
+    fresh_total, archive_total, all_total, history_total = _feed_mode_totals(user_id)
     apply_filters, _ = _feed_filter_context(user_id)
     hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
-    if fresh_total == 0 and archive_total == 0:
+    if fresh_total == 0 and archive_total == 0 and all_total == 0 and history_total == 0:
         await message.answer(
             f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
             f"{'💎 Premium — push сразу в чат.' if is_user_premium(user_id) else 'Я продолжаю мониторинг.'}",
             parse_mode="Markdown",
         )
         return
+    if fresh_total == 0 and archive_total == 0 and all_total == 0 and history_total > 0:
+        await message.answer(
+            f"🔍 *Новых вакансий пока нет*, но в истории — {history_total} "
+            f"за последние {FEED_HISTORY_MAX_HOURS // 24} дн.{hint}",
+            parse_mode="Markdown",
+            reply_markup=build_feed_mode_keyboard(
+                fresh_total, archive_total, all_total, history_total,
+            ),
+        )
+        return
     await message.answer(
         f"🔍 *Лента вакансий* — выберите период:{hint}\n\n"
+        f"📋 *Все за {FEED_ARCHIVE_MAX_HOURS // 24} дн.* — включая вчера вечером и сегодня утром.\n"
         f"🟢 *Свежие* — опубликованы за последние {FEED_FRESH_HOURS} ч.\n"
-        f"📂 *Ранее* — от {FEED_FRESH_HOURS} ч до {FEED_ARCHIVE_MAX_HOURS // 24} дн.",
+        f"📂 *Вчера и ранее* — от {FEED_FRESH_HOURS} ч до {FEED_ARCHIVE_MAX_HOURS // 24} дн.",
         parse_mode="Markdown",
-        reply_markup=build_feed_mode_keyboard(fresh_total, archive_total),
+        reply_markup=build_feed_mode_keyboard(fresh_total, archive_total, all_total, history_total),
     )
 
 
@@ -3812,7 +4010,11 @@ async def show_feed_category_menu(message: types.Message, user_id: int, feed_mod
     markup, total = build_feed_category_keyboard(user_id, feed_mode)
     apply_filters, _ = _feed_filter_context(user_id)
     hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
-    mode_title = f"🟢 Свежие ({FEED_FRESH_HOURS} ч)" if feed_mode == "fresh" else "📂 Ранее"
+    mode_title = {
+        "fresh": f"🟢 Свежие ({FEED_FRESH_HOURS} ч)",
+        "archive": "📂 Вчера и ранее",
+        "all": f"📋 Все за {FEED_ARCHIVE_MAX_HOURS // 24} дн.",
+    }.get(feed_mode, f"📋 Все за {FEED_ARCHIVE_MAX_HOURS // 24} дн.")
     if total == 0:
         await message.answer(
             f"{mode_title} — в этой категории вакансий нет.{hint}\n\n"
@@ -3836,9 +4038,11 @@ async def open_feed_vacancies(
     feed_mode: str,
     category_codes: list[str] | None = None,
 ):
-    from services.chat_feedback import typing_keepalive
+    from services.chat_feedback import topic_thread_id, thread_id_from_message, typing_keepalive
+    from services.forum_topics import TOPIC_VACANCIES
 
-    async with typing_keepalive(bot, message.chat.id):
+    feed_thread = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
+    async with typing_keepalive(bot, message.chat.id, message_thread_id=feed_thread):
         all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
     if not all_vacancies:
         apply_filters, _ = _feed_filter_context(user_id)
@@ -3872,10 +4076,17 @@ async def feed_pick_mode_callback(callback: types.CallbackQuery):
     await show_feed_mode_menu(callback.message, callback.from_user.id)
 
 
-@dp.callback_query(lambda c: c.data in {"feed_mode_fresh", "feed_mode_archive"})
+@dp.callback_query(lambda c: c.data in {"feed_mode_fresh", "feed_mode_archive", "feed_mode_all", "feed_mode_history"})
 async def feed_mode_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
-    mode = "fresh" if callback.data == "feed_mode_fresh" else "archive"
+    mode = "fresh"
+    if callback.data == "feed_mode_archive":
+        mode = "archive"
+    elif callback.data == "feed_mode_all":
+        mode = "all"
+    elif callback.data == "feed_mode_history":
+        await show_history_category_menu(callback.message, callback.from_user.id)
+        return
     await show_feed_category_menu(callback.message, callback.from_user.id, mode)
 
 
@@ -3889,6 +4100,16 @@ async def feed_fresh_routes(callback: types.CallbackQuery):
         await open_feed_vacancies(callback.message, callback.from_user.id, "fresh", [suffix])
 
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("feed_all_"))
+async def feed_all_routes(callback: types.CallbackQuery):
+    await safe_callback_answer(callback, "Загружаю ленту…")
+    suffix = callback.data.replace("feed_all_", "", 1)
+    if suffix == "all":
+        await open_feed_vacancies(callback.message, callback.from_user.id, "all", None)
+    else:
+        await open_feed_vacancies(callback.message, callback.from_user.id, "all", [suffix])
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("feed_archive_"))
 async def feed_archive_routes(callback: types.CallbackQuery):
     await safe_callback_answer(callback, "Загружаю архив…")
@@ -3899,17 +4120,78 @@ async def feed_archive_routes(callback: types.CallbackQuery):
         await open_feed_vacancies(callback.message, callback.from_user.id, "archive", [suffix])
 
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("feed_history_"))
+async def feed_history_routes(callback: types.CallbackQuery):
+    await safe_callback_answer(callback, "Загружаю историю…")
+    suffix = callback.data.replace("feed_history_", "", 1)
+    data = _get_user_feed(callback.from_user.id) or {}
+    search = data.get("history_search")
+    if suffix == "all":
+        await open_history_vacancies(callback.message, callback.from_user.id, None, search)
+    else:
+        await open_history_vacancies(callback.message, callback.from_user.id, [suffix], search)
+
+
+@dp.callback_query(lambda c: c.data == "history_search_start")
+async def history_search_start_callback(callback: types.CallbackQuery, state: FSMContext):
+    await safe_callback_answer(callback)
+    await state.set_state(HistorySearchState.waiting_for_query)
+    await callback.message.answer(
+        "🔎 Введите слово или фразу для поиска по тексту вакансий в истории "
+        f"(за {FEED_HISTORY_MAX_HOURS // 24} дн.).\n"
+        "Отмена — /cancel",
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(lambda c: c.data == "history_search_clear")
+async def history_search_clear_callback(callback: types.CallbackQuery):
+    await safe_callback_answer(callback, "Поиск сброшен")
+    uid = callback.from_user.id
+    data = _get_user_feed(uid) or {}
+    if data:
+        data = {**data, "history_search": None}
+        _cache_user_feed(uid, data)
+    await show_history_category_menu(callback.message, uid)
+
+
+@dp.message(HistorySearchState.waiting_for_query)
+async def history_search_query_message(message: types.Message, state: FSMContext):
+    if message.text and message.text.strip().lower() in ("/cancel", "отмена"):
+        await state.clear()
+        await message.answer("Поиск отменён.")
+        await show_history_category_menu(message, message.from_user.id)
+        return
+    query = (message.text or "").strip()
+    if len(query) < 2:
+        await message.answer("Минимум 2 символа. Попробуйте ещё или /cancel")
+        return
+    await state.clear()
+    uid = message.from_user.id
+    data = _get_user_feed(uid) or {}
+    data = {**data, "history_search": query, "feed_mode": "history"}
+    _cache_user_feed(uid, data)
+    await show_history_category_menu(message, uid, query)
+
+
 @dp.callback_query(lambda c: c.data == "feed_menu")
 async def feed_menu_callback(callback: types.CallbackQuery):
     await safe_callback_answer(callback)
     data = _get_user_feed(callback.from_user.id) or {}
     mode = data.get("feed_mode") or "fresh"
-    await show_feed_category_menu(callback.message, callback.from_user.id, mode)
+    if mode == "history":
+        await show_history_category_menu(
+            callback.message, callback.from_user.id, data.get("history_search"),
+        )
+    else:
+        await show_feed_category_menu(callback.message, callback.from_user.id, mode)
 
 
 async def send_vacancy_page(message: types.Message, user_id: int, page: int):
-    from services.chat_feedback import typing_keepalive
+    from services.chat_feedback import topic_thread_id, thread_id_from_message, typing_keepalive
+    from services.forum_topics import TOPIC_VACANCIES
 
+    feed_thread = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
     data = _get_user_feed(user_id)
     if not data:
         await _offer_feed_session_restart(message)
@@ -3923,8 +4205,13 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         await message.answer("📭 Это последняя страница.")
         return
 
-    await message.answer(f"📬 *Вакансии (страница {page+1} из {(total-1)//10 + 1})*", parse_mode="Markdown")
-    async with typing_keepalive(bot, message.chat.id):
+    feed_mode = data.get("feed_mode") or "fresh"
+    header = "📜 История" if feed_mode == "history" else "📬 Вакансии"
+    await message.answer(
+        f"{header} (страница {page+1} из {(total-1)//10 + 1})",
+        parse_mode="Markdown",
+    )
+    async with typing_keepalive(bot, message.chat.id, message_thread_id=feed_thread):
         for vac in vacancies[start:end]:
             raw_pub = vac.get('published_at') or vac.get('found_at')
             cat_code = vac.get("category_code") or "promoter"
@@ -3943,7 +4230,8 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
             keyboard = build_vacancy_preview_keyboard(vac["id"], **_map_fields_from_vacancy(vac))
             try:
                 await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
-                try_reserve_vacancy_sent_to_user(vac["id"], user_id)
+                if feed_mode != "history":
+                    try_reserve_vacancy_sent_to_user(vac["id"], user_id)
                 await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"Ошибка отправки вакансии: {e}")
@@ -4222,7 +4510,7 @@ async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> boo
     elif text == BTN_SETTINGS_CATEGORIES:
         await send_category_picker(message.chat.id, user_id)
     elif text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
-        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard())
+        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard(user_id))
     elif text in {BTN_PREMIUM_FILTERS, BTN_METRO, "📍 Мои районы"}:
         from handlers.premium_filters import show_premium_filters_screen
         await show_premium_filters_screen(message, user_id)
@@ -4309,10 +4597,11 @@ async def open_settings_menu(message: types.Message, state: FSMContext):
     await message.answer(
         "⚙️ *Настройки*\n\n"
         "• 📌 *Категории* — какие вакансии присылать\n"
-        "• 📍 *Станции метро* — фильтр локаций (Premium)\n\n"
-        "Выберите пункт ниже.",
+        "• 🎯 *Фильтры Premium* — geo, ставка, push\n"
+        + ("• 📡 *Предложить канал* — заявка на мониторинг нового чата (Premium)\n" if is_user_premium(message.from_user.id) else "")
+        + "\nВыберите пункт ниже.",
         parse_mode="Markdown",
-        reply_markup=get_settings_keyboard(),
+        reply_markup=get_settings_keyboard(message.from_user.id),
     )
 
 
@@ -5017,6 +5306,7 @@ async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Вакансия неактуальна/закрыта", callback_data="complaint_reason_closed")],
+            [InlineKeyboardButton(text="🏷 Не та категория/роль", callback_data="complaint_reason_wrong_category")],
             [InlineKeyboardButton(text="🤬 Грубость/неуважение", callback_data="complaint_reason_rude")],
             [InlineKeyboardButton(text="📛 Мошенничество/обман", callback_data="complaint_reason_scam")],
             [InlineKeyboardButton(text="📝 Другое (напишу)", callback_data="complaint_reason_other")]
@@ -5029,6 +5319,7 @@ async def start_complaint(callback: types.CallbackQuery, state: FSMContext):
 async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
     reason_map = {
         "complaint_reason_closed": "Вакансия неактуальна/закрыта",
+        "complaint_reason_wrong_category": "Не та категория/роль",
         "complaint_reason_rude": "Грубость/неуважение",
         "complaint_reason_scam": "Мошенничество/обман",
         "complaint_reason_other": "Другое"
@@ -5125,10 +5416,11 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
     await callback.answer("Готовлю черновик…")
     from services.forum_topics import TOPIC_RESPONSES
-    from services.chat_feedback import typing_keepalive
+    from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
+    resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
     draft_status = "failed"
     try:
-        async with typing_keepalive(bot, callback.message.chat.id):
+        async with typing_keepalive(bot, callback.message.chat.id, message_thread_id=resp_thread):
             draft_status = await deliver_response_draft(
                 user_id,
                 employer_contact=employer_contact,
@@ -5225,10 +5517,11 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     vacancy_text = row[0] or ""
     employer_contact = row[3] or extract_contact_from_text(vacancy_text)
     await callback.answer("Составляю текст…")
-    from services.chat_feedback import typing_keepalive
+    from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
     from services.llm_client import ask_llm
     from services.llm_prompts import build_response_draft_prompt
     from services.forum_topics import TOPIC_RESPONSES
+    resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
     cat_row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
     cat_code = cat_row[0] if cat_row else "promoter"
     prompt = build_response_draft_prompt(
@@ -5236,7 +5529,7 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         category_name=get_category_name(cat_code),
         profile_summary=build_candidate_profile_text(profile),
     )
-    async with typing_keepalive(bot, callback.message.chat.id):
+    async with typing_keepalive(bot, callback.message.chat.id, message_thread_id=resp_thread):
         draft = await ask_llm(prompt)
     if not draft:
         await send_user_message(

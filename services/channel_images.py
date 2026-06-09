@@ -23,6 +23,11 @@ _DEFAULT_CHANNEL_IMAGES_DIR = _PROJECT_ROOT / "assets" / "channel_images"
 # По 3 варианта на категорию — ротация 1→2→3→1 при каждой публикации в канал
 # (см. next_vacancy_image_variant_index + count_published_channel_vacancy_posts).
 VACANCY_IMAGES_BY_CATEGORY: dict[str, list[str]] = {
+    "handyman": [
+        "vacancy-loader-1.png",
+        "vacancy-loader-2.png",
+        "vacancy-loader-3.png",
+    ],
     "loader": [
         "vacancy-loader-1.png",
         "vacancy-loader-2.png",

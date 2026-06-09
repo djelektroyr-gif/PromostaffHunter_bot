@@ -146,3 +146,59 @@ async def notify_admin_complaint(
         )
     except Exception as e:
         logger.warning("notify_admin_complaint #%s: %s", complaint_id, e)
+
+
+def chat_suggestion_action_keyboard(suggestion_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Добавить",
+                callback_data=f"chs_ok:{suggestion_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"chs_no:{suggestion_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="👤 Карточка",
+                callback_data=f"adm_u_{user_id}_0",
+            ),
+        ],
+    ])
+
+
+async def notify_admin_chat_suggestion(
+    bot,
+    *,
+    suggestion_id: int,
+    user_id: int,
+    username: str | None,
+    chat_link: str,
+    chat_title: str | None = None,
+    probe: dict | None = None,
+) -> None:
+    if not YOUR_USER_ID:
+        return
+    from services.chat_suggest_flow import format_admin_chat_suggestion_html
+
+    text = format_admin_chat_suggestion_html(
+        suggestion_id=suggestion_id,
+        user_id=user_id,
+        username=username,
+        chat_link=chat_link,
+        chat_title=chat_title,
+        probe=probe,
+    )
+    markup = chat_suggestion_action_keyboard(suggestion_id, user_id)
+    try:
+        await bot.send_message(
+            YOUR_USER_ID,
+            text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning("notify_admin_chat_suggestion #%s: %s", suggestion_id, e)

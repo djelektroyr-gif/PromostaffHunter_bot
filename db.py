@@ -600,6 +600,28 @@ def init_db():
         """)
 
         cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS chat_suggestions (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                user_username TEXT,
+                chat_link TEXT NOT NULL,
+                chat_title TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                admin_note TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                resolved_at TIMESTAMP DEFAULT NULL
+            )
+        """)
+        cur.execute(
+            q(
+                "CREATE INDEX IF NOT EXISTS idx_chat_suggestions_pending "
+                "ON chat_suggestions (chat_link) WHERE status = 'pending'"
+            )
+            if IS_POSTGRES
+            else "CREATE INDEX IF NOT EXISTS idx_chat_suggestions_pending ON chat_suggestions (chat_link, status)"
+        )
+
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS target_chats (
                 id {serial_pk()},
                 chat_link TEXT UNIQUE,
@@ -643,11 +665,14 @@ def init_db():
                 ("security", "Охранник", "🛡️"),
                 ("parking", "Парковщик", "🚗"),
                 ("supervisor", "Супервайзер", "👨‍💼"),
+                ("handyman", "Разнорабочий / клининг", "🧹"),
             ]
             cur.executemany(
                 q("INSERT INTO categories (code, name, emoji) VALUES (?, ?, ?)"),
                 categories,
             )
+
+        _ensure_core_categories(cur)
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS last_processed (
@@ -703,6 +728,23 @@ CHANNEL_SETTING_DEFAULTS = {
     "quiet_hour_end": "22",
     "promo_times": "09:00,14:00,20:00",
 }
+
+
+def _ensure_core_categories(cur) -> None:
+    """Добавляет категории, появившиеся после первого деплоя."""
+    extras = [
+        ("handyman", "Разнорабочий / клининг", "🧹"),
+    ]
+    for code, name, emoji in extras:
+        cur.execute(
+            q(
+                """
+                INSERT INTO categories (code, name, emoji) VALUES (?, ?, ?)
+                ON CONFLICT(code) DO NOTHING
+                """
+            ),
+            (code, name, emoji),
+        )
 
 
 def _seed_channel_settings(cur):
@@ -1044,15 +1086,19 @@ def release_promo_slot(promo_slot: str, sent_date: str) -> None:
 
 
 def add_subscriber(user_id: int, username: str, first_name: str, last_name: str = None):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
     execute(f"""
-        INSERT INTO subscribers (user_id, username, first_name, last_name, is_active)
-        VALUES (?, ?, ?, ?, {bool_true()})
+        INSERT INTO subscribers (user_id, username, first_name, last_name, is_active, last_seen_at)
+        VALUES (?, ?, ?, ?, {bool_true()}, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
-            is_active = {bool_true()}
-    """, (user_id, username, first_name, last_name))
+            is_active = {bool_true()},
+            last_seen_at = excluded.last_seen_at
+    """, (user_id, username, first_name, last_name, now))
 
 
 def update_subscriber_profile(
@@ -2385,6 +2431,85 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
     ]
 
 
+def _history_sent_since_sql(hours: int) -> str:
+    days = max(1, (hours + 23) // 24)
+    return now_minus_days(days)
+
+
+def get_history_vacancies_for_user(
+    user_id: int,
+    category_code: str,
+    *,
+    search: str | None = None,
+    max_hours: int = 720,
+    limit: int = 300,
+) -> list:
+    """Вакансии, которые уже доставляли пользователю (push/лента)."""
+    params: list = [user_id, category_code]
+    search_sql = ""
+    if search and search.strip():
+        search_sql = " AND LOWER(v.message_text) LIKE LOWER(?)"
+        params.append(f"%{search.strip()}%")
+    params.append(limit)
+    rows = fetchall(
+        f"""
+        SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
+               v.author_contact, v.address, v.found_at, v.published_at,
+               v.address_normalized, v.location_lat, v.location_lon,
+               v.category_code, v.geo_tags, v.rate_hourly, v.rate_shift, v.rate_effective_hourly,
+               v.shift_date, v.shift_time_start, v.is_closed, sv.sent_at
+        FROM sent_vacancies sv
+        JOIN vacancies v ON v.id = sv.vacancy_id
+        WHERE sv.user_id = ? AND v.category_code = ?
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
+          AND sv.sent_at >= {_history_sent_since_sql(max_hours)}
+          {search_sql}
+        ORDER BY sv.sent_at DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    )
+    return [
+        {
+            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
+            "found_at": r[6], "published_at": r[7],
+            "address_normalized": r[8], "location_lat": r[9], "location_lon": r[10],
+            "category_code": r[11], "geo_tags": r[12],
+            "rate_hourly": r[13], "rate_shift": r[14], "rate_effective_hourly": r[15],
+            "shift_date": r[16], "shift_time_start": r[17],
+            "is_closed": bool(r[18]) if r[18] is not None else False,
+            "sent_at": r[19],
+        }
+        for r in rows
+    ]
+
+
+def count_history_vacancies_for_user(
+    user_id: int,
+    category_code: str,
+    *,
+    search: str | None = None,
+    max_hours: int = 720,
+) -> int:
+    params: list = [user_id, category_code]
+    search_sql = ""
+    if search and search.strip():
+        search_sql = " AND LOWER(v.message_text) LIKE LOWER(?)"
+        params.append(f"%{search.strip()}%")
+    return fetchval(
+        f"""
+        SELECT COUNT(*) FROM sent_vacancies sv
+        JOIN vacancies v ON v.id = sv.vacancy_id
+        WHERE sv.user_id = ? AND v.category_code = ?
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
+          AND sv.sent_at >= {_history_sent_since_sql(max_hours)}
+          {search_sql}
+        """,
+        tuple(params),
+        default=0,
+    )
+
+
 def get_feed_vacancies_by_ids(vacancy_ids: list[str]) -> list[dict]:
     """Вакансии для восстановления ленты после рестарта (порядок ids сохраняется)."""
     if not vacancy_ids:
@@ -3058,6 +3183,166 @@ def remove_target_chat(chat_link: str):
     execute(f"UPDATE target_chats SET is_active = {bool_false()} WHERE chat_link = ?", (chat_link,))
 
 
+def target_chat_is_active(chat_link: str) -> bool:
+    if not table_exists("target_chats"):
+        return False
+    row = fetchone(
+        f"SELECT is_active FROM target_chats WHERE chat_link = ?",
+        (chat_link,),
+    )
+    return bool(row and row[0])
+
+
+def activate_target_chat(chat_link: str) -> bool:
+    """Добавить чат в мониторинг или снова включить is_active."""
+    if not table_exists("target_chats"):
+        return False
+    if target_chat_is_active(chat_link):
+        return True
+    row = fetchone("SELECT id FROM target_chats WHERE chat_link = ?", (chat_link,))
+    if row:
+        execute(
+            f"UPDATE target_chats SET is_active = {bool_true()} WHERE chat_link = ?",
+            (chat_link,),
+        )
+        return True
+    try:
+        execute("INSERT INTO target_chats (chat_link) VALUES (?)", (chat_link,))
+        return True
+    except IntegrityError:
+        execute(
+            f"UPDATE target_chats SET is_active = {bool_true()} WHERE chat_link = ?",
+            (chat_link,),
+        )
+        return True
+
+
+def _chat_suggestion_row(row) -> dict | None:
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "user_username": row[2],
+        "chat_link": row[3],
+        "chat_title": row[4],
+        "status": row[5],
+        "admin_note": row[6],
+        "created_at": row[7],
+        "resolved_at": row[8],
+    }
+
+
+def get_chat_suggestion(suggestion_id: int) -> dict | None:
+    if not table_exists("chat_suggestions"):
+        return None
+    row = fetchone(
+        """
+        SELECT id, user_id, user_username, chat_link, chat_title, status,
+               admin_note, created_at, resolved_at
+        FROM chat_suggestions WHERE id = ?
+        """,
+        (suggestion_id,),
+    )
+    return _chat_suggestion_row(row)
+
+
+def get_pending_chat_suggestion_for_link(chat_link: str) -> dict | None:
+    if not table_exists("chat_suggestions"):
+        return None
+    row = fetchone(
+        """
+        SELECT id, user_id, user_username, chat_link, chat_title, status,
+               admin_note, created_at, resolved_at
+        FROM chat_suggestions
+        WHERE chat_link = ? AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (chat_link,),
+    )
+    return _chat_suggestion_row(row)
+
+
+def count_user_chat_suggestions_since(user_id: int, hours: int = 24) -> int:
+    if not table_exists("chat_suggestions"):
+        return 0
+    return fetchval(
+        f"""
+        SELECT COUNT(*) FROM chat_suggestions
+        WHERE user_id = ? AND created_at >= {now_minus_days(max(1, (hours + 23) // 24))}
+        """,
+        (user_id,),
+        default=0,
+    )
+
+
+def count_pending_chat_suggestions() -> int:
+    if not table_exists("chat_suggestions"):
+        return 0
+    return fetchval(
+        "SELECT COUNT(*) FROM chat_suggestions WHERE status = 'pending'",
+        default=0,
+    )
+
+
+def create_chat_suggestion(
+    user_id: int,
+    chat_link: str,
+    *,
+    user_username: str | None = None,
+    chat_title: str | None = None,
+) -> int | None:
+    if not table_exists("chat_suggestions"):
+        return None
+    with db_conn() as conn:
+        cur = conn.cursor()
+        if IS_POSTGRES:
+            cur.execute(
+                q("""
+                    INSERT INTO chat_suggestions
+                    (user_id, user_username, chat_link, chat_title, status)
+                    VALUES (?, ?, ?, ?, 'pending')
+                    RETURNING id
+                """),
+                (user_id, user_username, chat_link, chat_title),
+            )
+            return int(cur.fetchone()[0])
+        cur.execute(
+            q("""
+                INSERT INTO chat_suggestions
+                (user_id, user_username, chat_link, chat_title, status)
+                VALUES (?, ?, ?, ?, 'pending')
+            """),
+            (user_id, user_username, chat_link, chat_title),
+        )
+        return int(cur.lastrowid)
+
+
+def resolve_chat_suggestion(
+    suggestion_id: int,
+    status: str,
+    *,
+    admin_note: str | None = None,
+) -> bool:
+    if status not in ("approved", "rejected"):
+        return False
+    if not table_exists("chat_suggestions"):
+        return False
+    row = get_chat_suggestion(suggestion_id)
+    if not row or row["status"] != "pending":
+        return False
+    execute(
+        """
+        UPDATE chat_suggestions
+        SET status = ?, admin_note = ?, resolved_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+        """,
+        (status, admin_note, suggestion_id),
+    )
+    return True
+
+
 # ========== АДМИНСКАЯ СТАТИСТИКА ==========
 def get_all_subscribers() -> list:
     rows = fetchall(f"SELECT user_id FROM subscribers WHERE is_active = {bool_true()}")
@@ -3205,6 +3490,11 @@ def log_bot_event(user_id: int | None, event: str, meta: dict | None = None) -> 
         q("INSERT INTO bot_events (user_id, event, meta_json) VALUES (?, ?, ?)"),
         (user_id, event, meta_json),
     )
+    if user_id:
+        try:
+            touch_subscriber_last_seen(user_id)
+        except Exception:
+            pass
 
 
 def count_bot_events_since(event: str, since_utc: datetime) -> int:
@@ -3254,19 +3544,26 @@ def count_bot_events_since_for_user(user_id: int, event: str, since_utc: datetim
 
 
 def touch_subscriber_last_seen(user_id: int) -> None:
+    from datetime import datetime, timezone
+
     execute(
-        q("UPDATE subscribers SET last_seen_at = CURRENT_TIMESTAMP WHERE user_id = ?"),
-        (user_id,),
+        q("UPDATE subscribers SET last_seen_at = ? WHERE user_id = ?"),
+        (datetime.now(timezone.utc), user_id),
     )
 
 
 def count_subscribers_last_seen_since(since_utc: datetime) -> int:
     row = fetchone(
         q(f"""
-            SELECT COUNT(*) FROM subscribers
-            WHERE is_active = {bool_true()} AND last_seen_at >= ?
+            SELECT COUNT(DISTINCT user_id) FROM (
+                SELECT user_id FROM subscribers
+                WHERE is_active = {bool_true()} AND last_seen_at >= ?
+                UNION
+                SELECT user_id FROM bot_events
+                WHERE user_id IS NOT NULL AND created_at >= ?
+            ) active_users
         """),
-        (since_utc,),
+        (since_utc, since_utc),
     )
     return int(row[0]) if row else 0
 

@@ -106,6 +106,22 @@ def test_detect_category_parking_for_parkovshchik():
     assert detect_category(text) == "parking"
 
 
+def test_detect_category_handyman_not_security_for_raznorabochiy_with_propusk():
+    text = (
+        "завтра, 8:30, 1 человек. Паспорта при себе, пропускной режим.\n"
+        "Адрес: Москва, Крылатская вл40\n"
+        "Задача: разнорабочий на территории санатория, подай, принеси, сделай.\n"
+        "Работа на 8ч.\n"
+        "Оплата: 450/4/1800"
+    )
+    assert detect_category(text) == "handyman"
+
+
+def test_detect_category_security_still_works_for_guard():
+    text = "Нужен охранник на мероприятие, пропускной режим, 3500 за смену"
+    assert detect_category(text) == "security"
+
+
 def test_detect_category_loader_for_gruzchik():
     text = "Завтра к 7:00 нужны 3 грузчика в ТЦ Коламбус"
     assert detect_category(text) == "loader"

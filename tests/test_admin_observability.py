@@ -29,6 +29,7 @@ def test_log_and_count_events():
     record_bot_event(9001, EVENT_START)
     data = get_activity_digest_data(since_utc=since)
     assert data["events"].get("start", 0) >= 2
+    assert data["active_users_seen"] >= 1
 
 
 def test_build_activity_digest_html_contains_sections():

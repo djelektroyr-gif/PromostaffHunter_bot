@@ -453,10 +453,19 @@ def format_reject_samples_report(stats: dict | None = None) -> str:
                 "В обычном прогоне примеры копятся только по *новым* сообщениям, прошедшим фильтр.\n"
                 + hint
             )
-        return f"📋 *Примеры отсева*\n\nПока пусто.\n{hint}"
+        return (
+            f"📋 *Примеры отсева*\n\n"
+            "Пока нет отсеянных постов в памяти последнего прогона.\n\n"
+            "Это *не* вакансии в ленте — только то, что парсер отбросил.\n"
+            f"{hint}"
+        )
     lines = [
         "📋 *Примеры отсева* (последний прогон)",
-        f"Тип: {s.get('run_kind') or '—'} | показано {len(samples)}",
+        "",
+        "Посты из чатов, которые парсер *не сохранил* в ленту. "
+        "Причина в названии строки — фильтр считает, что это не подходящая вакансия.",
+        "",
+        f"Тип прогона: {s.get('run_kind') or '—'} · показано {len(samples)}",
         "",
     ]
     for i, sample in enumerate(reversed(samples), 1):
@@ -1798,16 +1807,16 @@ _BOUNDARY_KEYWORDS = frozenset({
 })
 
 _CATEGORY_TIEBREAK = (
-    "loader", "promoter", "hostess", "waiter", "animator", "wardrobe",
+    "loader", "handyman", "promoter", "hostess", "waiter", "animator", "wardrobe",
     "driver", "security", "parking", "supervisor", "helper",
 )
 
 _CATEGORY_KEYWORDS = {
     "loader": [
-        "грузчик", "грузчики", "разнорабочий", "разнорабочие", "подсобник", "подсобный рабочий",
+        "грузчик", "грузчики", "подсобник", "подсобный рабочий",
         "погрузка", "разгрузка", "выгрузка", "выгрузк", "разгрузк", "погрузк",
         "такелаж", "такелажник",
-        "помощь мастерам", "разнорабочие моменты", "работа на лесах",
+        "помощь мастерам", "работа на лесах",
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
         "складской работник", "на склад", "рохл", "паллет", "складирован",
@@ -1858,6 +1867,13 @@ _CATEGORY_KEYWORDS = {
         "ассистент по акт", "ассистент на площадке",
         "волонтер", "волонтёр",
     ],
+    "handyman": [
+        "разнорабочий", "разнорабочие", "разнорабоч",
+        "клининг", "уборщик", "уборщица", "уборщиц", "уборщ",
+        "посудомой", "посудомойщик", "посудомойщица", "мойка посуды",
+        "котломой", "дворник", "уборка помещен", "генеральная уборка",
+        "клинер", "cleaning",
+    ],
 }
 
 _HELPER_EVENT_HINTS = (
@@ -1873,12 +1889,19 @@ _HELPER_HEADCOUNT_RE = re.compile(
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
     "склад", "рохл", "паллет", "фасовоч", "конвейер", "50 кг",
-    "разнорабоч", "подсобн", "посадка", "глины",
+    "подсобн", "посадка", "глины",
+)
+_HANDYMAN_HINTS = (
+    "разнорабоч", "клининг", "уборщ", "посудомой", "котломой", "мойка посуды", "уборк",
+)
+# В gate грузчика не отсекаем общую «уборку» — её ловит отдельная ветка ниже.
+_HANDYMAN_LOADER_REJECT = (
+    "разнорабоч", "клининг", "уборщ", "посудомой", "котломой", "мойка посуды",
 )
 _LOADER_CORE_HINTS = (
     "грузчик", "грузчики", "разгруз", "погруз", "выгруз", "такелаж",
     "склад", "фура", "рохл", "паллет", "комплектовщик", "кладовщик",
-    "разнорабоч", "подсобник", "упаковщик", "фасовщик", "50 кг", "тележк",
+    "подсобник", "упаковщик", "фасовщик", "50 кг", "тележк",
     "помощь мастерам", "на лесах", "лесах", "конвейер", "фасовоч",
 )
 _PROMO_HINTS = (
@@ -1957,7 +1980,9 @@ def _is_driver_role(text_lower: str) -> bool:
     norm = _normalize_hashtag_text(text_lower)
     if "#водител" in norm or "#курьер" in norm or "#экспедитор" in norm:
         return True
-    if re.search(r"(?:требу|нужен|ищем|набор|ваканс)\w*\s+.{0,25}(?:водител|курьер|экспедитор)", text_lower):
+    if re.search(r"(?:требу|нужен|ищем|ищу|набор|ваканс)\w*\s+.{0,25}(?:водител|курьер|экспедитор)", text_lower):
+        return True
+    if re.search(r"ищ\w+\s+.{0,20}водител", text_lower):
         return True
     if _has_technician_role(text_lower):
         if re.search(
@@ -2020,6 +2045,18 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
             return "loader"
     if scores.get("driver") and scores.get("helper") and "водител" in text_lower:
         return "driver"
+    if scores.get("security") and scores.get("loader"):
+        if any(w in text_lower for w in _LOADER_CORE_HINTS) and not any(
+            w in text_lower for w in ("охранник", "охрана", "контрол", "секьюрити")
+        ):
+            return "loader"
+    if scores.get("handyman") and scores.get("loader"):
+        if any(w in text_lower for w in ("грузчик", "разгруз", "погруз", "фура", "склад", "такелаж")):
+            return "loader"
+        if any(w in text_lower for w in _HANDYMAN_HINTS):
+            return "handyman"
+    if scores.get("handyman") and any(w in text_lower for w in _HANDYMAN_HINTS):
+        return "handyman"
     if scores.get("loader") and scores.get("helper"):
         if any(w in text_lower for w in _HELPER_EVENT_HINTS) and any(
             w in text_lower for w in ("хелпер", "хэлпер", "помощник на мероприят", "к мероприятию")
@@ -2044,6 +2081,7 @@ _PAYMENT_RATE_RE = re.compile(
     r"(?:"
     r"\d[\d\s.,]*\s*(?:руб\.?|₽|р\.?\/?\s*ч)|"
     r"\d{3,4}\s*р/ч|"
+    r"\d{3,4}\s*/\s*р\s*/?\s*ч|"
     r"\d{3,5}\s*р(?:\.|\b)(?:\s*\+|\s*за|\s*/|\s|$)|"
     r"₽\/?\s*ч|р\/\s*ч|руб\.?\s*/\s*ч|"
     r"ставка\s*[:\s]?\s*\d|минималка|"
@@ -2052,7 +2090,8 @@ _PAYMENT_RATE_RE = re.compile(
     r"\d{3,5}\s*-\s*\d{3,5}\s*(?:₽|руб|р\b|$)|"
     r"(?:заработок|доход)\s*(?:от\s*)?\d[\d\s–—\-]*(?:до|–|-|—)\s*\d+\s*(?:тыс|тысяч)|"
     r"\d[\d\s.,]*\s*(?:тыс|тысяч)\w*\s*(?:руб|₽)?\s*/\s*день|"
-    r"оплат\w*[^\n]{0,40}?\d[\d\s.,]*\s*к\b"
+    r"оплат\w*[^\n]{0,40}?\d[\d\s.,]*\s*к\b|"
+    r"(?:по\s+)?договор[её]нност"
     r")",
     re.I,
 )
@@ -2339,6 +2378,8 @@ def _detect_category_scored(text: str) -> str | None:
     if not text:
         return None
     text_lower = text.lower()
+    if _is_driver_role(text_lower):
+        return "driver"
     return _pick_category_from_scores(_score_categories_weighted(text), text_lower)
 
 
@@ -2400,17 +2441,9 @@ def has_hiring_signal(text: str) -> bool:
 def has_payment_signal(text: str) -> bool:
     if not text or is_unpaid_vacancy(text):
         return False
-    tl = text.lower()
-    if _PAYMENT_RATE_RE.search(tl):
-        return True
-    for token in ("ставка", "минималка", "гонорар", "зарплат", "з/п"):
-        if token in tl:
-            return True
-    from services.channel_rate import extract_hourly_rate_rub, extract_shift_rate_rub
+    from services.vacancy_rate import has_payment_or_negotiated_rate
 
-    if extract_hourly_rate_rub(text) or extract_shift_rate_rub(text):
-        return True
-    return False
+    return has_payment_or_negotiated_rate(text)
 
 
 def has_ls_contact_phrase(text: str) -> bool:
@@ -2557,6 +2590,10 @@ def passes_quality_gate(category: str, text: str) -> bool:
     if is_unpaid_vacancy(text):
         return False
     tl = text.lower()
+    if category == "driver" and _is_driver_role(tl):
+        if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
+            return False
+        return True
     scores = _score_categories_weighted(text)
     picked = _pick_category_from_scores(scores, tl)
     if picked != category:
@@ -2593,6 +2630,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
         ):
             return False
     elif category == "loader":
+        if any(w in tl for w in _HANDYMAN_LOADER_REJECT) and not any(w in tl for w in _LOADER_CORE_HINTS):
+            return False
         if any(w in tl for w in _LOADER_CORE_HINTS):
             return True
         if (
@@ -2602,6 +2641,9 @@ def passes_quality_gate(category: str, text: str) -> bool:
         ):
             return True
         return False
+    elif category == "handyman":
+        if not any(w in tl for w in _HANDYMAN_HINTS):
+            return False
     elif category == "promoter":
         if not any(w in tl for w in _PROMO_HINTS):
             return False
@@ -2631,8 +2673,11 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False
     elif category == "security":
-        if not any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити", "пропускной")):
-            return False
+        if any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити", "контроль доступа")):
+            return True
+        if "пропускной" in tl and any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити")):
+            return True
+        return False
     elif category == "parking":
         if not any(w in tl for w in ("парковщик", "паркинг", "парковоч")):
             return False

@@ -254,12 +254,15 @@ def _location_line(inp: VacancyCardInput) -> str | None:
 
 
 def _rate_line(inp: VacancyCardInput) -> str | None:
-    if inp.rate_hourly:
-        return f"{inp.rate_hourly} ₽/ч"
-    if inp.rate_shift:
-        suffix = f" · от {inp.min_hours} ч" if inp.min_hours else ""
-        return f"{inp.rate_shift} ₽/смена{suffix}"
-    return None
+    from services.vacancy_rate import format_vacancy_rate_line
+
+    ctx = _merge_enrichment(inp)
+    return format_vacancy_rate_line(
+        body=ctx.body,
+        rate_hourly=ctx.rate_hourly,
+        rate_shift=ctx.rate_shift,
+        min_hours=ctx.min_hours,
+    )
 
 
 def _sanitized_lines(body: str) -> list[str]:

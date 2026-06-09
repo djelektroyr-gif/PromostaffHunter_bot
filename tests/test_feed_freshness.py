@@ -42,3 +42,5 @@ def test_vacancy_in_feed_mode_fresh_vs_archive():
     assert main_module._vacancy_in_feed_mode(fresh_vac, "archive") is False
     assert main_module._vacancy_in_feed_mode(old_vac, "fresh") is False
     assert main_module._vacancy_in_feed_mode(old_vac, "archive") is True
+    assert main_module._vacancy_in_feed_mode(fresh_vac, "all") is True
+    assert main_module._vacancy_in_feed_mode(old_vac, "all") is True
