@@ -1,0 +1,27 @@
+---
+description: Hunter — ingest парсера, фильтры, масштаб; сверяться при правках parser/gate
+globs: parser.py,services/vacancy_enrichment.py,services/filter_prefs.py,services/subscriber_match.py,db.py,docs/PARSER_INGEST_ROADMAP.md
+alwaysApply: true
+---
+
+# Promostaff Hunter — парсер и ingest
+
+Источник истины: **`docs/PARSER_INGEST_ROADMAP.md`**. При правках `parser.py`, quality gate, категорий, enrichment, backfill — **прочитать и следовать**.
+
+## Продуктовое направление (гибрид, не «лить всё»)
+
+- **Ingest:** сохранять всё, что похоже на **заказ персонала** (контакт, оплата/смена); не сливать резюме, «ищу работу», спам.
+- **Цель:** multi-tag/скоры ролей + primary `category_code`; отбор «что показать» — подписка + **Premium-фильтры** (+ keywords в бэклоге).
+- **Не ужесточать gate без аудита** (админка «аудит фильтра», `reject_samples`).
+
+## Правила итерации
+
+1. **Recall > precision** на границе ролей (handyman vs security и т.п.) — лучше save + теги, чем reject.
+2. **Пустая категория за неделю** — сигнал: покрытие чатов, audit, `/enrich_backfill 30`.
+3. После заметных правок парсера на проде — **`/enrich_backfill [дней]`** (enrichment + перекатегоризация).
+4. Карта и 📍 — один источник: `resolve_map_fields_for_vacancy` / `resolve_map_address`; мусорные адреса — `is_plausible_map_address`.
+5. **~100 каналов ≠ обязательный Timeweb** — см. §5 roadmap; сначала lag/lock/RAM Bothost.
+
+## Репозиторий
+
+Это **PromostaffHunter_bot**, не promostaff-agency-bot / promostaff-bot. Деплой — **Bothost, ручной**. Коммит/push только по запросу владельца.

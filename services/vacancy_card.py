@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from html import escape as escape_html
 
 MSK_TZ = timezone(timedelta(hours=3))
-from services.vacancy_enrichment import enrich_vacancy_text, extract_shift_date_token
+from services.vacancy_enrichment import enrich_vacancy_text, resolve_map_address, extract_shift_date_token
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
 _HEADLINE_RE = re.compile(
@@ -68,6 +68,11 @@ def _merge_enrichment(inp: VacancyCardInput) -> VacancyCardInput:
     )
     shift_date = inp.shift_date or enriched.shift_date or extract_shift_date_token(inp.body or "")
     geo = inp.geo_tags or enriched.geo_tags
+    best_addr = resolve_map_address(
+        body=inp.body or "",
+        address=inp.address,
+        address_normalized=inp.address_normalized or enriched.address_normalized,
+    )
     return VacancyCardInput(
         category_code=inp.category_code,
         category_name=inp.category_name,
@@ -76,7 +81,7 @@ def _merge_enrichment(inp: VacancyCardInput) -> VacancyCardInput:
         freshness=inp.freshness,
         published_at=inp.published_at,
         address=inp.address,
-        address_normalized=inp.address_normalized or enriched.address_normalized,
+        address_normalized=best_addr,
         geo_tags=geo,
         rate_hourly=inp.rate_hourly if inp.rate_hourly is not None else enriched.rate_hourly,
         rate_shift=inp.rate_shift if inp.rate_shift is not None else enriched.rate_shift,

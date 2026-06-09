@@ -340,6 +340,13 @@ def _map_fields_from_vacancy(
     location_lat: float | None = None,
     location_lon: float | None = None,
 ) -> dict:
+    if vac and (vac.get("text") or vac.get("message_text")):
+        from services.vacancy_enrichment import resolve_map_fields_for_vacancy
+
+        payload = dict(vac)
+        if not payload.get("text"):
+            payload["text"] = payload.get("message_text") or ""
+        return resolve_map_fields_for_vacancy(payload)
     if vac:
         address = vac.get("address", address)
         address_normalized = vac.get("address_normalized", address_normalized)
@@ -356,11 +363,16 @@ def _map_fields_from_vacancy(
 def _map_fields_from_push_row(row) -> dict:
     if not row:
         return _map_fields_from_vacancy()
-    return _map_fields_from_vacancy(
-        address=row[4],
-        address_normalized=row[13] if len(row) > 13 else None,
-        location_lat=row[14] if len(row) > 14 else None,
-        location_lon=row[15] if len(row) > 15 else None,
+    from services.vacancy_enrichment import resolve_map_fields_for_vacancy
+
+    return resolve_map_fields_for_vacancy(
+        {
+            "text": (row[0] or "") if row else "",
+            "address": row[4],
+            "address_normalized": row[13] if len(row) > 13 else None,
+            "location_lat": row[14] if len(row) > 14 else None,
+            "location_lon": row[15] if len(row) > 15 else None,
+        }
     )
 
 
@@ -5170,9 +5182,22 @@ async def enrich_backfill_cmd(message: types.Message):
         return
     from db import backfill_vacancy_enrichment
 
-    await message.answer("⏳ Пересчитываю enrichment за 3 дня…")
-    updated = await run_db(backfill_vacancy_enrichment, 3)
-    await message.answer(f"✅ Enrichment backfill: обновлено {updated} вакансий.")
+    parts = (message.text or "").split()
+    days = 30
+    if len(parts) >= 2:
+        try:
+            days = max(1, min(90, int(parts[1])))
+        except ValueError:
+            pass
+    await message.answer(f"⏳ Пересчитываю enrichment и категории за {days} дн.…")
+    result = await run_db(backfill_vacancy_enrichment, days)
+    if isinstance(result, dict):
+        await message.answer(
+            f"✅ Backfill: enrichment {result.get('enrichment', 0)}, "
+            f"перекатегоризировано {result.get('recategorized', 0)}."
+        )
+    else:
+        await message.answer(f"✅ Enrichment backfill: обновлено {result} вакансий.")
 
 
 @dp.message(Command("delvac"))
@@ -7375,9 +7400,12 @@ async def on_startup():
     async def _startup_enrichment_backfill():
         try:
             from db import backfill_vacancy_enrichment
-            updated = await run_db(backfill_vacancy_enrichment, 3)
-            if updated:
-                logger.info("Enrichment backfill on startup: %s vacancies", updated)
+            result = await run_db(backfill_vacancy_enrichment, 3)
+            if isinstance(result, dict):
+                if result.get("enrichment") or result.get("recategorized"):
+                    logger.info("Enrichment backfill on startup: %s", result)
+            elif result:
+                logger.info("Enrichment backfill on startup: %s vacancies", result)
         except Exception as e:
             logger.warning("Enrichment backfill on startup failed: %s", e)
 

@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from services.channel_rate import extract_hourly_rate_rub, extract_min_hours, extract_shift_rate_rub
 
-ENRICHMENT_VERSION = 4
+ENRICHMENT_VERSION = 5
 
 _CITY_STREET_RE = re.compile(
     r"\b("
@@ -26,6 +26,23 @@ _CITY_STREET_RE = re.compile(
 )
 _VENUE_RE = re.compile(
     r"\b((?:ТЦ|ТРЦ|ТК|МФК|БЦ|ТРК)\s+[«\"]?[А-Яа-яёЁ0-9\- ]{2,60}[»\"]?)",
+    re.IGNORECASE,
+)
+_LANDMARK_RE = re.compile(
+    r"\b(вднх|vdnh|выставочн\w*(?:\s+центр\w*)?(?:\s+вднх)?|экспоцентр|сокольники|лужники|"
+    r"гостин(?:ый|ого)\s+двор|парк\s+гор(?:ь|и)к(?:ого)?)\b",
+    re.IGNORECASE,
+)
+_GARBAGE_ADDR_RE = re.compile(
+    r"кандидат|рассмотрим|опыт\s+работ|активн\w*\s+промо|старше\s+\d|"
+    r"только\s+(?:актив|промо|опыт)|отклик|анкет|whatsapp|telegram|"
+    r"начинается|работа\s+нач|начало\s*:?\s*\d",
+    re.IGNORECASE,
+)
+_MAP_WORTHY_RE = re.compile(
+    r"вднх|vdnh|выставочн|метро|м\.|ул\.|улица|проспект|пр-т|наб\.|шоссе|"
+    r"бульвар|проезд|тц|трц|москва|област|район|"
+    r"\d{1,5}\s*[а-яa-z]?(?:/\d+)?(?:\s|,|$)",
     re.IGNORECASE,
 )
 _LOCATION_LABELS = (
@@ -266,6 +283,35 @@ def _is_label_only(value: str) -> bool:
     return cleaned in _LABEL_ONLY_WORDS or cleaned in ("место работы",)
 
 
+def is_plausible_map_address(text: str | None) -> bool:
+    """Отсекаем мусор вроде «кандидатов старше 18»; пропускаем ВДНХ, улицы, метро."""
+    if not text:
+        return False
+    s = text.strip()
+    if len(s) < 4:
+        return False
+    if _GARBAGE_ADDR_RE.search(s):
+        return False
+    if _MAP_WORTHY_RE.search(s):
+        return True
+    return len(s) >= 12 and not _GARBAGE_ADDR_RE.search(s)
+
+
+def _extract_landmark_address(text: str) -> str | None:
+    if not text:
+        return None
+    m = _LANDMARK_RE.search(text)
+    if not m:
+        return None
+    name = m.group(1).strip(" .,!—")
+    tl = text.lower()
+    if "москва" in name.lower():
+        return name
+    if re.search(r"\bмосква\b", tl) or "вднх" in name.lower() or "vdnh" in name.lower():
+        return f"Москва, {name}"
+    return name
+
+
 def _collect_lines_after_header(lines: list[str], start: int, inline: str) -> list[str]:
     parts: list[str] = []
     if inline and len(inline) >= 3 and not _is_label_only(inline):
@@ -406,7 +452,7 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
     if block:
         return block
     pin_line = _extract_pin_inline_address(text)
-    if pin_line:
+    if pin_line and is_plausible_map_address(pin_line):
         return pin_line
     explicit = _EXPLICIT_ADDR_RE.search(text)
     if explicit:
@@ -427,6 +473,9 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
             )
             return f"{_city_display_name(city_match, names)}, {venue_text}"
         return venue_text
+    landmark = _extract_landmark_address(text)
+    if landmark and is_plausible_map_address(landmark):
+        return landmark
     mo_region = _extract_mo_region_address(text)
     if mo_region:
         return mo_region
@@ -446,13 +495,54 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
     if boulevard:
         return f"Москва, {boulevard.group(1).strip()}"
     if legacy_address and legacy_address.strip():
-        return legacy_address.strip()
+        leg = legacy_address.strip()
+        if is_plausible_map_address(leg):
+            return leg
     city_only = _match_city_slug(text)
     if city_only:
         for slug, names in _load_city_catalog():
             if slug == city_only:
                 return _city_display_name(slug, names)
     return None
+
+
+def resolve_map_address(
+    *,
+    body: str = "",
+    address: str | None = None,
+    address_normalized: str | None = None,
+) -> str | None:
+    """Лучший адрес для карты: из текста (enrichment), затем БД — только если правдоподобен."""
+    enriched = enrich_vacancy_text(body or "", legacy_address=address)
+    for candidate in (enriched.address_normalized, address_normalized, address):
+        if candidate and is_plausible_map_address(candidate):
+            return candidate.strip()
+    return None
+
+
+def resolve_map_fields_for_vacancy(vac: dict) -> dict:
+    """Координаты и адрес для кнопки «На карте» — с учётом текста вакансии."""
+    body = vac.get("text") or ""
+    address = vac.get("address")
+    address_normalized = vac.get("address_normalized")
+    enriched = enrich_vacancy_text(body, legacy_address=address)
+    lat = vac.get("location_lat")
+    lon = vac.get("location_lon")
+    if lat is None:
+        lat = enriched.location_lat
+    if lon is None:
+        lon = enriched.location_lon
+    best_addr = resolve_map_address(
+        body=body,
+        address=address,
+        address_normalized=address_normalized,
+    )
+    return {
+        "address": address,
+        "address_normalized": best_addr,
+        "location_lat": lat,
+        "location_lon": lon,
+    }
 
 
 def _match_city_slug(text: str) -> str | None:
@@ -567,7 +657,7 @@ def build_maps_url(
         if len(url) <= 2048:
             return url
     text_addr = (address_normalized or address or "").strip()
-    if text_addr:
+    if text_addr and is_plausible_map_address(text_addr):
         url = f"https://yandex.ru/maps/?text={quote(text_addr)}"
         if len(url) <= 2048 and url.startswith("https://"):
             return url

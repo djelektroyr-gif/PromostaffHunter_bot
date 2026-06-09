@@ -1795,34 +1795,46 @@ def update_vacancy_enrichment(vacancy_id: str, enrichment_kwargs: dict) -> None:
     execute(f"UPDATE vacancies SET {', '.join(parts)} WHERE id = ?", tuple(values))
 
 
-def backfill_vacancy_enrichment(days: int = 3) -> int:
-    from services.vacancy_enrichment import ENRICHMENT_VERSION, enrich_vacancy_text
+def backfill_vacancy_enrichment(days: int = 3) -> dict[str, int]:
+    from parser import detect_category
+    from services.vacancy_enrichment import ENRICHMENT_VERSION, enrich_vacancy_text, is_plausible_map_address
 
     rows = fetchall(
         f"""
-        SELECT id, message_text, address
+        SELECT id, message_text, address, category_code, enrichment_version
         FROM vacancies
         WHERE is_closed = {bool_false()}
           AND found_at >= {now_minus_days(days)}
-          AND (enrichment_version IS NULL OR enrichment_version < ?)
         ORDER BY found_at DESC
         """,
-        (ENRICHMENT_VERSION,),
     )
-    updated = 0
+    enrichment_updated = 0
+    recategorized = 0
     for row in rows:
-        vid, message_text, address = row[0], row[1] or "", row[2]
+        vid, message_text, address, category_code, enrichment_version = (
+            row[0], row[1] or "", row[2], row[3], row[4]
+        )
+        new_cat = detect_category(message_text)
+        if new_cat and new_cat != category_code:
+            execute(
+                "UPDATE vacancies SET category_code = ? WHERE id = ?",
+                (new_cat, vid),
+            )
+            recategorized += 1
+        if enrichment_version is not None and enrichment_version >= ENRICHMENT_VERSION:
+            continue
         enrichment = enrich_vacancy_text(message_text, legacy_address=address)
         kwargs = enrichment.to_db_kwargs()
-        if enrichment.address_normalized and not address:
+        if enrichment.address_normalized and is_plausible_map_address(enrichment.address_normalized):
+            if not address:
+                execute(
+                    "UPDATE vacancies SET address = ? WHERE id = ? AND (address IS NULL OR address = '')",
+                    (enrichment.address_normalized, vid),
+                )
             kwargs["address"] = enrichment.address_normalized
-            execute(
-                "UPDATE vacancies SET address = ? WHERE id = ? AND (address IS NULL OR address = '')",
-                (enrichment.address_normalized, vid),
-            )
         update_vacancy_enrichment(vid, kwargs)
-        updated += 1
-    return updated
+        enrichment_updated += 1
+    return {"enrichment": enrichment_updated, "recategorized": recategorized}
 
 
 _VACANCY_VISIBLE_SQL = "(moderation_status IS NULL OR moderation_status = 'approved')"

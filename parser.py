@@ -2055,6 +2055,9 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
             return "loader"
         if any(w in text_lower for w in _HANDYMAN_HINTS):
             return "handyman"
+    if scores.get("security") and any(w in text_lower for w in _HANDYMAN_HINTS):
+        if not any(w in text_lower for w in ("охранник", "охрана", "контрол", "секьюрити")):
+            return "handyman"
     if scores.get("handyman") and any(w in text_lower for w in _HANDYMAN_HINTS):
         return "handyman"
     if scores.get("loader") and scores.get("helper"):

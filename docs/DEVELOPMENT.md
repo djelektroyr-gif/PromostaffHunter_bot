@@ -3,7 +3,16 @@
 > Живой конспект проекта. Обновлять при каждой заметной доработке бота, парсера или продуктовых решений.  
 > Репозиторий: **PromostaffHunter_bot** (не путать с **promostaff-agency-bot** и **promostaff-bot**).
 
-Последнее обновление: **2026-06-10** (лента/история, handyman, Premium-заявки на каналы)
+Последнее обновление: **2026-06-10** (ingest roadmap, масштаб парсера)
+
+### Сделано за сессию (2026-06-10, вечер)
+
+| Область | Что |
+|---------|-----|
+| **Карта / адрес** | `resolve_map_fields_for_vacancy`, ВДНХ/ориентиры, отсечение мусорных адресов |
+| **Парсер** | handyman > security при «разнорабочий + пропускной режим» |
+| **Backfill** | `/enrich_backfill [дней]` — enrichment + перекатегоризация |
+| **Доки** | **[`PARSER_INGEST_ROADMAP.md`](PARSER_INGEST_ROADMAP.md)** — целевая модель ingest (гибрид), принципы итераций, CPU при ~100 каналах |
 
 ### Сделано за сессию (2026-06-10)
 
@@ -294,6 +303,8 @@ Hunter на Bothost — **не блокер** для Timeweb **AI Gateway** (`ap
 4. **Операционка:** один мониторинг, один ручной деплoy, один счёт (App Platform + managed PG).
 5. **Webhook:** нужен единый домен `promostaff.pro` для Mini App + webhook Bot API (не «ради модности»).
 
+**Масштаб парсера (~50–100 каналов):** сам по себе **не** триггер переезда — см. оценку CPU/RAM в **[PARSER_INGEST_ROADMAP.md §5](PARSER_INGEST_ROADMAP.md#5-масштаб-100-каналов-cpu-и-память-чпу)**. Сначала мониторинг lag/lock/RAM; при упоре — апгрейд тарифа Bothost, затем Timeweb по чеклисту выше.
+
 **До переноса не трогать без причины:** автодеплой на каждый коммит; Amsterdam VDS для LLM (замена — Timeweb AI Gateway); webhook только ради «современности».
 
 **Чеклист миграции Hunter → Timeweb** (когда критерии выполнены):
@@ -312,6 +323,7 @@ Hunter на Bothost — **не блокер** для Timeweb **AI Gateway** (`ap
 
 ### Известные ограничения парсера
 
+- [ ] **Ingest vs выдача:** жёсткий gate на входе → риск пропуска спорных вакансий; целевая модель — **[PARSER_INGEST_ROADMAP.md](PARSER_INGEST_ROADMAP.md)** (гибрид, multi-tag, keywords Premium).
 - [ ] Категории по ключевым словам — scoring, без ML (P3: feedback).
 - [x] Digest «1. … 2. …» — **split по блокам** (P1, `tool-v1`); reject только блоки, не прошедшие gate.
 - [x] P0: `evaluate_vacancy()` — staff gate + per-category quality; push re-check.

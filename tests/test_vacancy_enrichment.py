@@ -9,6 +9,8 @@ from services.vacancy_enrichment import (
     enrich_vacancy_text,
     extract_address_normalized,
     extract_coordinates_from_text,
+    is_plausible_map_address,
+    resolve_map_fields_for_vacancy,
 )
 
 
@@ -119,15 +121,49 @@ def test_backfill_updates_recent_vacancies(monkeypatch, tmp_path):
         "dedupe_enrich",
         "2026-06-07 10:00:00",
     )
-    updated = backfill_vacancy_enrichment(days=3)
-    assert updated >= 1
+    result = backfill_vacancy_enrichment(days=3)
+    assert result["enrichment"] >= 1
     row = fetchone(
         "SELECT address_normalized, rate_hourly, enrichment_version FROM vacancies WHERE id = ?",
         ("vac_enrich_1",),
     )
     assert row[0] is not None
     assert row[1] == 500
-    assert row[2] == 4
+    assert row[2] == 5
+
+
+def test_extract_address_vdnh_landmark():
+    text = "ВДНХ! 15-22 июня\n5 часов в день\n750 р/час"
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "вднх" in addr.lower()
+    assert build_maps_url(address_normalized=addr) is not None
+
+
+def test_extract_address_vdnh_exhibition_center():
+    text = "#Промо 10.06.\nВДНХ выставочный центр\nСтавка: 6000 р"
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "вднх" in addr.lower()
+
+
+def test_garbage_address_not_on_map():
+    garbage = "кандидатов старше 18"
+    assert not is_plausible_map_address(garbage)
+    assert build_maps_url(address_normalized=garbage) is None
+    promo = (
+        "Открыта вакансия промоутера.\n"
+        "❗️Важно рассмотрим кандидатов старше 18\n"
+        "Работа начинается с 19:00"
+    )
+    vac = {
+        "text": promo,
+        "address": garbage,
+        "address_normalized": garbage,
+    }
+    fields = resolve_map_fields_for_vacancy(vac)
+    assert fields["address_normalized"] is None
+    assert build_maps_url(**fields) is None
 
 
 def test_extract_address_freeform_scattered():
