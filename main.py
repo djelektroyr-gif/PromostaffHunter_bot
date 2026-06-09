@@ -397,6 +397,27 @@ def build_notfit_reason_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def build_vacancy_preview_keyboard(
+    vacancy_id: str,
+    address: str | None = None,
+    *,
+    address_normalized: str | None = None,
+    location_lat: float | None = None,
+    location_lon: float | None = None,
+) -> InlineKeyboardMarkup:
+    """Компактная карточка — открыть подробности или карту."""
+    buttons = [[_inline_btn("📋 Открыть вакансию", callback_data=f"vac_open_{vacancy_id}", style="primary")]]
+    maps_url = build_maps_url(
+        address,
+        address_normalized=address_normalized,
+        location_lat=location_lat,
+        location_lon=location_lon,
+    )
+    if maps_url:
+        buttons.append([_inline_btn("🗺 На карте", url=maps_url)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def build_vacancy_keyboard(
     vacancy_id: str,
     address: str | None = None,
@@ -405,8 +426,9 @@ def build_vacancy_keyboard(
     location_lat: float | None = None,
     location_lon: float | None = None,
     responded: bool = False,
+    collapsed: bool = True,
 ) -> InlineKeyboardMarkup:
-    """Inline-кнопки с цветами Bot API 9.4 (style на InlineKeyboardButton)."""
+    """Полная карточка: отклик, карта, свернуть."""
     if responded:
         buttons = [[InlineKeyboardButton(text="✅ Отклик отправлен", callback_data="already_responded")]]
     else:
@@ -423,7 +445,62 @@ def build_vacancy_keyboard(
         _inline_btn("Не подходит", callback_data=f"notfit_{vacancy_id}"),
         _inline_btn("Жалоба", callback_data=f"complain_{vacancy_id}", style="danger"),
     ])
+    if collapsed:
+        buttons.append([_inline_btn("◀️ Свернуть", callback_data=f"vac_close_{vacancy_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _vacancy_card_bundle_from_id(vacancy_id: str):
+    """VacancyCardInput + поля для клавиатуры из БД."""
+    from services.vacancy_card import card_input_from_push_row
+
+    row = get_vacancy_push_row(vacancy_id)
+    if not row:
+        return None, {}
+    category_code = row[5] or "promoter"
+    inp = card_input_from_push_row(
+        row,
+        freshness=get_freshness_label(row[8]),
+        published_at=format_publication_time(row[8]),
+        category_name=get_category_name(category_code),
+        category_emoji=get_category_emoji(category_code),
+        category_code=category_code,
+    )
+    return inp, _map_fields_from_push_row(row)
+
+
+def format_vacancy_preview_html(
+    *,
+    category_emoji: str,
+    category_name: str,
+    category_code: str = "promoter",
+    freshness: str,
+    body: str,
+    address: str | None = None,
+    address_normalized: str | None = None,
+    geo_tags: list | None = None,
+    rate_hourly: int | None = None,
+    rate_shift: int | None = None,
+    shift_date: str | None = None,
+    shift_time_start: str | None = None,
+) -> str:
+    from services.vacancy_card import VacancyCardInput, build_vacancy_preview_html
+
+    inp = VacancyCardInput(
+        category_code=category_code,
+        category_name=category_name,
+        category_emoji=category_emoji,
+        body=body or "",
+        freshness=freshness,
+        address=address,
+        address_normalized=address_normalized,
+        geo_tags=geo_tags,
+        rate_hourly=rate_hourly,
+        rate_shift=rate_shift,
+        shift_date=shift_date,
+        shift_time_start=shift_time_start,
+    )
+    return build_vacancy_preview_html(inp)
 
 
 def format_vacancy_card_html(
@@ -435,21 +512,34 @@ def format_vacancy_card_html(
     body: str,
     source: str,
     message_link: str | None = None,
+    category_code: str = "promoter",
+    address: str | None = None,
+    address_normalized: str | None = None,
+    geo_tags: list | None = None,
+    rate_hourly: int | None = None,
+    rate_shift: int | None = None,
+    shift_date: str | None = None,
+    shift_time_start: str | None = None,
 ) -> str:
-    del source, message_link  # в боте не показываем группу-источник и ссылку на чужой чат
-    from services.vacancy_public_text import sanitize_vacancy_public_body
+    del source, message_link
+    from services.vacancy_card import VacancyCardInput, build_vacancy_full_html
 
-    description = sanitize_vacancy_public_body(body or "", max_len=500)
-    if not description:
-        description = "Откройте карточку в боте — там кнопка «Отклик»."
-    pub_line = ""
-    if published_at and published_at not in ("сейчас", "—"):
-        pub_line = f"🕐 <i>Опубликовано: {escape_html(published_at)}</i>\n\n"
-    return (
-        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n"
-        f"{pub_line}"
-        f"{escape_html(description)}"
+    inp = VacancyCardInput(
+        category_code=category_code,
+        category_name=category_name,
+        category_emoji=category_emoji,
+        body=body or "",
+        freshness=freshness,
+        published_at=published_at,
+        address=address,
+        address_normalized=address_normalized,
+        geo_tags=geo_tags,
+        rate_hourly=rate_hourly,
+        rate_shift=rate_shift,
+        shift_date=shift_date,
+        shift_time_start=shift_time_start,
     )
+    return build_vacancy_full_html(inp)
 
 
 async def send_vacancy_card(
@@ -931,19 +1021,14 @@ async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy
     if row[11] not in (None, "approved"):
         await message.answer("⏳ Вакансия на модерации.")
         return
-    msg_text, message_link, source_title, _contact, address = row[0], row[1], row[2], row[3], row[4]
-    category_code = row[5] or "promoter"
-    published_raw = row[8]
-    text = format_vacancy_card_html(
-        category_emoji=get_category_emoji(category_code),
-        category_name=get_category_name(category_code),
-        freshness=get_freshness_label(published_raw),
-        published_at=format_publication_time(published_raw),
-        body=msg_text or "",
-        source=source_title or row[6] or "—",
-        message_link=message_link,
-    )
-    keyboard = build_vacancy_keyboard(vacancy_id, **_map_fields_from_push_row(row))
+    inp, map_fields = _vacancy_card_bundle_from_id(vacancy_id)
+    if not inp:
+        await message.answer("❌ Вакансия не найдена.")
+        return
+    from services.vacancy_card import build_vacancy_full_html
+
+    text = build_vacancy_full_html(inp)
+    keyboard = build_vacancy_keyboard(vacancy_id, collapsed=False, **map_fields)
     await send_vacancy_card(user_id, text, reply_markup=keyboard)
 
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown", chunk_size: int = 3800):
@@ -2149,18 +2234,20 @@ async def send_vacancy_to_subscribers(order: dict):
     published_at = format_publication_time(published_raw)
     freshness = get_freshness_label(published_raw)
     cat_name = get_category_name(category_code)
-    text = format_vacancy_card_html(
-        category_emoji=get_category_emoji(category_code),
-        category_name=cat_name,
+    from services.vacancy_card import build_vacancy_preview_html, card_input_from_order
+
+    card_inp = card_input_from_order(
+        order,
         freshness=freshness,
         published_at=published_at,
-        body=msg_text,
-        source=order.get("chat_title") or "—",
-        message_link=order.get("message_link"),
+        category_code=category_code,
+        category_name=cat_name,
+        category_emoji=get_category_emoji(category_code),
     )
+    text = build_vacancy_preview_html(card_inp)
 
     address = order.get('address') or extract_address_from_text(msg_text)
-    keyboard = build_vacancy_keyboard(
+    keyboard = build_vacancy_preview_keyboard(
         vacancy_id,
         address=address,
         address_normalized=order.get("address_normalized"),
@@ -3702,17 +3789,20 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     async with typing_keepalive(bot, message.chat.id):
         for vac in vacancies[start:end]:
             raw_pub = vac.get('published_at') or vac.get('found_at')
-            emoji, cat_name = _detected_category_display(vac.get("text") or "")
-            text = format_vacancy_card_html(
-                category_emoji=emoji,
-                category_name=cat_name,
+            cat_code = vac.get("category_code") or "promoter"
+            emoji = get_category_emoji(cat_code)
+            cat_name = get_category_name(cat_code)
+            from services.vacancy_card import build_vacancy_preview_html, card_input_from_feed_vac
+
+            card_inp = card_input_from_feed_vac(
+                vac,
                 freshness=get_freshness_label(raw_pub),
                 published_at=format_publication_time(raw_pub),
-                body=vac.get("text") or "",
-                source=vac.get("source") or "—",
-                message_link=vac.get("link"),
+                category_name=cat_name,
+                category_emoji=emoji,
             )
-            keyboard = build_vacancy_keyboard(vac["id"], **_map_fields_from_vacancy(vac))
+            text = build_vacancy_preview_html(card_inp)
+            keyboard = build_vacancy_preview_keyboard(vac["id"], **_map_fields_from_vacancy(vac))
             try:
                 await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
                 try_reserve_vacancy_sent_to_user(vac["id"], user_id)
@@ -4346,6 +4436,63 @@ async def _finalize_notfit_feedback(
         await callback.message.answer(thank)
     elif message:
         await message.answer(thank)
+
+
+async def _edit_vacancy_card_message(
+    callback: types.CallbackQuery,
+    vacancy_id: str,
+    *,
+    expanded: bool,
+) -> bool:
+    inp, map_fields = _vacancy_card_bundle_from_id(vacancy_id)
+    if not inp or not callback.message:
+        return False
+    from services.vacancy_card import build_vacancy_full_html, build_vacancy_preview_html
+
+    if expanded:
+        text = build_vacancy_full_html(inp)
+        kb = build_vacancy_keyboard(vacancy_id, **map_fields)
+    else:
+        text = build_vacancy_preview_html(inp)
+        kb = build_vacancy_preview_keyboard(vacancy_id, **map_fields)
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        return True
+    except TelegramBadRequest as e:
+        if "parse" in str(e).lower():
+            plain = re.sub(r"<[^>]*>", "", text)
+            await callback.message.edit_text(
+                plain,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            return True
+        if "not modified" in str(e).lower():
+            return True
+        raise
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("vac_open_"))
+async def vacancy_card_open(callback: types.CallbackQuery):
+    vacancy_id = callback.data.replace("vac_open_", "", 1)
+    if not await _edit_vacancy_card_message(callback, vacancy_id, expanded=True):
+        await safe_callback_answer(callback, "Вакансия недоступна", show_alert=True)
+        return
+    await safe_callback_answer(callback)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("vac_close_"))
+async def vacancy_card_close(callback: types.CallbackQuery):
+    vacancy_id = callback.data.replace("vac_close_", "", 1)
+    if not await _edit_vacancy_card_message(callback, vacancy_id, expanded=False):
+        await safe_callback_answer(callback, "Вакансия недоступна", show_alert=True)
+        return
+    await safe_callback_answer(callback, "Свернуто")
 
 
 @dp.callback_query(lambda c: c.data and re.fullmatch(r"notfit_[^:]+", c.data))

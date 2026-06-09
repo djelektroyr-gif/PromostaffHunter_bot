@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from html import escape as escape_html
 from typing import TYPE_CHECKING
 
 from aiogram.types import InlineKeyboardMarkup
@@ -23,6 +22,7 @@ from services.channel_images import (
 )
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
+from services.vacancy_card import VacancyCardInput, build_vacancy_preview_html, card_input_from_push_row
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
 if TYPE_CHECKING:
@@ -35,25 +35,41 @@ def build_channel_preview_text(
     *,
     category_name: str,
     category_emoji: str,
+    category_code: str = "promoter",
     body: str,
     source: str,
     freshness: str,
+    address: str | None = None,
+    address_normalized: str | None = None,
+    geo_tags: list[str] | None = None,
+    rate_hourly: int | None = None,
+    rate_shift: int | None = None,
+    shift_date: str | None = None,
+    shift_time_start: str | None = None,
 ) -> str:
     del source  # не светим чужую группу в канале
-    snippet = sanitize_vacancy_public_body(body or "", max_len=320)
-    if not snippet:
-        snippet = "Подробности и отклик — в боте (кнопка ниже)."
-    return (
-        f"{category_emoji} <b>{escape_html(category_name)}</b> · {escape_html(freshness)}\n\n"
-        f"{escape_html(snippet)}"
+    inp = VacancyCardInput(
+        category_code=category_code,
+        category_name=category_name,
+        category_emoji=category_emoji,
+        body=body or "",
+        freshness=freshness,
+        address=address,
+        address_normalized=address_normalized,
+        geo_tags=geo_tags,
+        rate_hourly=rate_hourly,
+        rate_shift=rate_shift,
+        shift_date=shift_date,
+        shift_time_start=shift_time_start,
     )
+    return build_vacancy_preview_html(inp, show_published_at=False)
 
 
 def build_channel_preview_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     bot_user = (BOT_USERNAME or "PromostaffHunter_bot").lstrip("@")
     return InlineKeyboardMarkup(inline_keyboard=[
         [styled_inline_button(
-            "✋ Подробнее в боте",
+            "📋 Открыть в боте",
             url=f"https://t.me/{bot_user}?start=vac_{vacancy_id}",
             style="success",
         )],
@@ -117,13 +133,27 @@ async def post_vacancy_preview_to_channel(
             )
             release_vacancy_channel_post(vacancy_id)
             return False
-    text = build_channel_preview_text(
-        category_name=category_name,
-        category_emoji=category_emoji,
-        body=body,
-        source=source,
-        freshness=freshness,
-    )
+    from db import get_vacancy_push_row
+
+    row = get_vacancy_push_row(vacancy_id)
+    if row:
+        inp = card_input_from_push_row(
+            row,
+            freshness=freshness,
+            category_name=category_name,
+            category_emoji=category_emoji,
+            category_code=category_code,
+        )
+        text = build_vacancy_preview_html(inp, show_published_at=False)
+    else:
+        text = build_channel_preview_text(
+            category_name=category_name,
+            category_emoji=category_emoji,
+            category_code=category_code,
+            body=body,
+            source=source,
+            freshness=freshness,
+        )
     markup = build_channel_preview_keyboard(vacancy_id)
     variant_idx = next_vacancy_image_variant_index(category_code)
     photo_path = resolve_vacancy_image_path(

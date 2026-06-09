@@ -18,23 +18,30 @@ def test_channel_preview_keyboard_urls():
     kb = build_channel_preview_keyboard("abc123")
     row0 = kb.inline_keyboard[0][0]
     assert "vac_abc123" in row0.url
+    assert "Открыть" in row0.text
     assert row0.url.startswith("https://t.me/")
 
 
-def test_channel_preview_text_truncates():
+def test_channel_preview_text_structured():
     body = (
-        "На завтра нужен промоутер у метро Таганская. Оплата 2000.\n"
+        "Нужны 2 промоутера на завтра\n"
+        "м. Таганская\n"
+        "Раздача листовок\n"
+        "2000₽/смена\n"
         "☎️ @boss123"
     )
     text = build_channel_preview_text(
         category_name="Промоутер",
         category_emoji="📢",
+        category_code="promoter",
         body=body,
         source="Secret Group",
-        freshness="несколько часов назад",
+        freshness="🟢 Свежая: несколько часов назад",
     )
     assert "Промоутер" in text
-    assert "несколько часов назад" in text
+    assert "Свежая" in text or "Актуальна" in text
+    assert "Опубликовано" not in text
+    assert "завтра" in text
     assert "Secret Group" not in text
     assert "@" not in text
     assert "boss123" not in text
