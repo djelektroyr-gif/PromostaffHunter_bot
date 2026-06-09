@@ -1738,6 +1738,13 @@ def get_vacancy_row(vacancy_id: str):
     )
 
 
+def unpack_vacancy_row_basic(row):
+    """Первые 5 полей get_vacancy_row() — для откликов (geo-колонки игнорируются)."""
+    if not row:
+        return None
+    return row[0], row[1], row[2], row[3], row[4]
+
+
 def get_vacancy_push_row(vacancy_id: str):
     return fetchone(
         """SELECT message_text, message_link, source_chat_title, author_contact, address,

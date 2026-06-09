@@ -235,6 +235,7 @@ REJECT_REASON_LABELS = {
     "excluded_hashtag_role": "роль по хештегу вне профиля",
     "excluded_organizer": "организатор/свадьба",
     "permanent_job": "постоянная/вахта",
+    "office_staff_job": "офисная работа (не event-staff)",
     "remote_office_job": "удалённая офисная работа",
     "staff_job": "персонал (прошёл gate)",
 }
@@ -1827,7 +1828,7 @@ _CATEGORY_KEYWORDS = {
         "ростовые куклы",
     ],
     "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
-    "driver": ["водитель", "водители", "курьер", "экспедитор", "водительские права", "категория b", "категория с"],
+    "driver": ["водитель", "водители", "курьер", "экспедитор"],
     "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
     "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
     "supervisor": [
@@ -1841,7 +1842,8 @@ _CATEGORY_KEYWORDS = {
         "хелперский функционал", "хелперские задачи",
         "помощь на монтаже", "на монтаже",
         "парни хелпер", "парня хелпер", "парней хелпер",
-        "#помощник",
+        "#техник", "техник прокат", "техник оборудован", "техник концерт",
+        "техник на площадке", "техник на монтаже",
         # «мероприят» — намеренный стем: мероприятие / мероприятия / мероприятий
         "хелпер на мероприят", "хэлпер на мероприят",
         "хелпер на мероприятие", "хэлпер на мероприятие",
@@ -1925,6 +1927,33 @@ def _numbered_vacancy_count(text: str) -> int:
     return len(re.findall(r"(?:^|\n)\s*3[\.\)]\s", text))
 
 
+def _normalize_hashtag_text(text: str) -> str:
+    return re.sub(r"[\*_\s]", "", (text or "").lower())
+
+
+def _has_technician_role(text_lower: str) -> bool:
+    norm = _normalize_hashtag_text(text_lower)
+    if "#техник" in norm:
+        return True
+    return bool(re.search(r"(?:требу|нужен|ищем)\w*\s+.{0,20}техник", text_lower))
+
+
+def _is_driver_role(text_lower: str) -> bool:
+    """Водитель/курьер как основная роль — не «права в плюс» у техника."""
+    norm = _normalize_hashtag_text(text_lower)
+    if "#водител" in norm or "#курьер" in norm or "#экспедитор" in norm:
+        return True
+    if re.search(r"(?:требу|нужен|ищем|набор|ваканс)\w*\s+.{0,25}(?:водител|курьер|экспедитор)", text_lower):
+        return True
+    if _has_technician_role(text_lower):
+        if re.search(
+            r"(?:если\s+есть|наличие|есть).{0,25}водительск|водительск\w*\s+прав\w*.{0,35}(?:плюс|желательн)",
+            text_lower,
+        ):
+            return False
+    return False
+
+
 def _score_categories(text_lower: str) -> dict:
     scores = {}
     for category, keywords in _CATEGORY_KEYWORDS.items():
@@ -1942,6 +1971,9 @@ def _score_categories(text_lower: str) -> dict:
 def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if not scores:
         return None
+    if _has_technician_role(text_lower) and scores.get("helper"):
+        if not _is_driver_role(text_lower):
+            return "helper"
     if scores.get("loader") and scores.get("helper"):
         if any(w in text_lower for w in ("хелпер", "хэлпер", "хелперы", "хэлперы")):
             if re.search(r"хелпер\w*\s*[-–—]\s*грузчик", text_lower):
@@ -2135,6 +2167,30 @@ def is_massovka_or_film_extras(text: str) -> bool:
     return True
 
 
+_OFFICE_STAFF_MARKERS = (
+    "личный помощник", "личный #помощник", "#помощник в офис", "помощник в офис",
+    "в офис", "документооборот", "делопроизвод", "настольные игры", "зоны отдыха",
+    "соц. сет", "собеседован", "разбор заявок", "ведение документ", "выкладка рекламы",
+)
+
+
+def is_office_staff_spam(text: str) -> bool:
+    """Офисный помощник / админ — не хелпер на мероприятии."""
+    if not text:
+        return False
+    tl = text.lower()
+    norm = _normalize_hashtag_text(tl)
+    if "#помощник" in norm:
+        if any(w in tl for w in _HELPER_EVENT_HINTS + ("хелпер", "хэлпер", "на площадке", "монтаж", "демонтаж")):
+            return False
+        return True
+    if any(m in tl for m in _OFFICE_STAFF_MARKERS):
+        if any(w in tl for w in ("хелпер", "хэлпер", "мероприят", "площадк", "монтаж", "демонтаж")):
+            return False
+        return True
+    return False
+
+
 def is_digital_work_spam(text: str) -> bool:
     """Удалённая «подработка с телефона» — не хелпер на площадке."""
     if not text:
@@ -2154,6 +2210,12 @@ def is_permanent_job_spam(text: str) -> bool:
         return False
     tl = text.lower()
     if re.search(r"\d{2,3}[\s\d]*000\s*(?:-|–|—)?\s*\d{0,3}[\s\d]*000\s*(?:руб|₽|р)?\s*(?:в\s+)?месяц", tl):
+        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+            return True
+    if re.search(r"\d{2,3}[.\s]\d{3}.*(?:в\s+)?месяц", tl):
+        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+            return True
+    if "на руки" in tl and "месяц" in tl and re.search(r"\d{2,3}[.\s]\d{2,3}", tl):
         if not any(m in tl for m in _SHIFT_JOB_MARKERS):
             return True
     if re.search(r"(?:от\s*)?\+\s*\d{2,3}[\s.]*000.*месяц", tl):
@@ -2387,6 +2449,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "massovka_film", []
     if is_permanent_job_spam(text):
         return False, "permanent_job", []
+    if is_office_staff_spam(text):
+        return False, "office_staff_job", []
     if is_unpaid_vacancy(text):
         return False, "unpaid", []
     if is_academic_writing_spam(text):
@@ -2449,7 +2513,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "требуются хелпер", "требуются хэлпер",
             "хелперский функционал", "хелперские задачи",
             "помощь на монтаже",
-            "#помощник",
+            "#техник", "техник прокат", "техник оборудован",
             "хелпер на мероприят", "хэлпер на мероприят",
             "хелпер на мероприятие", "хэлпер на мероприятие",
             "помощник на мероприят", "помощник организатора",
@@ -2501,7 +2565,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
     elif category == "driver":
         if "грузчик" in tl and re.search(r"водител\w*\s+забер", tl):
             return False
-        if not any(w in tl for w in ("водител", "курьер", "экспедитор")):
+        if not _is_driver_role(tl):
             return False
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False

@@ -4795,7 +4795,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if not vacancy_row:
         await callback.answer("❌ Вакансия не найдена", show_alert=True)
         return
-    vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
+    vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     vac_snippet = vacancy_text[:200] if vacancy_text else None
     employer_contact = saved_contact or extract_contact_from_text(vacancy_text or "")
     if not employer_contact:
@@ -5115,7 +5115,8 @@ async def respond_comment_received(message: types.Message, state: FSMContext):
         await message.answer("❌ Вакансия не найдена.")
         await state.clear()
         return
-    vacancy_text, saved_contact = row
+    vacancy_text = row[0]
+    saved_contact = row[3]
     contact = saved_contact or extract_contact_from_text(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile, extra_comment=message.text)
     link = build_contact_link(contact, draft_text)
@@ -5166,7 +5167,7 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
     if not vacancy_row:
         await target.answer("❌ Вакансия не найдена")
         return
-    vacancy_text, vacancy_link, source_chat, saved_contact, address = vacancy_row
+    vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     if not add_response(
         user_id,
         vacancy_id,
@@ -5206,7 +5207,7 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
         await send_to_admin(target, profile, vacancy_row, candidate_questionnaire, photo_file_id)
 
 async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_questionnaire: str, photo_file_id: str = None):
-    vacancy_text, vacancy_link, source_chat, _, address = vacancy_row
+    vacancy_text, vacancy_link, source_chat, _, address = unpack_vacancy_row_basic(vacancy_row)
     user_link = f"[{profile['full_name']}](tg://user?id={profile['user_id']})"
     admin_message = (
         f"🔔 *НОВЫЙ ОТКЛИК НА ВАКАНСИЮ!*\n\n"

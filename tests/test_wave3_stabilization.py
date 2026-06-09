@@ -18,6 +18,7 @@ from db import (
     init_db,
     is_vacancy_channel_posted,
     get_vacancy_row,
+    unpack_vacancy_row_basic,
     load_user_feed_session,
     mark_vacancy_channel_posted,
     release_vacancy_channel_post,
@@ -216,6 +217,12 @@ def test_delete_vacancy_completely(tmp_db):
     session = load_user_feed_session(501)
     assert session["vacancy_ids"] == ["other_v"]
     assert delete_vacancy_completely("spam_v1") is None
+
+
+def test_unpack_vacancy_row_basic_ignores_geo_columns():
+    row = ("text", "link", "chat", "@boss", "addr", "norm addr", 55.7, 37.6)
+    assert unpack_vacancy_row_basic(row) == ("text", "link", "chat", "@boss", "addr")
+    assert unpack_vacancy_row_basic(None) is None
 
 
 # --- FSM storage fallback ---
