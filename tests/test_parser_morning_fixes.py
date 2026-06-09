@@ -6,6 +6,7 @@ from parser import (
     evaluate_vacancy,
     is_digital_work_spam,
     is_massovka_or_film_extras,
+    is_office_staff_spam,
     is_permanent_job_spam,
 )
 
@@ -197,3 +198,83 @@ def test_campaign_duplicate_same_channel(monkeypatch):
         variant, "@promo2", "k2", "promoter", "Promo Channel",
     )
     assert dup == "campaign"
+
+
+def test_office_personal_assistant_not_helper():
+    text = (
+        "**Требуется личный ****#помощник**** в офис**\n"
+        "‼️Поиск срочный ‼️\n"
+        "Разбор заявок ✅\n"
+        "Выкладка рекламы в соц. сети\n"
+        "Помощь с ведением документооборота (по шаблону)\n"
+        "1). Настольные игры и зоны отдыха😎\n"
+        "2). Гибкий график\n"
+        "**Оплата: 80.000-100.00 в месяц на руки **\n"
+        "Находимся на м. Университет\n"
+        "@office_hr"
+    )
+    assert is_office_staff_spam(text) is True
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason in ("office_staff_job", "permanent_job")
+    assert cat != "helper" or not ok
+
+
+def test_krasnopresnenskaya_sixteen_helpers_accepted():
+    text = (
+        "г. Москва, Краснопресненская набережная, дом 12\n"
+        "С 9 на 10 июня\n"
+        "С 21:00-15:00\n"
+        "Нужны 16 хэлперов \n"
+        "Помощь на демонтаже, выгрузить мебель, помощь монтажникам, "
+        "мелкие поручения принеси/подай, больше монтажных работ, "
+        "но хэлперские задачи тоже будут\n"
+        "Ставка 500 в час \n"
+        "ОПЛАТА 10, край 11 ого ИЮНЯ!!!\n"
+        "ПО СМЗ\n"
+        "пишите в ЛС\n"
+        "@event_crew"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is True, reason
+    assert cat == "helper"
+
+
+def test_bakery_dishwasher_not_loader():
+    text = (
+        "На постоянную работу в пекарню 🍞 нужна посудомойщица-уборщица,\n"
+        "котломой день\n"
+        "котломой ночь\n"
+        "МОЙКА-УБОРКА:\n"
+        "✅6/1 по 14 часов смена (7-21 и 10-24)\n"
+        "✅360 руб/час,5040 смена\n"
+        "✅От 130 тр в месяц\n"
+        "✅Официальное оформление, оплачиваемый отпуск и больничный;\n"
+        "✅Нужен полный пакет документов.\n"
+        "МОЙЩИК КОТЛОВ:\n"
+        "✅6/1 по 14 часов смена 7-21 или 19-7(НОЧЬ СМЕНА)\n"
+        "📌м. Китай-город\n"
+        "@bakery_hr"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok is False
+    assert reason in ("permanent_job", "non_event_labor", "ambiguous_category", "quality_gate:loader")
+    assert cat != "loader" or not ok
+
+
+def test_technician_with_driver_license_plus_is_helper_not_driver():
+    text = (
+        "В связи с расширением в небольшой прокат концертного оборудования "
+        "требуется #**техник** (с возможным ростом до старшего)\n"
+        "**Не обязательно с опытом**. Главное — быть молодым, адекватным.\n"
+        "Работы много. **Зарплата по рынку. **\n"
+        "Если есть водительские права — это большой плюс.\n"
+        "📝 Пиши в личные сообщения\n"
+        "@rental_boss"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert detect_category(text) != "driver"
+    if ok:
+        assert cat == "helper"
+    else:
+        assert reason != "quality_gate:driver"

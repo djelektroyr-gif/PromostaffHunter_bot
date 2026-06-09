@@ -236,6 +236,7 @@ REJECT_REASON_LABELS = {
     "excluded_organizer": "организатор/свадьба",
     "permanent_job": "постоянная/вахта",
     "office_staff_job": "офисная работа (не event-staff)",
+    "non_event_labor": "не event-staff (производство/ЖКХ/общепит)",
     "remote_office_job": "удалённая офисная работа",
     "staff_job": "персонал (прошёл gate)",
 }
@@ -1810,8 +1811,9 @@ _CATEGORY_KEYWORDS = {
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
         "складской работник", "на склад", "рохл", "паллет", "складирован",
-        "производств", "фасовоч", "кладовщик",
-        "уборка", "разбирать", "посадка растений", "декоративные работы", "прораб",
+        "фасовоч", "кладовщик",
+        "уборка",
+        "разбирать", "посадка растений", "декоративные работы", "прораб",
         "погруз", "глины", "тележк",
     ],
     "promoter": [
@@ -1847,6 +1849,8 @@ _CATEGORY_KEYWORDS = {
         # «мероприят» — намеренный стем: мероприятие / мероприятия / мероприятий
         "хелпер на мероприят", "хэлпер на мероприят",
         "хелпер на мероприятие", "хэлпер на мероприятие",
+        "хелперов", "хэлперов", "хелперск", "хэлперск",
+        "демонтаж", "монтажник",
         "помощник на мероприятие", "помощник организатора",
         "помощь на площадке", "помощники на площадке",
         "к мероприятию", "деловое мероприятие", "приготовить площадку",
@@ -1858,14 +1862,24 @@ _CATEGORY_KEYWORDS = {
 
 _HELPER_EVENT_HINTS = (
     "мероприят", "площадк", "хелпер", "хэлпер", "регистрац", "конференц",
-    "саммит", "summit", "к мероприятию", "демонтаж декор", "реквизит",
+    "саммит", "summit", "к мероприятию", "демонтаж", "монтажник", "монтажн",
     "на такси на площадку", "монтаж",
+)
+_HELPER_HEADCOUNT_RE = re.compile(
+    r"(?:нужн\w*|требу\w*)\s+\d+\s+х[еэ]лпер|\d+\s+х[еэ]лпер",
+    re.I,
 )
 
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
-    "склад", "рохл", "паллет", "фасовоч", "конвейер", "производств", "50 кг",
-    "уборка", "разнорабоч", "подсобн", "посадка", "глины",
+    "склад", "рохл", "паллет", "фасовоч", "конвейер", "50 кг",
+    "разнорабоч", "подсобн", "посадка", "глины",
+)
+_LOADER_CORE_HINTS = (
+    "грузчик", "грузчики", "разгруз", "погруз", "выгруз", "такелаж",
+    "склад", "фура", "рохл", "паллет", "комплектовщик", "кладовщик",
+    "разнорабоч", "подсобник", "упаковщик", "фасовщик", "50 кг", "тележк",
+    "помощь мастерам", "на лесах", "лесах", "конвейер", "фасовоч",
 )
 _PROMO_HINTS = (
     "промоутер", "листовок", "визиток", "промо-акция", "раздача листовок",
@@ -1961,6 +1975,11 @@ def _score_categories(text_lower: str) -> dict:
             if category == "driver" and kw.startswith("водител"):
                 if re.search(r"водител\w*\s+забер", text_lower) and "грузчик" in text_lower:
                     continue
+            if category == "loader" and kw == "уборка":
+                if not any(m in text_lower for m in _SHORT_TERM_SHIFT_MARKERS):
+                    continue
+                if any(m in text_lower for m in _NON_EVENT_LABOR_MARKERS):
+                    continue
             if _keyword_in_text(kw, text_lower):
                 scores[category] = scores.get(category, 0) + len(kw)
     if any(marker in text_lower for marker in _NON_SUPERVISOR_COORDINATOR):
@@ -1968,9 +1987,15 @@ def _score_categories(text_lower: str) -> dict:
     return scores
 
 
+def _has_explicit_helper_hiring(text_lower: str) -> bool:
+    return bool(_HELPER_HEADCOUNT_RE.search(text_lower))
+
+
 def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if not scores:
         return None
+    if _has_explicit_helper_hiring(text_lower):
+        return "helper"
     if _has_technician_role(text_lower) and scores.get("helper"):
         if not _is_driver_role(text_lower):
             return "helper"
@@ -1980,7 +2005,7 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
                 return "helper"
             if any(w in text_lower for w in _HELPER_EVENT_HINTS):
                 return "helper"
-        if any(w in text_lower for w in ("хелперский функционал", "хелперские задачи", "помощь на монтаже")):
+        if any(w in text_lower for w in ("хелперский функционал", "хелперские задачи", "хэлперские задачи", "помощь на монтаже", "демонтаж")):
             return "helper"
         if any(w in text_lower for w in _LABOR_HINTS):
             return "loader"
@@ -2064,9 +2089,18 @@ _PERMANENT_JOB_MARKERS = (
     "на постоянную основу", "постоянную основу",
     "вахта 30", "вахта 60", "вахта 90", "вахта от", "на вахту",
     "оформление по тк", "оформление по тк рф", "по тк рф",
-    "ежемесячн", "два раза в месяц", "график 5/2", "график 6/1",
+    "официальное оформление", "оплачиваемый отпуск", "больничн",
+    "полный пакет документов", "трудовой договор",
+    "ежемесячн", "два раза в месяц", "график 5/2", "график 6/1", "6/1 по",
     "набор на вахту", "проживание и питание бесплатно",
     "с заселением", "заселени",
+    " тр в месяц", "тр/мес",
+)
+_NON_EVENT_LABOR_MARKERS = (
+    "пекарн", "посудомой", "котломой", "мойщик котл", "мойщик кото",
+    "уборщиц", "уборщик", "прачечн", "жкх", "клининг",
+    "на производств", "пищевом производств", "общепит",
+    "мойка-уборка", "мойка уборка",
 )
 _MASSOVKA_FILM_MARKERS = (
     "массовк", "на съёмках", "на съемках", "съемки клипа", "съёмки клипа",
@@ -2079,8 +2113,9 @@ _DIGITAL_WORK_MARKERS = (
 )
 _SHIFT_JOB_MARKERS = (
     "на сегодня", "на завтра", "на сейчас", "срочно",
-    "заказ наряд", "разово", "подработк", "смена ",
+    "заказ наряд", "разово", "подработк",
 )
+_SHORT_TERM_SHIFT_MARKERS = _SHIFT_JOB_MARKERS
 
 _PRO_CASTING_MARKERS = (
     "спектакл", "гастрол", "проф. артист", "профессиональный акт",
@@ -2204,26 +2239,46 @@ def is_digital_work_spam(text: str) -> bool:
     return True
 
 
+def is_non_event_labor_spam(text: str) -> bool:
+    """Пекарня, ЖКХ, посудомой — не грузчик/хелпер на мероприятии."""
+    if not text:
+        return False
+    tl = text.lower()
+    if not any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
+        return False
+    if any(w in tl for w in _LOADER_CORE_HINTS):
+        return False
+    if any(w in tl for w in (
+        "грузчик", "разгруз", "выгруз", "мероприят", "event staff",
+        "фура", "склад", "такелаж", "хелпер", "хэлпер", "конвейер", "фасовоч", "рохл",
+    )):
+        return False
+    return True
+
+
 def is_permanent_job_spam(text: str) -> bool:
     """Вахта/ТК — не разовая смена для бота."""
     if not text:
         return False
     tl = text.lower()
     if re.search(r"\d{2,3}[\s\d]*000\s*(?:-|–|—)?\s*\d{0,3}[\s\d]*000\s*(?:руб|₽|р)?\s*(?:в\s+)?месяц", tl):
-        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+        if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
     if re.search(r"\d{2,3}[.\s]\d{3}.*(?:в\s+)?месяц", tl):
-        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+        if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
+            return True
+    if re.search(r"(?:от\s*)?\d{2,3}\s*тр\s*(?:в\s+)?месяц", tl):
+        if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
     if "на руки" in tl and "месяц" in tl and re.search(r"\d{2,3}[.\s]\d{2,3}", tl):
-        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+        if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
     if re.search(r"(?:от\s*)?\+\s*\d{2,3}[\s.]*000.*месяц", tl):
-        if not any(m in tl for m in _SHIFT_JOB_MARKERS):
+        if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
     if not any(m in tl for m in _PERMANENT_JOB_MARKERS):
         return False
-    if any(m in tl for m in _SHIFT_JOB_MARKERS):
+    if any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
         return False
     if re.search(r"к\s*\d{1,2}[:.\s]", tl):
         return False
@@ -2451,6 +2506,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "permanent_job", []
     if is_office_staff_spam(text):
         return False, "office_staff_job", []
+    if is_non_event_labor_spam(text):
+        return False, "non_event_labor", []
     if is_unpaid_vacancy(text):
         return False, "unpaid", []
     if is_academic_writing_spam(text):
@@ -2511,8 +2568,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
         helper_markers = (
             "хелпер", "хэлпер", "хелперы", "хэлперы",
             "требуются хелпер", "требуются хэлпер",
-            "хелперский функционал", "хелперские задачи",
-            "помощь на монтаже",
+            "хелперский функционал", "хелперские задачи", "хэлперские задачи",
+            "помощь на монтаже", "демонтаж", "монтажник",
             "#техник", "техник прокат", "техник оборудован",
             "хелпер на мероприят", "хэлпер на мероприят",
             "хелпер на мероприятие", "хэлпер на мероприятие",
@@ -2529,18 +2586,22 @@ def passes_quality_gate(category: str, text: str) -> bool:
                 return False
         if any(w in tl for w in _LABOR_HINTS) and not any(
             m in tl for m in (
-                "хелпер", "хэлпер", "хелперский", "хелперские",
+                "хелпер", "хэлпер", "хелперский", "хелперские", "хэлперск",
                 "помощник на мероприят", "помощник организатора",
-                "помощь на монтаже",
+                "помощь на монтаже", "демонтаж",
             )
         ):
             return False
     elif category == "loader":
-        if not any(w in tl for w in _LABOR_HINTS + (
-            "грузчик", "разнорабоч", "подсобник", "такелаж", "кладовщик",
-            "разгрузк", "погрузк", "помощь мастерам", "на лесах", "разнорабочие",
-        )):
-            return False
+        if any(w in tl for w in _LOADER_CORE_HINTS):
+            return True
+        if (
+            "уборка" in tl
+            and any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS)
+            and not any(m in tl for m in _NON_EVENT_LABOR_MARKERS)
+        ):
+            return True
+        return False
     elif category == "promoter":
         if not any(w in tl for w in _PROMO_HINTS):
             return False
