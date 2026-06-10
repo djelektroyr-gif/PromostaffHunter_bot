@@ -1432,9 +1432,77 @@ def get_last_debug_report() -> str:
             )
     return "\n".join(lines)
 
+def _is_maps_url(url: str) -> bool:
+    u = (url or "").lower()
+    return any(
+        x in u
+        for x in (
+            "yandex.ru/maps", "yandex.com/maps", "google.com/maps", "maps.google",
+            "go.yandex", "2gis.ru",
+        )
+    )
+
+
+def _is_application_url(url: str) -> bool:
+    if not url or _is_maps_url(url):
+        return False
+    u = url.lower()
+    return any(
+        d in u
+        for d in (
+            "airtable.com", "forms.gle", "docs.google.com/forms", "forms.google.com",
+            "typeform.com", "jotform.com", "anketolog.ru", "surveymonkey.com",
+            "tally.so", "notion.site", "leadplan.ru", "formdesigner.ru",
+        )
+    )
+
+
+_APPLY_LABEL_RE = re.compile(
+    r"заявк|отклик|анкет|apply|register|регистр|подать",
+    re.IGNORECASE,
+)
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)]+)\)", re.IGNORECASE)
+
+
+def _extract_application_url(text: str) -> str | None:
+    """Форма заявки (Airtable, Google Forms, …) — приоритетнее @ канала в footer."""
+    if not text:
+        return None
+    md_links = _MD_LINK_RE.findall(text)
+    for label, url in md_links:
+        url = url.strip()
+        if _is_application_url(url) and _APPLY_LABEL_RE.search(label):
+            return url
+    for _label, url in md_links:
+        url = url.strip()
+        if _is_application_url(url):
+            return url
+    for m in re.finditer(r"https?://[^\s\])<>\"']+", text):
+        url = m.group(0).rstrip(".,;")
+        if _is_application_url(url):
+            return url
+    return None
+
+
+def pick_employer_contact_for_response(saved_contact: str | None, vacancy_text: str | None) -> str | None:
+    """Контакт для отклика: перечитываем текст; форма заявки важнее сохранённого @ канала."""
+    extracted = extract_contact_from_text(vacancy_text or "")
+    saved = (saved_contact or "").strip() or None
+    if extracted and _is_application_url(extracted):
+        return extracted
+    if saved and _is_application_url(saved):
+        return saved
+    if extracted:
+        return extracted
+    return saved
+
+
 def extract_contact_from_text(text: str) -> str:
     if not text:
         return None
+    apply_url = _extract_application_url(text)
+    if apply_url:
+        return apply_url
     md_user = re.search(r"\]\(tg://user\?id=(\d+)\)", text, re.IGNORECASE)
     if md_user:
         return f"tg://user?id={md_user.group(1)}"

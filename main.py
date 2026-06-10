@@ -16,6 +16,7 @@ from db import *
 from db_backend import db_conn, fetchone, now_minus_days, bool_false, run_db
 from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
+    pick_employer_contact_for_response,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
     make_vacancy_id, PARSER_LABEL, inspect_parser_chats, format_parser_chats_report,
     get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
@@ -2065,6 +2066,12 @@ async def finish_profile_field_edit(message: types.Message, state: FSMContext, u
     await message.answer(notice, parse_mode="Markdown", reply_markup=keyboard)
     await send_profile_data_screen(message.chat.id, user_id)
 
+def _normalize_ru_phone_digits(contact: str) -> str | None:
+    from services.employer_contact import normalize_ru_phone_digits
+
+    return normalize_ru_phone_digits(contact)
+
+
 def build_contact_link(contact: str, text: str) -> str | None:
     """URL для inline-кнопки «Открыть чат». tg://user?id= Bot API отклоняет (BUTTON_USER_INVALID)."""
     if not contact:
@@ -2077,22 +2084,29 @@ def build_contact_link(contact: str, text: str) -> str | None:
         return f"https://t.me/{username}?text={quote(text)}"
     if contact.startswith("tg://user?id="):
         return None
-    if contact.startswith("https://t.me/") or contact.startswith("http://t.me/"):
-        base = contact.split("?", 1)[0]
-        return f"{base}?text={quote(text)}"
-    if contact.startswith("https://wa.me/") or contact.startswith("http://wa.me/"):
+    if contact.startswith("https://") or contact.startswith("http://"):
+        lower = contact.lower()
+        if any(m in lower for m in ("yandex.ru/maps", "google.com/maps", "maps.google", "2gis.ru")):
+            return None
+        if lower.startswith("https://t.me/") or lower.startswith("http://t.me/"):
+            base = contact.split("?", 1)[0]
+            return f"{base}?text={quote(text)}"
+        if "wa.me/" in lower or "api.whatsapp.com" in lower:
+            base = contact.split("?", 1)[0]
+            return f"{base}?text={quote(text)}"
         return contact
-    digits = re.sub(r"\D", "", contact)
-    if digits:
-        if len(digits) == 11 and digits.startswith("8"):
-            digits = "7" + digits[1:]
-        if len(digits) == 11 and digits.startswith("7"):
-            return f"tel:+{digits}"
+    # Только цифры телефона: Bot API не даёт tel: и tg://user в url-кнопках — без кнопки, черновик в тексте.
     return None
 
 
 def manual_contact_hint(contact: str | None, draft_text: str) -> str:
     """Подсказка, если кнопку deeplink к заказчику собрать нельзя."""
+    from services.employer_contact import (
+        format_phone_display,
+        is_phone_only_employer_contact,
+        phone_response_instructions_markdown,
+    )
+
     if not contact:
         return ""
     if contact.startswith("tg://user?id="):
@@ -2106,6 +2120,13 @@ def manual_contact_hint(contact: str | None, draft_text: str) -> str:
         return (
             f"\n\nЕсли кнопка не открылась — напишите {escape_markdown(contact)} вручную "
             f"и вставьте черновик:\n\n```\n{draft_text}\n```"
+        )
+    if is_phone_only_employer_contact(contact):
+        phone_line = format_phone_display(contact)
+        return (
+            f"\n\n📞 *Номер заказчика:* {escape_markdown(phone_line)}\n\n"
+            f"{phone_response_instructions_markdown()}\n\n"
+            f"```\n{draft_text}\n```"
         )
     return (
         f"\n\nКонтакт: `{escape_markdown(contact)}`. Скопируйте черновик:\n\n"
@@ -2132,7 +2153,7 @@ async def send_user_message_safe_buttons(
         )
     except TelegramBadRequest as e:
         err = str(e).lower()
-        if "button_user_invalid" not in err and "button_url_invalid" not in err:
+        if "button_user_invalid" not in err and "button_url_invalid" not in err and "inline keyboard button url" not in err:
             raise
         logger.warning("Bad inline url button for user %s: %s", user_id, e)
         safe_rows = []
@@ -2160,6 +2181,18 @@ async def send_user_message_safe_buttons(
         )
 
 
+def _response_open_button_label(contact_link: str) -> str:
+    cl = contact_link.lower()
+    if any(
+        d in cl
+        for d in ("airtable.com", "forms.gle", "typeform", "jotform", "docs.google.com/forms")
+    ):
+        return "✅ Подать заявку"
+    if cl.startswith("https://wa.me/") or cl.startswith("http://wa.me/"):
+        return "✅ Написать в WhatsApp"
+    return "✅ Открыть чат и отправить"
+
+
 def build_response_draft_message(
     *,
     employer_contact: str,
@@ -2167,18 +2200,41 @@ def build_response_draft_message(
     draft_text: str,
     contact_link: str | None,
 ) -> str:
+    from services.employer_contact import format_phone_display, is_phone_only_employer_contact
+
     req_line = ", ".join(required_fields) if required_fields else "явных требований не найдено"
+    if is_phone_only_employer_contact(employer_contact) and not contact_link:
+        from services.employer_contact import phone_response_instructions_markdown
+
+        phone_line = format_phone_display(employer_contact)
+        return (
+            "📨 *Черновик отклика готов*\n\n"
+            f"📞 *Номер заказчика:* {escape_markdown(phone_line)}\n"
+            f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
+            f"{phone_response_instructions_markdown()}\n\n"
+            f"```\n{draft_text}\n```"
+        )
     msg = (
         "📨 *Черновик отклика готов*\n\n"
         f"👨‍💼 Контакт заказчика: `{escape_markdown(employer_contact)}`\n"
         f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n\n"
     )
     if contact_link:
-        msg += (
-            "Нажмите кнопку ниже — откроется чат с заказчиком и готовым текстом.\n"
-            "Перед отправкой можно отредактировать сообщение.\n\n"
-            "_Карточка отклика — в «📨 Мои отклики». Заказчику нужно отправить сообщение вручную кнопкой выше._"
-        )
+        if any(
+            d in contact_link.lower()
+            for d in ("airtable.com", "forms.gle", "typeform", "jotform", "docs.google.com/forms")
+        ):
+            msg += (
+                "Нажмите кнопку ниже — откроется **форма заявки** заказчика.\n"
+                "При необходимости скопируйте данные профиля из «👤 Мои данные» в поля формы.\n\n"
+                "_Карточка отклика — в «📨 Мои отклики»._"
+            )
+        else:
+            msg += (
+                "Нажмите кнопку ниже — откроется чат с заказчиком и готовым текстом.\n"
+                "Перед отправкой можно отредактировать сообщение.\n\n"
+                "_Карточка отклика — в «📨 Мои отклики». Заказчику нужно отправить сообщение вручную кнопкой выше._"
+            )
     else:
         msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
     return msg
@@ -2193,7 +2249,9 @@ def build_response_action_keyboard(
 ) -> InlineKeyboardMarkup:
     buttons = []
     if contact_link:
-        buttons.append([InlineKeyboardButton(text="✅ Открыть чат и отправить", url=contact_link)])
+        buttons.append([
+            InlineKeyboardButton(text=_response_open_button_label(contact_link), url=contact_link),
+        ])
     buttons.append([InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data=f"respond_add_{vacancy_id}")])
     if LLM_ENABLED and is_user_premium(user_id):
         buttons.append([_inline_btn("✨ Улучшить текст", callback_data=f"respond_llm_{vacancy_id}", style="primary")])
@@ -5400,7 +5458,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         return
     vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     vac_snippet = vacancy_text[:200] if vacancy_text else None
-    employer_contact = saved_contact or extract_contact_from_text(vacancy_text or "")
+    employer_contact = pick_employer_contact_for_response(saved_contact, vacancy_text)
     if not employer_contact:
         if not add_response(
             user_id,
@@ -5540,7 +5598,7 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка данных", show_alert=True)
         return
     vacancy_text = row[0] or ""
-    employer_contact = row[3] or extract_contact_from_text(vacancy_text)
+    employer_contact = pick_employer_contact_for_response(row[3], vacancy_text)
     await callback.answer("Составляю текст…")
     from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
     from services.llm_client import ask_llm
@@ -5625,7 +5683,7 @@ async def successful_payment_handler(message: types.Message):
         await message.answer("✅ Оплата прошла. Откройте вакансию в «Мои отклики».")
         return
     vacancy_text = row[0] or ""
-    employer_contact = row[3] or extract_contact_from_text(vacancy_text)
+    employer_contact = pick_employer_contact_for_response(row[3], vacancy_text)
     prefix = "⭐ Приоритетный отклик через Promostaff Hunter\n\n"
     draft = build_candidate_profile_text(profile)
     if LLM_ENABLED and is_user_premium(user_id):
@@ -5726,7 +5784,7 @@ async def respond_comment_received(message: types.Message, state: FSMContext):
         return
     vacancy_text = row[0]
     saved_contact = row[3]
-    contact = saved_contact or extract_contact_from_text(vacancy_text or "")
+    contact = pick_employer_contact_for_response(saved_contact, vacancy_text)
     draft_text = build_candidate_profile_text(profile, extra_comment=message.text)
     link = build_contact_link(contact, draft_text)
     if not link:

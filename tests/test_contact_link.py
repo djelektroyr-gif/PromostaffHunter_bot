@@ -19,12 +19,26 @@ def test_tg_user_id_no_button():
     assert build_contact_link("tg://user?id=123456789", "Hi") is None
 
 
-def test_phone_tel():
-    assert build_contact_link("+7 916 123-45-67", "Hi") == "tel:+79161234567"
+def test_phone_no_inline_button():
+    """Bot API не принимает tel: — только ручной отклик с черновиком в тексте."""
+    assert build_contact_link("+7 916 123-45-67", "Hi") is None
+    assert build_contact_link("89254807851", "Привет") is None
 
 
-def test_wa_me():
-    assert build_contact_link("https://wa.me/79001234567", "Hi") == "https://wa.me/79001234567"
+def test_wa_me_explicit_link_with_text():
+    assert (
+        build_contact_link("https://wa.me/79001234567", "Hi")
+        == "https://wa.me/79001234567?text=Hi"
+    )
+
+
+def test_airtable_form_link_passthrough():
+    url = "https://airtable.com/appglH7lKHqV99EIi/shrSX4Drh5gna7MkC"
+    assert build_contact_link(url, "draft") == url
+
+
+def test_maps_url_not_button():
+    assert build_contact_link("https://yandex.ru/maps/-/CPvW7RjJ", "Hi") is None
 
 
 def test_invalid_username():

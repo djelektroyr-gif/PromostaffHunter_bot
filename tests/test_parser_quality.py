@@ -11,6 +11,7 @@ from parser import (
     _extract_phone_digits,
     detect_duplicate_type,
     detect_category,
+    pick_employer_contact_for_response,
     chat_id_aliases,
     is_chat_monitored,
     is_vacancy_closed_text,
@@ -44,6 +45,28 @@ def test_extract_address_detects_metro_with_emoji():
 def test_extract_contact_from_tg_resolve_link():
     text = "Контакт: tg://resolve?domain=GuseynzadeGF"
     assert extract_contact_from_text(text) == "@GuseynzadeGF"
+
+
+def test_extract_contact_airtable_apply_link():
+    text = (
+        "Продавцы на ВДНХ\n"
+        "[🙌ПОДАТЬ ЗАЯВКУ🙌](https://airtable.com/appglH7lKHqV99EIi/shrSX4Drh5gna7MkC)\n"
+        "есть❓, пиши 👇\n"
+        "📍 [Парк ОРИОН](https://yandex.ru/maps/-/CPvW7RjJ)\n"
+    )
+    assert extract_contact_from_text(text) == "https://airtable.com/appglH7lKHqV99EIi/shrSX4Drh5gna7MkC"
+
+
+def test_pick_employer_contact_prefers_airtable_over_saved_channel():
+    text = (
+        "[🙌ПОДАТЬ ЗАЯВКУ🙌](https://airtable.com/appglH7lKHqV99EIi/shrSX4Drh5gna7MkC)\n"
+    )
+    assert pick_employer_contact_for_response("@HelpersTeam", text).startswith("https://airtable.com/")
+
+
+def test_extract_contact_ignores_maps_links():
+    text = "📍 [Парк ОРИОН](https://yandex.ru/maps/-/CPvW7RjJ)"
+    assert extract_contact_from_text(text) is None
 
 
 def test_is_message_recent_within_window():

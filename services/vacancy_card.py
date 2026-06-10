@@ -9,6 +9,12 @@ from datetime import date, datetime, timedelta, timezone
 from html import escape as escape_html
 
 MSK_TZ = timezone(timedelta(hours=3))
+from services.employer_contact import (
+    format_phone_display,
+    is_phone_only_employer_contact,
+    phone_vacancy_notice_html,
+    resolve_effective_employer_contact,
+)
 from services.vacancy_enrichment import enrich_vacancy_text, resolve_map_address, extract_shift_date_token
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
@@ -43,6 +49,7 @@ class VacancyCardInput:
     min_hours: int | None = None
     shift_date: str | None = None
     shift_time_start: str | None = None
+    author_contact: str | None = None
 
 
 def _parse_geo_tags(raw) -> list[str] | None:
@@ -88,6 +95,7 @@ def _merge_enrichment(inp: VacancyCardInput) -> VacancyCardInput:
         min_hours=inp.min_hours if inp.min_hours is not None else enriched.min_hours,
         shift_date=shift_date,
         shift_time_start=inp.shift_time_start or enriched.shift_time_start,
+        author_contact=inp.author_contact,
     )
 
 
@@ -146,6 +154,7 @@ def card_input_from_push_row(
         rate_shift=row[18] if row and len(row) > 18 else None,
         shift_date=row[20] if row and len(row) > 20 else None,
         shift_time_start=row[21] if row and len(row) > 21 else None,
+        author_contact=row[3] if row else None,
     )
     return _merge_enrichment(base)
 
@@ -174,6 +183,7 @@ def card_input_from_order(
         min_hours=order.get("min_hours"),
         shift_date=order.get("shift_date"),
         shift_time_start=order.get("shift_time_start"),
+        author_contact=order.get("author_contact"),
     )
     return _merge_enrichment(base)
 
@@ -204,6 +214,7 @@ def card_input_from_feed_vac(
         rate_shift=vac.get("rate_shift"),
         shift_date=vac.get("shift_date"),
         shift_time_start=vac.get("shift_time_start"),
+        author_contact=vac.get("author_contact") or vac.get("contact"),
     )
     return _merge_enrichment(base)
 
@@ -295,6 +306,14 @@ def _shift_schedule_line(inp: VacancyCardInput) -> str | None:
     return ", ".join(parts)
 
 
+def _append_phone_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
+    contact = resolve_effective_employer_contact(inp.author_contact, inp.body)
+    if not is_phone_only_employer_contact(contact):
+        return
+    lines_out.append(f"📞 {escape_html(format_phone_display(contact or ''))}")
+    lines_out.append(phone_vacancy_notice_html())
+
+
 def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool = True) -> str:
     """Компактная карточка — канал, push, лента.
 
@@ -328,6 +347,8 @@ def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool
     task = _extract_task_hint(sanitized, headline)
     if task and task != (headline or ""):
         lines_out.append(escape_html(task))
+
+    _append_phone_apply_notice(lines_out, ctx)
 
     if len(lines_out) == 1:
         lines_out.append("Подробности — по кнопке «Открыть вакансию».")
@@ -363,5 +384,7 @@ def build_vacancy_full_html(inp: VacancyCardInput) -> str:
     if extras:
         lines_out.append("")
         lines_out.extend(extras)
+
+    _append_phone_apply_notice(lines_out, ctx)
 
     return "\n".join(lines_out)
