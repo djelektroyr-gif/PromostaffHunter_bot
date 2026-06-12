@@ -40,6 +40,8 @@ from config import (
     FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS, FEED_HISTORY_MAX_HOURS,
     FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID,
     LLM_ENABLED, LLM_DAILY_LIMIT_PREMIUM, STARS_ENABLED, STARS_EXTENDED_RESPONSE_PRICE,
+    STARS_RESPONSE_PRICE, PAID_RESPONSES_ENABLED, RESPONSE_PACK_CREDITS, RESPONSE_PACK_PRICE_RUB,
+    TRIAL_ON_FIRST_RESPONSE,
 )
 from profile_photos import (
     get_user_photos_dir, persist_user_photo, photo_health_loop, send_profile_photo,
@@ -802,6 +804,106 @@ def format_premium_payment_details_html(user_id: int) -> str:
     return "\n".join(lines)
 
 
+def format_response_pack_payment_details_html(user_id: int) -> str:
+    lines = []
+    if SUBSCRIPTION_CARD_HINT:
+        lines.append(f"💳 <b>Реквизиты:</b> {escape_html(SUBSCRIPTION_CARD_HINT)}")
+    lines.append(
+        f"💰 <b>Сумма:</b> {escape_html(str(RESPONSE_PACK_PRICE_RUB))} ₽ "
+        f"за {RESPONSE_PACK_CREDITS} откликов"
+    )
+    lines.append(f"В комментарии к переводу укажите ID: <code>{user_id}</code>")
+    return "\n".join(lines)
+
+
+def response_pack_admin_keyboard(request_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"✅ +{RESPONSE_PACK_CREDITS} откликов",
+                callback_data=f"rp_a_{request_id}",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить",
+                callback_data=f"rp_r_{request_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="👤 Карточка",
+                callback_data=f"adm_u_{user_id}_0",
+            ),
+        ],
+    ])
+
+
+def format_response_pack_admin_caption_html(req: dict) -> str:
+    uname = req.get("username")
+    user_line = f"@{escape_html(uname)}" if uname else f"ID <code>{req['user_id']}</code>"
+    pending = count_pending_response_pack_requests()
+    return (
+        f"📦 <b>Пакет откликов</b> · #{req['id']}\n"
+        f"Очередь: {pending}\n\n"
+        f"👤 {user_line}\n"
+        f"📝 {escape_html(req.get('full_name') or '—')}\n"
+        f"📞 {escape_html(req.get('phone') or '—')}\n"
+        f"💰 {RESPONSE_PACK_PRICE_RUB} ₽ → {RESPONSE_PACK_CREDITS} откликов"
+    )
+
+
+async def send_admin_response_pack_alert(request_id: int):
+    req = get_response_pack_request(request_id)
+    if not req or req.get("status") != "pending":
+        return
+    caption = format_response_pack_admin_caption_html(req)
+    markup = response_pack_admin_keyboard(req["id"], req["user_id"])
+    file_id = req.get("receipt_file_id")
+    kind = req.get("receipt_kind")
+    try:
+        if file_id and kind == "photo":
+            await bot.send_photo(
+                YOUR_USER_ID, file_id, caption=caption,
+                parse_mode="HTML", reply_markup=markup,
+            )
+        elif file_id and kind == "document":
+            await bot.send_document(
+                YOUR_USER_ID, file_id, caption=caption,
+                parse_mode="HTML", reply_markup=markup,
+            )
+        else:
+            await bot.send_message(
+                YOUR_USER_ID, caption, parse_mode="HTML", reply_markup=markup,
+            )
+    except Exception as e:
+        logger.warning("send_admin_response_pack_alert #%s: %s", request_id, e)
+
+
+def build_response_paywall_keyboard(vacancy_id: str, user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if STARS_ENABLED:
+        rows.append([
+            _inline_btn(
+                f"⭐ {STARS_RESPONSE_PRICE} Stars — этот отклик",
+                callback_data=f"resp_star_{vacancy_id}",
+                style="primary",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text=f"📦 {RESPONSE_PACK_CREDITS} откликов — {RESPONSE_PACK_PRICE_RUB} ₽",
+            callback_data="resp_pack_start",
+        ),
+    ])
+    sub_btns = subscription_action_buttons(user_id)
+    if sub_btns and sub_btns.inline_keyboard:
+        rows.extend(sub_btns.inline_keyboard[:1])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="💎 Premium — безлимит", callback_data="subscription_from_paywall"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def format_premium_request_admin_caption(req: dict) -> str:
     """Legacy Markdown — предпочтительно HTML-версия ниже."""
     title = "💳 *Запрос продления Premium*" if req.get("is_renewal") else "💳 *Запрос Premium*"
@@ -1042,9 +1144,14 @@ async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy
     if not inp:
         await message.answer("❌ Вакансия не найдена.")
         return
-    from services.vacancy_card import build_vacancy_full_html
+    from services.vacancy_card import build_vacancy_preview_html
 
-    text = build_vacancy_full_html(inp)
+    text = build_vacancy_preview_html(inp)
+    if TRIAL_ON_FIRST_RESPONSE:
+        text += (
+            f"\n\n<i>Нажмите «Откликнуться» — короткая анкета (имя и телефон).</i>\n"
+            f"<i>🎁 Первый отклик — пробный Premium {TRIAL_DAYS} дн.</i>"
+        )
     keyboard = build_vacancy_keyboard(vacancy_id, collapsed=False, **map_fields)
     await send_vacancy_card(user_id, text, reply_markup=keyboard)
 
@@ -1471,6 +1578,10 @@ class ResponseDraftState(StatesGroup):
     waiting_for_comment = State()
 
 class PremiumPaymentState(StatesGroup):
+    waiting_for_receipt = State()
+
+
+class ResponsePackPaymentState(StatesGroup):
     waiting_for_receipt = State()
 
 class ProfileEditState(StatesGroup):
@@ -3026,6 +3137,15 @@ async def start_cmd(message: types.Message, state: FSMContext):
                 reply_markup=keyboard
             )
             return
+        if start_payload.startswith("vac_"):
+            await setup_forum_topics_for_user(user_id)
+            keyboard, _ = get_main_keyboard(user_id)
+            await message.answer(
+                f"👋 С возвращением, {greet_name}!\n\n"
+                "Вакансия выше — нажмите «Откликнуться».",
+                reply_markup=keyboard,
+            )
+            return
         fsm_data = await state.get_data()
         await send_category_picker(
             message.chat.id,
@@ -3043,6 +3163,9 @@ async def start_cmd(message: types.Message, state: FSMContext):
             parse_mode="Markdown",
         )
         await state.set_state(EmployerRegState.waiting_for_name)
+        return
+
+    if start_payload.startswith("vac_"):
         return
 
     await message.answer(
@@ -3382,6 +3505,28 @@ async def process_photo(message: types.Message, state: FSMContext):
 
     # Профиль уже полностью сохранён в БД, просто завершаем регистрацию
     data = await state.get_data()
+    pending_vac = data.get("pending_response_vacancy_id")
+    if pending_vac:
+        await message.answer(
+            "✅ *Профиль готов!* Отправляю отклик…",
+            parse_mode="Markdown",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        from services.admin_ops_alerts import notify_admin_registration_success
+        from services.bot_events import EVENT_REG_COMPLETE, record_bot_event
+        record_bot_event(user_id, EVENT_REG_COMPLETE)
+        await notify_admin_registration_success(
+            bot,
+            user_id=user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            role="candidate",
+        )
+        await setup_forum_topics_for_user(user_id)
+        await continue_response_after_registration(message, user_id, pending_vac, state)
+        await state.clear()
+        return
+
     await message.answer(
         "✅ *Профиль успешно создан!*\n\n"
         f"📝 ФИО: {data['full_name']}\n"
@@ -3533,16 +3678,8 @@ async def finish_categories(callback: types.CallbackQuery):
             callback.message.chat.id,
             message_thread_id=thread_id_from_message(callback.message),
         ):
-            trial_granted = await run_db(grant_trial_if_eligible, user_id, TRIAL_DAYS)
             await setup_forum_topics_for_user(user_id)
-        trial_line = ""
-        if trial_granted:
-            trial_line = (
-                f"\n\n🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — все категории, push и фильтр по метро!\n"
-                f"_После trial без оплаты останется {_free_category_hint_short()} — оформите Premium, "
-                "чтобы сохранить несколько категорий._"
-            )
-        title = "✅ *Вы подписались на вакансии!*" if trial_granted else "✅ *Категории сохранены!*"
+        title = "✅ *Категории сохранены!*"
         try:
             await callback.message.delete()
         except TelegramBadRequest:
@@ -3556,7 +3693,7 @@ async def finish_categories(callback: types.CallbackQuery):
             f"📌 Ваши категории:\n{categories_text}\n\n"
             f"{'💎 Новые вакансии — в теме «📬 Вакансии».' if FORUM_TOPICS_ENABLED else '💎 Новые вакансии приходят моментально в чат.'}"
             f"{' Push Premium.' if await run_db(is_user_premium, user_id) else ' Free: «Посмотреть новые».'}"
-            f"{trial_line}\n\n"
+            f"\n\n🎁 *Пробный Premium* выдаётся при первом отклике на вакансию ({TRIAL_DAYS} дн.).\n\n"
             f"📖 Инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
             parse_mode="Markdown",
@@ -5465,26 +5602,61 @@ async def complaint_text(message: types.Message, state: FSMContext):
 
 # ========== ОТКЛИКИ НА ВАКАНСИИ С ВОЗМОЖНОСТЬЮ ПРИКРЕПИТЬ ФОТО ==========
 
-@dp.callback_query(
-    lambda c: c.data
-    and c.data.startswith("respond_")
-    and not c.data.startswith("respond_add_")
-    and not c.data.startswith("respond_llm_")
-    and c.data != "respond_cancel"
-)
-async def handle_response(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    vacancy_id = callback.data.replace("respond_", "")
-    if is_already_responded(user_id, vacancy_id):
-        await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+async def _notify_first_response_trial(user_id: int, trial_info: dict | None) -> None:
+    if not trial_info or not trial_info.get("trial_granted"):
         return
+    from services.forum_topics import TOPIC_RESPONSES
+    cat_code = trial_info.get("category_code")
+    cat_line = ""
+    if cat_code and trial_info.get("category_added"):
+        cat_line = f"\n📌 Категория: *{get_category_name(cat_code)}*"
+    await send_user_message(
+        user_id,
+        topic_key=TOPIC_RESPONSES,
+        text=(
+            f"🎁 *Пробный Premium на {TRIAL_DAYS} дн.* — безлимит откликов и push-уведомления!"
+            f"{cat_line}\n"
+            f"_После trial — платный отклик (Stars или пакет) или подписка Premium._"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def _prompt_response_registration(
+    callback: types.CallbackQuery,
+    state: FSMContext,
+    vacancy_id: str,
+) -> None:
+    user_id = callback.from_user.id
+    await state.update_data(pending_response_vacancy_id=vacancy_id)
+    push_row = get_vacancy_push_row(vacancy_id)
+    if push_row and push_row[5]:
+        await state.update_data(deeplink_category=push_row[5])
+    set_subscriber_role(user_id, "candidate")
+    await callback.answer("Заполним короткую анкету")
+    await callback.message.answer(
+        "📝 *Для отклика нужны имя и телефон* — это займёт минуту.\n\n"
+        "Как вас представить заказчику? (ФИО)",
+        parse_mode="Markdown",
+    )
+    await state.set_state(RegistrationState.waiting_for_name)
+
+
+async def _execute_response_flow(
+    callback: types.CallbackQuery | None,
+    user_id: int,
+    vacancy_id: str,
+    state: FSMContext,
+    *,
+    trial_info: dict | None = None,
+) -> None:
     profile = get_subscriber_profile(user_id)
-    if not profile or not profile.get("full_name") or not profile.get("phone"):
-        await callback.answer("⚠️ Сначала заполните профиль! Нажмите /start", show_alert=True)
+    if not profile:
         return
     vacancy_row = get_vacancy_row(vacancy_id)
     if not vacancy_row:
-        await callback.answer("❌ Вакансия не найдена", show_alert=True)
+        if callback:
+            await callback.answer("❌ Вакансия не найдена", show_alert=True)
         return
     vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     vac_snippet = vacancy_text[:200] if vacancy_text else None
@@ -5507,14 +5679,17 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             source_chat_title=source_chat,
             draft_status="admin_forward",
         ):
-            await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+            if callback:
+                await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
             return
         from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
         record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id, "via": "admin_forward"})
-        await _mark_vacancy_card_responded(callback, vacancy_id, address)
-        await send_to_admin(
-            callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
-        )
+        if callback:
+            await _mark_vacancy_card_responded(callback, vacancy_id, address)
+            await send_to_admin(
+                callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
+            )
+        await _notify_first_response_trial(user_id, trial_info)
         return
     if not add_response(
         user_id,
@@ -5526,21 +5701,28 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
         source_chat_title=source_chat,
         draft_status="pending",
     ):
-        await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+        if callback:
+            await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
     from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
     record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id})
-    await _mark_vacancy_card_responded(callback, vacancy_id, address)
+    if callback:
+        await _mark_vacancy_card_responded(callback, vacancy_id, address)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
-    await callback.answer("Готовлю черновик…")
+    if callback:
+        await callback.answer("Готовлю черновик…")
     from services.forum_topics import TOPIC_RESPONSES
     from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
-    resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
+    resp_thread = None
+    chat_id = user_id
+    if callback and callback.message:
+        resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
+        chat_id = callback.message.chat.id
     draft_status = "failed"
     try:
-        async with typing_keepalive(bot, callback.message.chat.id, message_thread_id=resp_thread):
+        async with typing_keepalive(bot, chat_id, message_thread_id=resp_thread):
             draft_status = await deliver_response_draft(
                 user_id,
                 employer_contact=employer_contact,
@@ -5560,7 +5742,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 source_chat_title=source_chat,
             )
     except Exception as e:
-        logger.exception("handle_response user=%s vac=%s: %s", user_id, vacancy_id, e)
+        logger.exception("_execute_response_flow user=%s vac=%s: %s", user_id, vacancy_id, e)
         try:
             plain = build_response_draft_message(
                 employer_contact=employer_contact,
@@ -5590,7 +5772,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 text="📨 Отклик сохранён — «📨 Мои отклики». Отправьте сообщение заказчику вручную.",
             )
         except Exception as e2:
-            logger.exception("handle_response fallback failed: %s", e2)
+            logger.exception("_execute_response_flow fallback failed: %s", e2)
             await notify_admin_response_issue(
                 user_id,
                 vacancy_id,
@@ -5598,19 +5780,6 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 employer_contact=employer_contact,
                 reason=f"Не удалось доставить черновик: {e2}",
             )
-            try:
-                await send_user_message(
-                    user_id,
-                    topic_key=TOPIC_RESPONSES,
-                    text=(
-                        "⚠️ Не удалось отправить черновик автоматически.\n"
-                        "Напишите в «❓ Поддержка» — администратор поможет.\n\n"
-                        f"Скопируйте текст:\n\n```\n{draft_text}\n```"
-                    ),
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
             return
         await notify_admin_response_issue(
             user_id,
@@ -5619,6 +5788,103 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             employer_contact=employer_contact,
             reason=f"Первичная ошибка ({e}), черновик доставлен текстом.",
         )
+    await _notify_first_response_trial(user_id, trial_info)
+
+
+async def continue_response_after_registration(
+    message: types.Message,
+    user_id: int,
+    vacancy_id: str,
+    state: FSMContext,
+) -> None:
+    from services.response_monetization import resolve_response_access, consume_response_slot, response_paywall_text
+    if is_already_responded(user_id, vacancy_id):
+        await message.answer("❌ Вы уже откликались на эту вакансию.")
+        return
+    access = await run_db(resolve_response_access, user_id, vacancy_id)
+    if access.needs_paywall:
+        credits = get_response_credits(user_id)
+        await message.answer(
+            response_paywall_text(
+                credits=credits,
+                stars_price=STARS_RESPONSE_PRICE,
+                pack_credits=RESPONSE_PACK_CREDITS,
+                pack_price=RESPONSE_PACK_PRICE_RUB,
+            ),
+            parse_mode="Markdown",
+            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
+        )
+        return
+    ok, trial_info = await run_db(consume_response_slot, user_id, vacancy_id)
+    if not ok:
+        credits = get_response_credits(user_id)
+        await message.answer(
+            response_paywall_text(
+                credits=credits,
+                stars_price=STARS_RESPONSE_PRICE,
+                pack_credits=RESPONSE_PACK_CREDITS,
+                pack_price=RESPONSE_PACK_PRICE_RUB,
+            ),
+            parse_mode="Markdown",
+            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
+        )
+        return
+    await _execute_response_flow(None, user_id, vacancy_id, state, trial_info=trial_info)
+
+
+@dp.callback_query(
+    lambda c: c.data
+    and c.data.startswith("respond_")
+    and not c.data.startswith("respond_add_")
+    and not c.data.startswith("respond_llm_")
+    and c.data != "respond_cancel"
+)
+async def handle_response(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    vacancy_id = callback.data.replace("respond_", "")
+    if is_already_responded(user_id, vacancy_id):
+        await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+        return
+    profile = get_subscriber_profile(user_id)
+    if not profile or not profile.get("full_name") or not profile.get("phone"):
+        await _prompt_response_registration(callback, state, vacancy_id)
+        return
+    if not get_vacancy_row(vacancy_id):
+        await callback.answer("❌ Вакансия не найдена", show_alert=True)
+        return
+    from services.response_monetization import resolve_response_access, consume_response_slot, response_paywall_text
+    access = await run_db(resolve_response_access, user_id, vacancy_id)
+    if access.needs_paywall:
+        credits = get_response_credits(user_id)
+        await state.update_data(paywall_vacancy_id=vacancy_id)
+        await callback.answer("Нужна оплата отклика")
+        await callback.message.answer(
+            response_paywall_text(
+                credits=credits,
+                stars_price=STARS_RESPONSE_PRICE,
+                pack_credits=RESPONSE_PACK_CREDITS,
+                pack_price=RESPONSE_PACK_PRICE_RUB,
+            ),
+            parse_mode="Markdown",
+            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
+        )
+        return
+    ok, trial_info = await run_db(consume_response_slot, user_id, vacancy_id)
+    if not ok:
+        credits = get_response_credits(user_id)
+        await callback.answer("Нет платных откликов", show_alert=True)
+        await callback.message.answer(
+            response_paywall_text(
+                credits=credits,
+                stars_price=STARS_RESPONSE_PRICE,
+                pack_credits=RESPONSE_PACK_CREDITS,
+                pack_price=RESPONSE_PACK_PRICE_RUB,
+            ),
+            parse_mode="Markdown",
+            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
+        )
+        return
+    await _execute_response_flow(callback, user_id, vacancy_id, state, trial_info=trial_info)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_llm_"))
 async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
@@ -5674,6 +5940,187 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("resp_star_"))
+async def resp_star_pay_invoice(callback: types.CallbackQuery):
+    if not STARS_ENABLED:
+        await callback.answer("Оплата Stars временно недоступна", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    vacancy_id = callback.data.replace("resp_star_", "", 1)
+    if has_paid_response_unlock(user_id, vacancy_id):
+        await callback.answer("Уже оплачено для этой вакансии", show_alert=True)
+        return
+    if is_already_responded(user_id, vacancy_id):
+        await callback.answer("Вы уже откликались", show_alert=True)
+        return
+    payload = f"resp_pay:{vacancy_id}"
+    create_star_purchase(user_id, vacancy_id, STARS_RESPONSE_PRICE, payload)
+    await bot.send_invoice(
+        chat_id=user_id,
+        title="Отклик на вакансию",
+        description=f"Разовый отклик — {STARS_RESPONSE_PRICE} Stars",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Отклик", amount=STARS_RESPONSE_PRICE)],
+    )
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "resp_pack_start")
+async def resp_pack_start_callback(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    profile = get_subscriber_profile(user_id)
+    request_id = add_response_pack_request(
+        user_id,
+        callback.from_user.username,
+        profile.get("full_name") if profile else callback.from_user.first_name,
+        profile.get("phone") if profile else None,
+    )
+    await state.set_state(ResponsePackPaymentState.waiting_for_receipt)
+    await state.update_data(response_pack_request_id=request_id)
+    pay_hint = format_response_pack_payment_details_html(user_id) + "\n\n"
+    await callback.message.answer(
+        f"📦 <b>Пакет {RESPONSE_PACK_CREDITS} откликов</b>\n\n"
+        f"{pay_hint}"
+        f"📎 <b>Пришлите скрин чека</b> — фото или PDF.\n\n"
+        f"После проверки начислим {RESPONSE_PACK_CREDITS} откликов на баланс.\n\n"
+        f"Отмена — «Отмена».",
+        parse_mode="HTML",
+    )
+    await callback.answer("Дальше — чек об оплате")
+
+
+@dp.message(ResponsePackPaymentState.waiting_for_receipt)
+async def response_pack_payment_receipt(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    data = await state.get_data()
+    request_id = data.get("response_pack_request_id")
+    if not request_id:
+        await state.clear()
+        await message.answer("❌ Сессия истекла. Начните снова с кнопки «📦 пакет откликов».")
+        return
+    if message.text and message.text.strip().lower() in ("отмена", "cancel", "/cancel"):
+        cancel_response_pack_awaiting(user_id, request_id)
+        await state.clear()
+        await message.answer("❌ Запрос отменён.")
+        return
+    file_id = None
+    kind = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        kind = "photo"
+    elif message.document:
+        file_id = message.document.file_id
+        kind = "document"
+    if not file_id:
+        await message.answer(
+            "📎 Нужен скрин перевода — <b>фото</b> или <b>файл</b>.\nОтмена — «Отмена».",
+            parse_mode="HTML",
+        )
+        return
+    if not attach_response_pack_receipt(request_id, user_id, file_id, kind):
+        await state.clear()
+        await message.answer("❌ Запрос не найден. Начните снова.")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Чек получен</b>\n\n"
+        f"После проверки на баланс придёт <b>{RESPONSE_PACK_CREDITS} откликов</b>.",
+        parse_mode="HTML",
+    )
+    await send_admin_response_pack_alert(request_id)
+
+
+@dp.callback_query(lambda c: c.data == "subscription_from_paywall")
+async def subscription_from_paywall(callback: types.CallbackQuery):
+    await safe_callback_answer(callback)
+    user_id = callback.from_user.id
+    buttons = subscription_action_buttons(user_id)
+    await send_subscription_screen(callback.message, user_id, reply_markup=buttons)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("rp_a_"))
+async def response_pack_approve_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback, "Нет доступа", show_alert=True)
+        return
+    try:
+        request_id = int(callback.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
+        return
+    req = approve_response_pack_request(request_id, RESPONSE_PACK_CREDITS)
+    if not req:
+        await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
+        return
+    target_id = req["user_id"]
+    await safe_callback_answer(callback, f"+{RESPONSE_PACK_CREDITS} откликов")
+    try:
+        await bot.send_message(
+            target_id,
+            f"✅ *Пакет откликов активирован!*\n\n"
+            f"На балансе: *{req['balance']}* платных откликов.\n"
+            f"Вернитесь к вакансии и нажмите «Откликнуться».",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("pack approve notify %s: %s", target_id, e)
+    try:
+        suffix = f"\n\n✅ +{RESPONSE_PACK_CREDITS} откликов (баланс {req['balance']})"
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + suffix,
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + suffix,
+                reply_markup=None,
+            )
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("rp_r_"))
+async def response_pack_reject_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback, "Нет доступа", show_alert=True)
+        return
+    try:
+        request_id = int(callback.data.split("_", 2)[2])
+    except (ValueError, IndexError):
+        await safe_callback_answer(callback, "Неверный запрос", show_alert=True)
+        return
+    target_id = reject_response_pack_request(request_id)
+    if not target_id:
+        await safe_callback_answer(callback, "Запрос уже обработан", show_alert=True)
+        return
+    await safe_callback_answer(callback, "Отклонено")
+    try:
+        await bot.send_message(
+            target_id,
+            "❌ *Запрос пакета откликов отклонён.*\n\nЕсли это ошибка — ❓ Поддержка.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("pack reject notify %s: %s", target_id, e)
+    try:
+        suffix = "\n\n❌ Отклонено"
+        if callback.message.photo or callback.message.document:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + suffix,
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(
+                (callback.message.text or "") + suffix,
+                reply_markup=None,
+            )
+    except TelegramBadRequest:
+        pass
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("star_resp_"))
 async def star_response_invoice(callback: types.CallbackQuery):
     if not STARS_ENABLED:
@@ -5704,9 +6151,28 @@ async def pre_checkout_handler(pre_checkout: types.PreCheckoutQuery):
 
 
 @dp.message(F.successful_payment)
-async def successful_payment_handler(message: types.Message):
+async def successful_payment_handler(message: types.Message, state: FSMContext):
     payment = message.successful_payment
     payload = payment.invoice_payload or ""
+    if payload.startswith("resp_pay:"):
+        purchase = complete_star_purchase(payload)
+        if not purchase:
+            await message.answer("Платёж получен, но запись не найдена. Напишите в поддержку.")
+            return
+        user_id = purchase["user_id"]
+        vacancy_id = purchase["vacancy_id"]
+        profile = get_subscriber_profile(user_id)
+        if not profile or not profile.get("full_name") or not profile.get("phone"):
+            await message.answer(
+                "✅ Оплата принята. Заполните профиль (/start) и нажмите «Откликнуться» снова."
+            )
+            return
+        if is_already_responded(user_id, vacancy_id):
+            await message.answer("✅ Оплата принята. Вы уже откликались на эту вакансию.")
+            return
+        await message.answer("✅ Оплата принята! Отправляю отклик…")
+        await _execute_response_flow(None, user_id, vacancy_id, state, trial_info=None)
+        return
     if not payload.startswith("ext_resp:"):
         return
     purchase = complete_star_purchase(payload)
@@ -6588,41 +7054,65 @@ async def admin_premium_requests_button(message: types.Message):
     if message.from_user.id != YOUR_USER_ID:
         return
     requests = get_pending_premium_requests(30)
-    if not requests:
-        await message.answer("📭 Нет ожидающих запросов Premium.")
+    pack_requests = get_pending_response_pack_requests(30)
+    if not requests and not pack_requests:
+        await message.answer("📭 Нет ожидающих запросов оплаты.")
         return
-    await message.answer(f"💳 *Запросы Premium* — {len(requests)} в очереди:", parse_mode="Markdown")
-    for req in requests:
-        caption = format_premium_request_admin_caption_html(req)
-        markup = premium_request_admin_keyboard(req["id"], req["user_id"])
-        file_id = req.get("receipt_file_id")
-        kind = req.get("receipt_kind")
-        try:
-            if file_id and kind == "photo":
-                await bot.send_photo(
-                    message.chat.id, file_id, caption=caption,
-                    parse_mode="HTML", reply_markup=markup,
-                )
-            elif file_id and kind == "document":
-                await bot.send_document(
-                    message.chat.id, file_id, caption=caption,
-                    parse_mode="HTML", reply_markup=markup,
-                )
-            else:
-                await message.answer(caption, parse_mode="HTML", reply_markup=markup)
-        except TelegramBadRequest:
-            plain = re.sub(r"<[^>]+>", "", caption)
+    if requests:
+        await message.answer(f"💳 *Запросы Premium* — {len(requests)} в очереди:", parse_mode="Markdown")
+        for req in requests:
+            caption = format_premium_request_admin_caption_html(req)
+            markup = premium_request_admin_keyboard(req["id"], req["user_id"])
+            file_id = req.get("receipt_file_id")
+            kind = req.get("receipt_kind")
             try:
                 if file_id and kind == "photo":
-                    await bot.send_photo(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                    await bot.send_photo(
+                        message.chat.id, file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=markup,
+                    )
                 elif file_id and kind == "document":
-                    await bot.send_document(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                    await bot.send_document(
+                        message.chat.id, file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=markup,
+                    )
                 else:
-                    await message.answer(plain, reply_markup=markup)
+                    await message.answer(caption, parse_mode="HTML", reply_markup=markup)
+            except TelegramBadRequest:
+                plain = re.sub(r"<[^>]+>", "", caption)
+                try:
+                    if file_id and kind == "photo":
+                        await bot.send_photo(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                    elif file_id and kind == "document":
+                        await bot.send_document(message.chat.id, file_id, caption=plain, reply_markup=markup)
+                    else:
+                        await message.answer(plain, reply_markup=markup)
+                except Exception as e:
+                    logger.warning(f"admin premium request card #{req['id']}: {e}")
             except Exception as e:
                 logger.warning(f"admin premium request card #{req['id']}: {e}")
-        except Exception as e:
-            logger.warning(f"admin premium request card #{req['id']}: {e}")
+    if pack_requests:
+        await message.answer(f"📦 *Пакеты откликов* — {len(pack_requests)} в очереди:", parse_mode="Markdown")
+        for req in pack_requests:
+            caption = format_response_pack_admin_caption_html(req)
+            markup = response_pack_admin_keyboard(req["id"], req["user_id"])
+            file_id = req.get("receipt_file_id")
+            kind = req.get("receipt_kind")
+            try:
+                if file_id and kind == "photo":
+                    await bot.send_photo(
+                        message.chat.id, file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=markup,
+                    )
+                elif file_id and kind == "document":
+                    await bot.send_document(
+                        message.chat.id, file_id, caption=caption,
+                        parse_mode="HTML", reply_markup=markup,
+                    )
+                else:
+                    await message.answer(caption, parse_mode="HTML", reply_markup=markup)
+            except Exception as e:
+                logger.warning(f"admin pack request card #{req['id']}: {e}")
 
 
 @dp.message(lambda m: m.text == "🗂️ Карточки пользователей")

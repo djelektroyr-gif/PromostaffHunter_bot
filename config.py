@@ -58,9 +58,17 @@ LLM_INTERNAL_TOKEN = os.getenv("LLM_INTERNAL_TOKEN", "").strip()
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
 LLM_DAILY_LIMIT_PREMIUM = int(os.getenv("LLM_DAILY_LIMIT_PREMIUM", "20"))
 
-# Telegram Stars — расширенный отклик
-STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
+# Telegram Stars — отклик и расширенный отклик
+STARS_ENABLED = os.getenv("STARS_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+STARS_RESPONSE_PRICE = int(os.getenv("STARS_RESPONSE_PRICE", "3"))
 STARS_EXTENDED_RESPONSE_PRICE = int(os.getenv("STARS_EXTENDED_RESPONSE_PRICE", "35"))
+
+# Платные отклики после trial (Free): пакет или Stars за штуку
+PAID_RESPONSES_ENABLED = os.getenv("PAID_RESPONSES_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+RESPONSE_PACK_CREDITS = int(os.getenv("RESPONSE_PACK_CREDITS", "5"))
+RESPONSE_PACK_PRICE_RUB = int(os.getenv("RESPONSE_PACK_PRICE_RUB", "99"))
+# Trial при первом отклике (не при выборе категорий)
+TRIAL_ON_FIRST_RESPONSE = os.getenv("TRIAL_ON_FIRST_RESPONSE", "1").strip().lower() in ("1", "true", "yes")
 
 # Telethon Settings
 API_ID = int(os.getenv("API_ID", "0"))

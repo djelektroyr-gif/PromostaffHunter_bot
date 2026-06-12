@@ -185,6 +185,11 @@ def init_db():
             cur=cur,
         )
         add_column_if_missing(
+            "subscribers", "response_credits",
+            "ALTER TABLE subscribers ADD COLUMN response_credits INTEGER DEFAULT 0",
+            cur=cur,
+        )
+        add_column_if_missing(
             "subscribers", "birth_date",
             "ALTER TABLE subscribers ADD COLUMN birth_date TEXT DEFAULT NULL",
             cur=cur,
@@ -720,6 +725,20 @@ def init_db():
             cur=cur,
         )
 
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS response_pack_requests (
+                id {serial_pk()},
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                full_name TEXT,
+                phone TEXT,
+                status TEXT DEFAULT 'pending',
+                receipt_file_id TEXT DEFAULT NULL,
+                receipt_kind TEXT DEFAULT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         _seed_channel_settings(cur)
 
         _migrate_pg_telegram_bigint_ids(cur)
@@ -1189,7 +1208,8 @@ def get_subscriber_profile(user_id: int) -> dict:
     row = fetchone("""
         SELECT user_id, username, first_name, last_name, full_name, age, phone,
                photo_file_id, questionnaire, is_active, plan, paid_until, metro_zones, trial_used,
-               birth_date, resume_extra, photo_storage_path, photo_updated_at, user_role
+               birth_date, resume_extra, photo_storage_path, photo_updated_at, user_role,
+               response_credits
         FROM subscribers WHERE user_id = ?
     """, (user_id,))
     if row:
@@ -1201,6 +1221,7 @@ def get_subscriber_profile(user_id: int) -> dict:
             "birth_date": row[14], "resume_extra": row[15],
             "photo_storage_path": row[16], "photo_updated_at": row[17],
             "user_role": row[18] or "candidate",
+            "response_credits": int(row[19] or 0) if len(row) > 19 else 0,
         }
     return None
 
@@ -2125,11 +2146,59 @@ def complete_star_purchase(payload: str) -> dict | None:
 
 
 def has_star_purchase_for_vacancy(user_id: int, vacancy_id: str) -> bool:
+    """Оплаченный расширенный отклик (ext_resp:)."""
+    return has_star_payload_purchase(user_id, vacancy_id, "ext_resp:")
+
+
+def has_star_payload_purchase(user_id: int, vacancy_id: str, payload_prefix: str) -> bool:
     row = fetchone(
-        "SELECT 1 FROM star_purchases WHERE user_id = ? AND vacancy_id = ? AND status = 'paid'",
-        (user_id, vacancy_id),
+        """
+        SELECT 1 FROM star_purchases
+        WHERE user_id = ? AND vacancy_id = ? AND status = 'paid'
+          AND payload LIKE ?
+        """,
+        (user_id, vacancy_id, f"{payload_prefix}%"),
     )
     return bool(row)
+
+
+def has_paid_response_unlock(user_id: int, vacancy_id: str) -> bool:
+    """Разовая оплата отклика Stars (resp_pay:)."""
+    return has_star_payload_purchase(user_id, vacancy_id, "resp_pay:")
+
+
+def get_response_credits(user_id: int) -> int:
+    row = fetchone("SELECT response_credits FROM subscribers WHERE user_id = ?", (user_id,))
+    return int(row[0] or 0) if row else 0
+
+
+def add_response_credits(user_id: int, amount: int) -> int:
+    execute(
+        """
+        UPDATE subscribers
+        SET response_credits = COALESCE(response_credits, 0) + ?
+        WHERE user_id = ?
+        """,
+        (int(amount), user_id),
+    )
+    return get_response_credits(user_id)
+
+
+def consume_response_credit(user_id: int) -> bool:
+    """Атомарно списать один платный отклик. False — нет кредитов."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                UPDATE subscribers
+                SET response_credits = response_credits - 1
+                WHERE user_id = ? AND COALESCE(response_credits, 0) >= 1
+                """
+            ),
+            (user_id,),
+        )
+        return cur.rowcount > 0
 
 
 def set_response_star_boost(user_id: int, vacancy_id: str):
@@ -4082,5 +4151,183 @@ def reject_premium_request(request_id: int) -> int | None:
         if cur.rowcount == 0:
             return None
         cur.execute(q("SELECT user_id FROM premium_requests WHERE id = ?"), (request_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+# ========== ПАКЕТЫ ОТКЛИКОВ (рубли) ==========
+
+def _response_pack_request_row(row) -> dict:
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "username": row[2],
+        "full_name": row[3],
+        "phone": row[4],
+        "status": row[5],
+        "receipt_file_id": row[6] if len(row) > 6 else None,
+        "receipt_kind": row[7] if len(row) > 7 else None,
+        "created_at": row[8] if len(row) > 8 else None,
+    }
+
+
+_RESPONSE_PACK_SELECT = """
+    SELECT id, user_id, username, full_name, phone, status,
+           receipt_file_id, receipt_kind, created_at
+    FROM response_pack_requests
+"""
+
+
+def add_response_pack_request(
+    user_id: int,
+    username: str | None = None,
+    full_name: str | None = None,
+    phone: str | None = None,
+) -> int:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE response_pack_requests SET status = 'cancelled' "
+                "WHERE user_id = ? AND status IN ('pending', 'awaiting_receipt')"
+            ),
+            (user_id,),
+        )
+        if IS_POSTGRES:
+            cur.execute(
+                q("""
+                    INSERT INTO response_pack_requests
+                    (user_id, username, full_name, phone, status)
+                    VALUES (?, ?, ?, ?, 'awaiting_receipt')
+                    RETURNING id
+                """),
+                (user_id, username, full_name, phone),
+            )
+            return int(cur.fetchone()[0])
+        cur.execute(
+            q("""
+                INSERT INTO response_pack_requests
+                (user_id, username, full_name, phone, status)
+                VALUES (?, ?, ?, ?, 'awaiting_receipt')
+            """),
+            (user_id, username, full_name, phone),
+        )
+        return int(cur.lastrowid)
+
+
+def get_response_pack_request(request_id: int) -> dict | None:
+    row = fetchone(f"{_RESPONSE_PACK_SELECT} WHERE id = ?", (request_id,))
+    return _response_pack_request_row(row) if row else None
+
+
+def attach_response_pack_receipt(
+    request_id: int,
+    user_id: int,
+    file_id: str,
+    kind: str,
+) -> bool:
+    row = fetchone(
+        f"{_RESPONSE_PACK_SELECT} WHERE id = ? AND user_id = ? AND status = 'awaiting_receipt'",
+        (request_id, user_id),
+    )
+    if not row:
+        return False
+    execute(
+        """
+        UPDATE response_pack_requests
+        SET receipt_file_id = ?, receipt_kind = ?, status = 'pending'
+        WHERE id = ?
+        """,
+        (file_id, kind, request_id),
+    )
+    return True
+
+
+def cancel_response_pack_awaiting(user_id: int, request_id: int | None = None) -> None:
+    if request_id:
+        execute(
+            "UPDATE response_pack_requests SET status = 'cancelled' "
+            "WHERE id = ? AND user_id = ? AND status = 'awaiting_receipt'",
+            (request_id, user_id),
+        )
+    else:
+        execute(
+            "UPDATE response_pack_requests SET status = 'cancelled' "
+            "WHERE user_id = ? AND status = 'awaiting_receipt'",
+            (user_id,),
+        )
+
+
+def get_pending_response_pack_requests(limit: int = 20) -> list:
+    rows = fetchall(
+        f"""
+        {_RESPONSE_PACK_SELECT}
+        WHERE status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return [_response_pack_request_row(r) for r in rows]
+
+
+def count_pending_response_pack_requests() -> int:
+    return fetchval(
+        "SELECT COUNT(*) FROM response_pack_requests WHERE status = 'pending'",
+        default=0,
+    )
+
+
+def approve_response_pack_request(request_id: int, credits: int) -> dict | None:
+    """Атомарно одобряет запрос и начисляет кредиты. None — уже обработан."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE response_pack_requests SET status = 'approved' "
+                "WHERE id = ? AND status = 'pending'"
+            ),
+            (request_id,),
+        )
+        if cur.rowcount == 0:
+            return None
+        cur.execute(q(f"{_RESPONSE_PACK_SELECT} WHERE id = ?"), (request_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        req = _response_pack_request_row(row)
+        cur.execute(
+            q(
+                """
+                UPDATE subscribers
+                SET response_credits = COALESCE(response_credits, 0) + ?
+                WHERE user_id = ?
+                """
+            ),
+            (int(credits), req["user_id"]),
+        )
+        req["credits_added"] = int(credits)
+        cur.execute(
+            q("SELECT COALESCE(response_credits, 0) FROM subscribers WHERE user_id = ?"),
+            (req["user_id"],),
+        )
+        bal_row = cur.fetchone()
+        req["balance"] = int(bal_row[0] or 0) if bal_row else int(credits)
+        return req
+
+
+def reject_response_pack_request(request_id: int) -> int | None:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                "UPDATE response_pack_requests SET status = 'rejected' "
+                "WHERE id = ? AND status = 'pending'"
+            ),
+            (request_id,),
+        )
+        if cur.rowcount == 0:
+            return None
+        cur.execute(q("SELECT user_id FROM response_pack_requests WHERE id = ?"), (request_id,))
         row = cur.fetchone()
         return row[0] if row else None

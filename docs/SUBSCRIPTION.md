@@ -11,12 +11,16 @@
 | Тариф | Как получить | Категории | Push | Метро | Срок |
 |-------|--------------|-----------|------|-------|------|
 | **Free** | по умолчанию | **1** | нет | нет | — |
-| **Trial** | один раз при «✅ Завершить выбор» категорий (`grant_trial_if_eligible`) | все | да | да | `TRIAL_DAYS` (env, default 7) |
+| **Trial** | один раз при **первом отклике** на вакансию (`setup_trial_from_first_response`) | категория вакансии + Premium на срок trial | да | да | `TRIAL_DAYS` (env, default 7) |
 | **Premium** | оплата + одобрение админа или `/setplan` | все | да | да | `paid_until` в БД |
 
 Расширенные фильтры (ставка, города, тихие часы) — **[PREMIUM_FILTERS.md](PREMIUM_FILTERS.md)** (согласовано, реализация по фазам).
 
 **Лимит Free:** `FREE_CATEGORY_LIMIT` (env, default **1**). Вторая категория и дальше — только Premium.
+
+**Платные отклики (после trial):** `PAID_RESPONSES_ENABLED=1` — Free без Premium платит за каждый отклик: **3 Stars** (`STARS_RESPONSE_PRICE`) или **пакет 5 за 99 ₽** (`RESPONSE_PACK_*`, чек → админ). Баланс — `subscribers.response_credits`. Premium — безлимит откликов.
+
+**Расширенный отклик (Stars):** отдельно, `ext_resp:` — 35 Stars, приоритетный текст (см. [STARS_EXTENDED_RESPONSE.md](STARS_EXTENDED_RESPONSE.md)).
 
 **Premium активен:** `plan = 'premium'` и `paid_until` в будущем (`is_user_premium()`).
 
@@ -35,6 +39,7 @@
 - `plan` — `free` | `premium`
 - `paid_until` — TIMESTAMP окончания Premium
 - `trial_used` — пробный период уже выдавался
+- `response_credits` — платные отклики (пакет 99 ₽)
 - `metro_zones` — фильтр станций (Premium)
 
 ### `premium_requests`
