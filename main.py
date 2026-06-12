@@ -286,7 +286,8 @@ if chat_suggestions_router.parent_router is None:
     dp.include_router(chat_suggestions_router)
 
 # Flood control для рассылки (пауза между отправками)
-SEND_DELAY = 1  # секунда между push-вакансиями одному пользователю
+SEND_DELAY = 0.35  # пауза между push одному пользователю (лимиты Bot API)
+FEED_CARDS_PER_PAGE = 4  # меньше карточек за раз — быстрее открывается лента
 MSK_TZ = timezone(timedelta(hours=3))
 _vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллельных push-рассылок
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
@@ -1167,6 +1168,22 @@ def build_admin_dashboard_text() -> str:
         f"• 💳 Ожидают Premium: {count_pending_premium_requests()}"
     )
 
+async def _send_broadcast_html(user_id: int, body_html: str, *, topic_key: str | None = None) -> None:
+    try:
+        if topic_key:
+            await send_user_message(user_id, topic_key=topic_key, text=body_html, parse_mode="HTML")
+        else:
+            await send_message_with_retry(user_id, text=body_html, parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "parse" not in str(e).lower():
+            raise
+        plain = re.sub(r"<[^>]*>", "", body_html)
+        if topic_key:
+            await send_user_message(user_id, topic_key=topic_key, text=plain)
+        else:
+            await send_message_with_retry(user_id, text=plain)
+
+
 async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message = None):
     subscribers = get_all_subscribers()
     if not subscribers:
@@ -1174,10 +1191,10 @@ async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message
     if not status_msg:
         status_msg = await bot.send_message(admin_chat_id, f"📢 Рассылка {len(subscribers)} подписчикам...")
     sent, failed = 0, 0
-    body = f"📢 *Рассылка от администратора:*\n\n{text}"
+    body = f"📢 <b>Рассылка от администратора</b>\n\n{escape_html(text)}"
     for i, uid in enumerate(subscribers, 1):
         try:
-            await send_message_with_retry(uid, text=body, parse_mode="Markdown")
+            await _send_broadcast_html(uid, body)
             sent += 1
         except Exception as e:
             failed += 1
@@ -1195,6 +1212,24 @@ async def run_broadcast(admin_chat_id: int, text: str, status_msg: types.Message
                 pass
         await asyncio.sleep(BROADCAST_DELAY)
     return sent, failed, None
+
+
+async def _run_tech_broadcast_job(admin_chat_id: int, text: str, status_msg: types.Message):
+    async with _broadcast_lock:
+        sent, failed, err = await run_topic_broadcast(
+            admin_chat_id,
+            text,
+            topic_key="support",
+            body_prefix="🔧 <b>Сообщение от техподдержки</b>\n\n",
+            status_msg=status_msg,
+        )
+    if err:
+        await status_msg.edit_text(err)
+    else:
+        await status_msg.edit_text(
+            f"✅ Техсообщение отправлено.\nДоставлено: {sent}\nОшибок: {failed}",
+            reply_markup=None,
+        )
 
 
 async def run_topic_broadcast(
@@ -1215,10 +1250,10 @@ async def run_topic_broadcast(
             f"📣 Рассылка в топик «{topic_key}» — {len(subscribers)} подписчиков…",
         )
     sent, failed = 0, 0
-    body = f"{body_prefix}{text}"
+    body = f"{body_prefix}{escape_html(text)}"
     for i, uid in enumerate(subscribers, 1):
         try:
-            await send_user_message(uid, topic_key=topic_key, text=body, parse_mode="Markdown")
+            await _send_broadcast_html(uid, body, topic_key=topic_key)
             sent += 1
         except Exception as e:
             failed += 1
@@ -1384,10 +1419,11 @@ async def _maybe_alert_reg_validation(message: types.Message, step: str, detail:
 async def send_admin_stats_screen(message: types.Message, *, hours: int = 24) -> None:
     from services.admin_activity_digest import build_activity_digest_html
 
+    notice = await message.answer("⏳ Считаю статистику…")
     await bot.send_chat_action(message.chat.id, "typing")
-    text = build_activity_digest_html(hours=hours)
+    text = await run_db(build_activity_digest_html, hours=hours)
     try:
-        await message.answer(
+        await notice.edit_text(
             text,
             parse_mode="HTML",
             reply_markup=get_admin_stats_keyboard(),
@@ -1395,7 +1431,7 @@ async def send_admin_stats_screen(message: types.Message, *, hours: int = 24) ->
         )
     except TelegramBadRequest:
         plain = re.sub(r"<[^>]*>", "", text)
-        await message.answer(plain, reply_markup=get_admin_stats_keyboard())
+        await notice.edit_text(plain, reply_markup=get_admin_stats_keyboard())
 
 
 class BroadcastState(StatesGroup):
@@ -1405,6 +1441,12 @@ class TechBroadcastState(StatesGroup):
     waiting_for_text = State()
 
 class AdminSupportReplyState(StatesGroup):
+    waiting_for_text = State()
+
+class AdminComplaintReplyState(StatesGroup):
+    waiting_for_text = State()
+
+class AdminDirectMessageState(StatesGroup):
     waiting_for_text = State()
 
 class ComplaintState(StatesGroup):
@@ -1626,7 +1668,8 @@ def build_admin_help_html() -> str:
         "• «⏳ Premium истекает» — trial/подписка кончается в ближайшие 7 дн.; кнопка «🎁 Подарить дни».\n"
         "• «💎 Запросы Premium» — чек на оплату, ✅ оплата или 🎁 подарок N дн.\n"
         "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
-        "• «⚠️ Жалобы», «❓ Поддержка (админ)» — обращения; push + кнопка «✉️ Ответить».\n"
+        "• «⚠️ Жалобы», «❓ Поддержка (админ)» — push + «✉️ Ответить»; из карточки пользователя — «✉️ Написать».\n"
+        "• Команды: `/answer ID текст`, `/complaint_answer ID текст`.\n"
         "• Push «📡 Заявка на мониторинг канала» — от Premium-пользователей; "
         "кнопки «✅ Добавить» / «❌ Отклонить».\n"
         "• «📣 Техсообщение» — рассылка в топик «❓ Поддержка» (техработы, важное).\n"
@@ -1795,6 +1838,10 @@ def admin_user_detail_keyboard(user_id: int, profile: dict, cards_page: int = 0)
     p = cards_page
     rows = [
         [InlineKeyboardButton(
+            text="✉️ Написать пользователю",
+            callback_data=f"adm_msg_{user_id}_{p}",
+        )],
+        [InlineKeyboardButton(
             text="🎁 Подарить Premium",
             callback_data=f"adm_gt_{user_id}_{p}",
         )],
@@ -1828,7 +1875,7 @@ async def show_admin_user_detail(
         else:
             await message.answer(text, parse_mode="HTML", reply_markup=markup)
         return
-    text = build_admin_user_detail_html(user_id)
+    text = await run_db(build_admin_user_detail_html, user_id)
     markup = admin_user_detail_keyboard(user_id, profile, cards_page)
     if edit:
         try:
@@ -1927,16 +1974,14 @@ def _vacancy_age_hours(vac: dict) -> float | None:
 
 
 def _vacancy_in_feed_mode(vac: dict, feed_mode: str) -> bool:
-    age = _vacancy_age_hours(vac)
-    if feed_mode == "all":
-        if age is None:
-            return True
-        return age <= FEED_ARCHIVE_MAX_HOURS
-    if age is None:
-        return feed_mode == "fresh"
-    if feed_mode == "fresh":
-        return age <= FEED_FRESH_HOURS
-    return FEED_FRESH_HOURS < age <= FEED_ARCHIVE_MAX_HOURS
+    from services.feed_loader import vacancy_in_feed_mode
+
+    return vacancy_in_feed_mode(
+        vac,
+        feed_mode,
+        fresh_hours=FEED_FRESH_HOURS,
+        archive_max_hours=FEED_ARCHIVE_MAX_HOURS,
+    )
 
 
 def _detected_category_display(text: str) -> tuple[str, str]:
@@ -2099,22 +2144,28 @@ def build_contact_link(contact: str, text: str) -> str | None:
     return None
 
 
-def manual_contact_hint(contact: str | None, draft_text: str) -> str:
+def manual_contact_hint(
+    contact: str | None,
+    draft_text: str,
+    *,
+    vacancy_text: str | None = None,
+) -> str:
     """Подсказка, если кнопку deeplink к заказчику собрать нельзя."""
     from services.employer_contact import (
         format_phone_display,
         is_phone_only_employer_contact,
+        is_tg_user_id_contact,
         phone_response_instructions_markdown,
+        tg_user_response_instructions_markdown,
     )
 
     if not contact:
         return ""
-    if contact.startswith("tg://user?id="):
-        uid = contact.split("=", 1)[-1].split("&", 1)[0]
-        return (
-            f"\n\n_Контакт без @username (ID `{uid}`). Telegram не даёт кнопку «Открыть чат» — "
-            f"скопируйте черновик ниже и найдите заказчика вручную._\n\n"
-            f"```\n{draft_text}\n```"
+    if is_tg_user_id_contact(contact):
+        return tg_user_response_instructions_markdown(
+            contact,
+            vacancy_text=vacancy_text,
+            draft_text=draft_text,
         )
     if contact.startswith("@"):
         return (
@@ -2199,10 +2250,25 @@ def build_response_draft_message(
     required_fields: list,
     draft_text: str,
     contact_link: str | None,
+    vacancy_text: str | None = None,
 ) -> str:
-    from services.employer_contact import format_phone_display, is_phone_only_employer_contact
+    from services.employer_contact import (
+        format_phone_display,
+        is_phone_only_employer_contact,
+        is_tg_user_id_contact,
+    )
 
     req_line = ", ".join(required_fields) if required_fields else "явных требований не найдено"
+    if is_tg_user_id_contact(employer_contact) and not contact_link:
+        return (
+            "📨 *Черновик отклика готов*\n\n"
+            f"🧾 Что просит вакансия: {escape_markdown(req_line)}\n"
+            + manual_contact_hint(
+                employer_contact,
+                draft_text,
+                vacancy_text=vacancy_text,
+            ).lstrip("\n")
+        )
     if is_phone_only_employer_contact(employer_contact) and not contact_link:
         from services.employer_contact import phone_response_instructions_markdown
 
@@ -2236,7 +2302,11 @@ def build_response_draft_message(
                 "_Карточка отклика — в «📨 Мои отклики». Заказчику нужно отправить сообщение вручную кнопкой выше._"
             )
     else:
-        msg += manual_contact_hint(employer_contact, draft_text).lstrip("\n")
+        msg += manual_contact_hint(
+            employer_contact,
+            draft_text,
+            vacancy_text=vacancy_text,
+        ).lstrip("\n")
     return msg
 
 
@@ -2269,6 +2339,7 @@ async def deliver_response_draft(
     required_fields: list,
     draft_text: str,
     vacancy_id: str,
+    vacancy_text: str | None = None,
 ) -> str:
     """Отправить черновик пользователю. Возвращает draft_status: delivered | manual."""
     from services.forum_topics import TOPIC_RESPONSES
@@ -2279,6 +2350,7 @@ async def deliver_response_draft(
         required_fields=required_fields,
         draft_text=draft_text,
         contact_link=contact_link,
+        vacancy_text=vacancy_text,
     )
     markup = build_response_action_keyboard(user_id, vacancy_id, contact_link=contact_link)
     await send_user_message_safe_buttons(
@@ -3775,77 +3847,30 @@ def _get_user_feed(user_id: int) -> dict | None:
     return data
 
 
-def _feed_filter_context(user_id: int) -> tuple[bool, dict | None]:
-    if not is_user_premium(user_id):
-        return False, None
-    prefs = get_subscriber_filter_prefs_effective(user_id)
-    if not prefs or not prefs.get("apply_to_feed"):
-        return False, prefs
-    return True, prefs
+async def _load_feed_snapshot_async(user_id: int, *, force_refresh: bool = False):
+    from services.feed_loader import get_feed_snapshot
+
+    return await run_db(get_feed_snapshot, user_id, force_refresh=force_refresh)
 
 
-def _vacancy_passes_feed_filters(vac: dict, cat_code: str, prefs: dict | None) -> bool:
-    if not prefs:
-        return True
-    from services.subscriber_match import vacancy_matches_subscriber
+async def _send_feed_loading_notice(message: types.Message, user_id: int) -> types.Message:
+    from services.chat_feedback import thread_id_from_message, topic_thread_id
+    from services.forum_topics import TOPIC_VACANCIES
 
-    vac_match = {
-        "message_text": vac.get("text") or "",
-        "address": vac.get("address"),
-        "address_normalized": vac.get("address_normalized"),
-        "category_code": cat_code,
-        "geo_tags": vac.get("geo_tags"),
-        "rate_hourly": vac.get("rate_hourly"),
-        "rate_shift": vac.get("rate_shift"),
-        "rate_effective_hourly": vac.get("rate_effective_hourly"),
-        "shift_date": vac.get("shift_date"),
-        "shift_time_start": vac.get("shift_time_start"),
-        "location_lat": vac.get("location_lat"),
-        "location_lon": vac.get("location_lon"),
-    }
-    ok, _ = vacancy_matches_subscriber(vac_match, prefs)
-    return ok
+    extra: dict = {}
+    thread_id = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
+    if thread_id is not None:
+        extra["message_thread_id"] = thread_id
+    return await message.answer("⏳ Собираю ленту…", **extra)
 
 
-def _feed_vacancies_for_category(
-    user_id: int, cat: dict, apply_filters: bool, prefs: dict | None, feed_mode: str = "fresh",
-) -> list:
-    vacancies = get_feed_vacancies_for_user(user_id, cat["code"])
-    result = []
-    for vac in vacancies:
-        if not _vacancy_in_feed_mode(vac, feed_mode):
-            continue
-        if apply_filters and not _vacancy_passes_feed_filters(vac, cat["code"], prefs):
-            continue
-        vac["category"] = cat
-        result.append(vac)
-    return result
-
-
-def _collect_feed_vacancies(
-    user_id: int, category_codes: list[str] | None = None, feed_mode: str = "fresh",
-) -> list:
-    apply_filters, prefs = _feed_filter_context(user_id)
-    user_categories = get_user_categories(user_id)
-    if category_codes is not None:
-        codes = set(category_codes)
-        user_categories = [c for c in user_categories if c["code"] in codes]
-    all_vacancies = []
-    for cat in user_categories:
-        all_vacancies.extend(
-            _feed_vacancies_for_category(user_id, cat, apply_filters, prefs, feed_mode)
-        )
-    all_vacancies.sort(
-        key=lambda v: v.get("published_at") or v.get("found_at") or "",
-        reverse=True,
-    )
-    return all_vacancies
-
-
-def _feed_count_for_category(
-    user_id: int, cat: dict, apply_filters: bool, prefs: dict | None, feed_mode: str = "fresh",
-) -> int:
-    return len(_feed_vacancies_for_category(user_id, cat, apply_filters, prefs, feed_mode))
+async def _delete_feed_loading_notice(notice: types.Message | None) -> None:
+    if not notice:
+        return
+    try:
+        await notice.delete()
+    except TelegramBadRequest:
+        pass
 
 
 
@@ -3892,15 +3917,10 @@ def _history_count_for_category(
         user_id, cat["code"], search=search, max_hours=FEED_HISTORY_MAX_HOURS,
     )
 
-def _feed_mode_totals(user_id: int) -> tuple[int, int, int, int]:
-    apply_filters, prefs = _feed_filter_context(user_id)
-    fresh_total = archive_total = all_total = history_total = 0
-    for cat in get_user_categories(user_id):
-        fresh_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "fresh")
-        archive_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "archive")
-        all_total += _feed_count_for_category(user_id, cat, apply_filters, prefs, "all")
-        history_total += _history_count_for_category(user_id, cat)
-    return fresh_total, archive_total, all_total, history_total
+def _feed_mode_totals_from_snapshot(snap) -> tuple[int, int, int, int]:
+    from services.feed_loader import snapshot_mode_totals
+
+    return snapshot_mode_totals(snap)
 
 
 def build_feed_mode_keyboard(fresh_total: int, archive_total: int, all_total: int, history_total: int,) -> InlineKeyboardMarkup:
@@ -3926,14 +3946,15 @@ def build_feed_mode_keyboard(fresh_total: int, archive_total: int, all_total: in
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_feed_category_keyboard(user_id: int, feed_mode: str) -> tuple[InlineKeyboardMarkup, int]:
-    user_categories = get_user_categories(user_id)
-    apply_filters, prefs = _feed_filter_context(user_id)
+def build_feed_category_keyboard(snap, feed_mode: str) -> tuple[InlineKeyboardMarkup, int]:
+    from services.feed_loader import snapshot_category_count
+
+    user_categories = snap.categories
     buttons, row = [], []
     total = 0
     mode_label = {"fresh": "свежие", "archive": "ранее", "all": "все"}.get(feed_mode, "все")
     for i, cat in enumerate(user_categories):
-        count = _feed_count_for_category(user_id, cat, apply_filters, prefs, feed_mode)
+        count = snapshot_category_count(snap, cat["code"], feed_mode)
         total += count
         row.append(InlineKeyboardButton(
             text=f"{cat['emoji']} {cat['name']} ({count})",
@@ -4042,9 +4063,11 @@ async def show_feed_mode_menu(message: types.Message, user_id: int):
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
-    fresh_total, archive_total, all_total, history_total = _feed_mode_totals(user_id)
-    apply_filters, _ = _feed_filter_context(user_id)
-    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
+    notice = await _send_feed_loading_notice(message, user_id)
+    snap = await _load_feed_snapshot_async(user_id)
+    await _delete_feed_loading_notice(notice)
+    fresh_total, archive_total, all_total, history_total = _feed_mode_totals_from_snapshot(snap)
+    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if snap.apply_filters else ""
     if fresh_total == 0 and archive_total == 0 and all_total == 0 and history_total == 0:
         await message.answer(
             f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
@@ -4077,9 +4100,11 @@ async def show_feed_category_menu(message: types.Message, user_id: int, feed_mod
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
-    markup, total = build_feed_category_keyboard(user_id, feed_mode)
-    apply_filters, _ = _feed_filter_context(user_id)
-    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if apply_filters else ""
+    notice = await _send_feed_loading_notice(message, user_id)
+    snap = await _load_feed_snapshot_async(user_id)
+    await _delete_feed_loading_notice(notice)
+    markup, total = build_feed_category_keyboard(snap, feed_mode)
+    hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if snap.apply_filters else ""
     mode_title = {
         "fresh": f"🟢 Свежие ({FEED_FRESH_HOURS} ч)",
         "archive": "📂 Вчера и ранее",
@@ -4109,16 +4134,19 @@ async def open_feed_vacancies(
     category_codes: list[str] | None = None,
 ):
     from services.chat_feedback import topic_thread_id, thread_id_from_message, typing_keepalive
+    from services.feed_loader import snapshot_collect
     from services.forum_topics import TOPIC_VACANCIES
 
+    notice = await _send_feed_loading_notice(message, user_id)
     feed_thread = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
     async with typing_keepalive(bot, message.chat.id, message_thread_id=feed_thread):
-        all_vacancies = _collect_feed_vacancies(user_id, category_codes, feed_mode)
+        snap = await _load_feed_snapshot_async(user_id)
+        all_vacancies = snapshot_collect(snap, category_codes, feed_mode)
+    await _delete_feed_loading_notice(notice)
     if not all_vacancies:
-        apply_filters, _ = _feed_filter_context(user_id)
         hint = (
             "\n\nПопробуйте ослабить фильтры в ⚙️ Настройки → 🎯 Фильтры Premium."
-            if apply_filters else ""
+            if snap.apply_filters else ""
         )
         await message.answer(f"🔍 В этой категории вакансий нет.{hint}", parse_mode="Markdown")
         return
@@ -4142,13 +4170,13 @@ async def show_new_vacancies(message: types.Message):
 
 @dp.callback_query(lambda c: c.data == "feed_pick_mode")
 async def feed_pick_mode_callback(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Собираю ленту…")
     await show_feed_mode_menu(callback.message, callback.from_user.id)
 
 
 @dp.callback_query(lambda c: c.data in {"feed_mode_fresh", "feed_mode_archive", "feed_mode_all", "feed_mode_history"})
 async def feed_mode_callback(callback: types.CallbackQuery):
-    await safe_callback_answer(callback)
+    await safe_callback_answer(callback, "Собираю ленту…")
     mode = "fresh"
     if callback.data == "feed_mode_archive":
         mode = "archive"
@@ -4269,16 +4297,18 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
     _cache_user_feed(user_id, data, page=page)
     vacancies = data["vacancies"]
     total = data["total"]
-    start = page * 10
-    end = min(start + 10, total)
+    page_size = FEED_CARDS_PER_PAGE
+    start = page * page_size
+    end = min(start + page_size, total)
     if start >= total:
         await message.answer("📭 Это последняя страница.")
         return
 
     feed_mode = data.get("feed_mode") or "fresh"
     header = "📜 История" if feed_mode == "history" else "📬 Вакансии"
+    total_pages = max(1, (total - 1) // page_size + 1)
     await message.answer(
-        f"{header} (страница {page+1} из {(total-1)//10 + 1})",
+        f"{header} (страница {page+1} из {total_pages})",
         parse_mode="Markdown",
     )
     async with typing_keepalive(bot, message.chat.id, message_thread_id=feed_thread):
@@ -5459,6 +5489,13 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     vac_snippet = vacancy_text[:200] if vacancy_text else None
     employer_contact = pick_employer_contact_for_response(saved_contact, vacancy_text)
+    push_row = get_vacancy_push_row(vacancy_id)
+    poster_username = push_row[10] if push_row and len(push_row) > 10 else None
+    from services.employer_contact import coalesce_employer_contact_for_deeplink
+    employer_contact = coalesce_employer_contact_for_deeplink(
+        employer_contact,
+        poster_username=poster_username,
+    ) or employer_contact
     if not employer_contact:
         if not add_response(
             user_id,
@@ -5511,6 +5548,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 required_fields=required_fields,
                 draft_text=draft_text,
                 vacancy_id=vacancy_id,
+                vacancy_text=vacancy_text,
             )
             update_response_delivery(
                 user_id,
@@ -5529,6 +5567,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
                 required_fields=required_fields,
                 draft_text=draft_text,
                 contact_link=None,
+                vacancy_text=vacancy_text,
             )
             await send_user_message(
                 user_id,
@@ -5945,26 +5984,23 @@ async def _wait_parser_lock_release():
         await asyncio.sleep(1)
 
 
-@dp.message(Command("check_now"))
-async def check_now_cmd(message: types.Message):
-    if message.from_user.id != YOUR_USER_ID:
-        return
-    status_msg = await message.answer("🔍 Начинаю проверку...")
+async def _run_check_now_job(status_msg: types.Message):
+    """Фоновая ручная проверка — не блокирует админ-меню."""
     progress_task = None
-    if parser_scan_in_progress():
-        await status_msg.edit_text(
-            format_parser_wait_message(LAST_DEBUG_STATS),
-            parse_mode="Markdown",
-        )
-        progress_task = asyncio.create_task(_parser_wait_progress_loop(status_msg))
-        await _wait_parser_lock_release()
-        if progress_task:
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
     try:
+        if parser_scan_in_progress():
+            await status_msg.edit_text(
+                format_parser_wait_message(LAST_DEBUG_STATS),
+                parse_mode="Markdown",
+            )
+            progress_task = asyncio.create_task(_parser_wait_progress_loop(status_msg))
+            await _wait_parser_lock_release()
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
         await status_msg.edit_text("🔍 Ручная проверка чатов…")
         orders, closed_data, stats = await run_parser()
         summary = format_scan_finished_summary(stats)
@@ -5978,12 +6014,12 @@ async def check_now_cmd(message: types.Message):
             await status_msg.edit_text(summary, parse_mode="Markdown")
             return
         if closed_data:
-            await notify_closed_vacancies(closed_data)
+            spawn_background_task(notify_closed_vacancies(closed_data))
         for order in orders:
-            await send_vacancy_to_subscribers(order)
+            schedule_vacancy_push(order)
         await status_msg.edit_text(
             f"✅ Проверка завершена. Найдено вакансий: {len(orders)}. "
-            f"Уведомлений о закрытии: {len(closed_data)}",
+            f"Push поставлен в очередь. Закрыто: {len(closed_data)}",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -5992,6 +6028,14 @@ async def check_now_cmd(message: types.Message):
     finally:
         if progress_task and not progress_task.done():
             progress_task.cancel()
+
+
+@dp.message(Command("check_now"))
+async def check_now_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    status_msg = await message.answer("🔍 Начинаю проверку… (можно пользоваться ботом)")
+    spawn_background_task(_run_check_now_job(status_msg))
 
 
 @dp.message(Command("audit_filter"))
@@ -6205,22 +6249,8 @@ async def tech_broadcast_confirm(callback: types.CallbackQuery, state: FSMContex
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
-    status_msg = await callback.message.edit_text("📣 Техсообщение отправляется…")
-    async with _broadcast_lock:
-        sent, failed, err = await run_topic_broadcast(
-            callback.from_user.id,
-            text,
-            topic_key="support",
-            body_prefix="🔧 *Сообщение от техподдержки:*\n\n",
-            status_msg=status_msg,
-        )
-    if err:
-        await status_msg.edit_text(err)
-    else:
-        await status_msg.edit_text(
-            f"✅ Техсообщение отправлено.\nДоставлено: {sent}\nОшибок: {failed}",
-            reply_markup=None,
-        )
+    status_msg = await callback.message.edit_text("📣 Техсообщение отправляется… (в фоне)")
+    spawn_background_task(_run_tech_broadcast_job(callback.from_user.id, text, status_msg))
 
 
 @dp.callback_query(lambda c: c.data == "tech_broadcast_cancel")
@@ -6842,10 +6872,45 @@ async def deliver_support_answer(req_id: int, answer_text: str) -> tuple[bool, s
     await send_user_message(
         user_id,
         topic_key="support",
-        text=f"📞 *Ответ от администратора:*\n\n{answer_text}",
-        parse_mode="Markdown",
+        text=f"📞 <b>Ответ от администратора</b>\n\n{escape_html(answer_text)}",
+        parse_mode="HTML",
     )
     return True, user_id
+
+
+async def deliver_complaint_answer(complaint_id: int, answer_text: str) -> tuple[bool, str | int]:
+    """Ответ на жалобу пользователю. (ok, user_id или код ошибки)."""
+    from db import get_complaint, mark_complaint_answered
+
+    complaint = get_complaint(complaint_id)
+    if not complaint or complaint.get("resolved"):
+        return False, "not_found"
+    user_id = complaint["user_id"]
+    mark_complaint_answered(complaint_id, answer_text)
+    await send_user_message(
+        user_id,
+        topic_key="support",
+        text=(
+            f"📞 <b>Ответ по вашей жалобе #{complaint_id}</b>\n\n"
+            f"{escape_html(answer_text)}"
+        ),
+        parse_mode="HTML",
+    )
+    return True, user_id
+
+
+async def deliver_admin_direct_message(user_id: int, message_text: str) -> bool:
+    """Личное сообщение от админа в топик «Поддержка»."""
+    profile = get_subscriber_profile(user_id)
+    if not profile:
+        return False
+    await send_user_message(
+        user_id,
+        topic_key="support",
+        text=f"📞 <b>Сообщение от администратора</b>\n\n{escape_html(message_text)}",
+        parse_mode="HTML",
+    )
+    return True
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("sup_r:"))
@@ -6897,6 +6962,108 @@ async def admin_support_reply_text(message: types.Message, state: FSMContext):
         await message.answer("❌ Обращение не найдено или уже отвечено.")
 
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("cmp_r:"))
+async def admin_complaint_reply_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    try:
+        complaint_id = int(callback.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    from db import get_complaint
+
+    complaint = get_complaint(complaint_id)
+    if not complaint or complaint.get("resolved"):
+        await callback.answer("Жалоба не найдена или уже обработана", show_alert=True)
+        return
+    await state.update_data(complaint_reply_id=complaint_id)
+    await state.set_state(AdminComplaintReplyState.waiting_for_text)
+    await callback.answer()
+    preview = (complaint.get("complaint_text") or complaint.get("reason") or "")[:200]
+    await callback.message.answer(
+        f"✉️ *Ответ на жалобу #{complaint_id}*\n"
+        f"От: `{complaint['user_id']}`\n"
+        f"Вакансия: `{complaint.get('vacancy_id') or '—'}`\n"
+        f"Текст: _{escape_markdown(preview)}_\n\n"
+        "Введите ответ одним сообщением:",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(AdminComplaintReplyState.waiting_for_text)
+async def admin_complaint_reply_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    data = await state.get_data()
+    complaint_id = data.get("complaint_reply_id")
+    if not complaint_id:
+        await state.clear()
+        await message.answer("❌ Жалоба не выбрана.")
+        return
+    ok, result = await deliver_complaint_answer(int(complaint_id), message.text or "")
+    await state.clear()
+    if ok:
+        await message.answer(f"✅ Ответ на жалобу #{complaint_id} отправлен пользователю {result}")
+    else:
+        await message.answer("❌ Жалоба не найдена или уже обработана.")
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("adm_msg_"))
+async def admin_direct_message_start(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != YOUR_USER_ID:
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    if len(parts) < 4:
+        await callback.answer("Неверные данные", show_alert=True)
+        return
+    try:
+        target_id = int(parts[2])
+        cards_page = int(parts[3])
+    except ValueError:
+        await callback.answer("Неверный ID", show_alert=True)
+        return
+    profile = await run_db(get_subscriber_profile, target_id)
+    if not profile:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await state.update_data(direct_message_user_id=target_id, direct_message_cards_page=cards_page)
+    await state.set_state(AdminDirectMessageState.waiting_for_text)
+    await callback.answer()
+    label = _admin_user_short_label(profile)
+    await callback.message.answer(
+        f"✉️ *Сообщение пользователю* {escape_markdown(label)} (`{target_id}`)\n\n"
+        "Введите текст одним сообщением:",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(AdminDirectMessageState.waiting_for_text)
+async def admin_direct_message_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    if await admin_fsm_menu_escape(message, state):
+        return
+    data = await state.get_data()
+    target_id = data.get("direct_message_user_id")
+    cards_page = int(data.get("direct_message_cards_page") or 0)
+    if not target_id:
+        await state.clear()
+        await message.answer("❌ Пользователь не выбран.")
+        return
+    ok = await deliver_admin_direct_message(int(target_id), message.text or "")
+    await state.clear()
+    if ok:
+        await message.answer(f"✅ Сообщение отправлено пользователю {target_id}")
+        await show_admin_user_detail(message, int(target_id), cards_page=cards_page, edit=False)
+    else:
+        await message.answer("❌ Пользователь не найден.")
+
+
 @dp.callback_query(lambda c: c.data and c.data.startswith("cmp_ok:"))
 async def admin_complaint_resolve(callback: types.CallbackQuery):
     if callback.from_user.id != YOUR_USER_ID:
@@ -6941,6 +7108,30 @@ async def answer_support(message: types.Message):
         await message.answer(f"✅ Ответ отправлен пользователю {result}")
     else:
         await message.answer("❌ Обращение не найдено или уже отвечено.")
+
+
+@dp.message(Command("complaint_answer"))
+async def answer_complaint_cmd(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "❌ Использование: `/complaint_answer ID_жалобы текст_ответа`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        complaint_id = int(parts[1])
+        answer_text = parts[2]
+    except Exception:
+        await message.answer("❌ Неверный ID жалобы")
+        return
+    ok, result = await deliver_complaint_answer(complaint_id, answer_text)
+    if ok:
+        await message.answer(f"✅ Ответ по жалобе отправлен пользователю {result}")
+    else:
+        await message.answer("❌ Жалоба не найдена или уже обработана.")
 
 @dp.message(lambda m: m.text == "➕ Добавить чат")
 async def admin_add_chat_button(message: types.Message, state: FSMContext):

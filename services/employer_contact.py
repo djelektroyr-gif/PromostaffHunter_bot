@@ -9,6 +9,9 @@ _PHONE_APPLY_HINT = (
     "и отправьте заказчику по номеру из объявления."
 )
 
+_TG_USER_ID_RE = re.compile(r"tg://user\?id=(\d+)", re.I)
+_MD_TG_USER_RE = re.compile(r"\[([^\]]+)\]\(tg://user\?id=(\d+)\)", re.I)
+
 
 def normalize_ru_phone_digits(contact: str | None) -> str | None:
     """11 цифр 7XXXXXXXXXX."""
@@ -37,13 +40,58 @@ def is_phone_only_employer_contact(contact: str | None) -> bool:
     return normalize_ru_phone_digits(c) is not None
 
 
+def is_tg_user_id_contact(contact: str | None) -> bool:
+    if not contact:
+        return False
+    return bool(_TG_USER_ID_RE.match(contact.strip()))
+
+
+def parse_tg_user_id(contact: str | None) -> str | None:
+    if not contact:
+        return None
+    m = _TG_USER_ID_RE.match(contact.strip())
+    return m.group(1) if m else None
+
+
+def extract_tg_user_display_name(vacancy_text: str | None, user_id: str) -> str | None:
+    """Имя из [Станислав](tg://user?id=…) в тексте вакансии."""
+    if not vacancy_text or not user_id:
+        return None
+    for pattern in (
+        re.compile(rf"\[([^\]]+)\]\(tg://user\?id={re.escape(user_id)}[^)]*\)", re.I),
+        re.compile(rf"👉\s*\[([^\]]+)\]\(tg://user\?id={re.escape(user_id)}", re.I),
+    ):
+        m = pattern.search(vacancy_text)
+        if m:
+            name = m.group(1).strip()
+            if name:
+                return name
+    return None
+
+
+def coalesce_employer_contact_for_deeplink(
+    contact: str | None,
+    *,
+    poster_username: str | None = None,
+) -> str | None:
+    """Если в БД tg://user, но есть @username автора — даём кнопку «Открыть чат»."""
+    c = (contact or "").strip() or None
+    if not c:
+        return None
+    if is_tg_user_id_contact(c) and poster_username:
+        uname = poster_username.strip().lstrip("@")
+        if re.fullmatch(r"[a-zA-Z0-9_]{5,32}", uname):
+            return f"@{uname}"
+    return c
+
+
 def employer_contact_needs_manual_apply(contact: str | None) -> bool:
     """Нет автоматической кнопки «открыть чат» в Telegram."""
     if not contact:
         return False
     if is_phone_only_employer_contact(contact):
         return True
-    return contact.strip().startswith("tg://user?id=")
+    return is_tg_user_id_contact(contact)
 
 
 def format_phone_display(contact: str) -> str:
@@ -58,11 +106,42 @@ def phone_vacancy_notice_html() -> str:
     return f"ℹ️ <i>{_PHONE_APPLY_HINT}</i>"
 
 
+def tg_user_vacancy_notice_html(contact: str, vacancy_text: str | None = None) -> str:
+    """Кликабельная ссылка на заказчика в HTML-карточке."""
+    uid = parse_tg_user_id(contact)
+    if not uid:
+        return ""
+    label = extract_tg_user_display_name(vacancy_text, uid) or "Написать заказчику"
+    return (
+        f'👉 <a href="tg://user?id={uid}">{label}</a>\n'
+        f"ℹ️ <i>Нажмите «✅ Откликнуться» — бот пришлёт черновик и ссылку на заказчика.</i>"
+    )
+
+
 def phone_response_instructions_markdown() -> str:
     return (
         "_Telegram не даёт боту кнопку «открыть чат по номеру». "
         "Нажмите на номер выше (если он стал ссылкой) или найдите заказчика в Telegram по номеру из объявления. "
         "Скопируйте текст отклика ниже и отправьте заказчику._"
+    )
+
+
+def tg_user_response_instructions_markdown(
+    contact: str,
+    *,
+    vacancy_text: str | None = None,
+    draft_text: str,
+) -> str:
+    """Черновик отклика: кликабельная ссылка tg://user в тексте сообщения."""
+    uid = parse_tg_user_id(contact)
+    if not uid:
+        return ""
+    label = extract_tg_user_display_name(vacancy_text, uid) or "заказчику"
+    return (
+        f"\n\n👨‍💼 Нажмите на имя — откроется чат: [{label}](tg://user?id={uid})\n"
+        "_Кнопки «Открыть чат» у бота нет (ограничение Telegram). "
+        "Скопируйте черновик ниже и вставьте в сообщение заказчику._\n\n"
+        f"```\n{draft_text}\n```"
     )
 
 

@@ -12,8 +12,10 @@ MSK_TZ = timezone(timedelta(hours=3))
 from services.employer_contact import (
     format_phone_display,
     is_phone_only_employer_contact,
+    is_tg_user_id_contact,
     phone_vacancy_notice_html,
     resolve_effective_employer_contact,
+    tg_user_vacancy_notice_html,
 )
 from services.vacancy_enrichment import enrich_vacancy_text, resolve_map_address, extract_shift_date_token
 from services.vacancy_public_text import sanitize_vacancy_public_body
@@ -306,12 +308,20 @@ def _shift_schedule_line(inp: VacancyCardInput) -> str | None:
     return ", ".join(parts)
 
 
-def _append_phone_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
+def _append_contact_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
     contact = resolve_effective_employer_contact(inp.author_contact, inp.body)
-    if not is_phone_only_employer_contact(contact):
+    if is_phone_only_employer_contact(contact):
+        lines_out.append(f"📞 {escape_html(format_phone_display(contact or ''))}")
+        lines_out.append(phone_vacancy_notice_html())
         return
-    lines_out.append(f"📞 {escape_html(format_phone_display(contact or ''))}")
-    lines_out.append(phone_vacancy_notice_html())
+    if is_tg_user_id_contact(contact):
+        notice = tg_user_vacancy_notice_html(contact or "", inp.body)
+        if notice:
+            lines_out.append(notice)
+
+
+def _append_phone_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
+    _append_contact_apply_notice(lines_out, inp)
 
 
 def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool = True) -> str:

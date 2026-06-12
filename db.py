@@ -373,6 +373,10 @@ def init_db():
         ):
             add_column_if_missing("vacancies", col, ddl, cur=cur)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vacancies_feed "
+            "ON vacancies(category_code, is_closed, found_at)"
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS vacancy_notfit_feedback (
@@ -586,6 +590,11 @@ def init_db():
                 FOREIGN KEY (vacancy_id) REFERENCES vacancies(id)
             )
         """)
+        add_column_if_missing(
+            "complaints", "admin_response",
+            "ALTER TABLE complaints ADD COLUMN admin_response TEXT DEFAULT NULL",
+            cur=cur,
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS support_requests (
@@ -2410,8 +2419,35 @@ def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200
     ]
 
 
-def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
+def _feed_since_sql(max_hours: int) -> str:
+    days = max(1, (int(max_hours) + 23) // 24)
+    return now_minus_days(days)
+
+
+def _map_feed_vacancy_rows(rows) -> list[dict]:
+    return [
+        {
+            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
+            "found_at": r[6], "published_at": r[7],
+            "address_normalized": r[8], "location_lat": r[9], "location_lon": r[10],
+            "category_code": r[11], "geo_tags": r[12],
+            "rate_hourly": r[13], "rate_shift": r[14], "rate_effective_hourly": r[15],
+            "shift_date": r[16], "shift_time_start": r[17],
+        }
+        for r in rows
+    ]
+
+
+def get_feed_vacancies_for_user(
+    user_id: int,
+    category_code: str,
+    *,
+    max_hours: int | None = None,
+) -> list:
     """Открытые вакансии категории, которые пользователь ещё не получал (push/лента)."""
+    age_sql = ""
+    if max_hours is not None:
+        age_sql = f" AND ({vacancy_sort_published_sql()}) >= {_feed_since_sql(max_hours)}"
     rows = fetchall(
         f"""
         SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
@@ -2426,21 +2462,68 @@ def get_feed_vacancies_for_user(user_id: int, category_code: str) -> list:
             SELECT 1 FROM sent_vacancies sv
             WHERE sv.user_id = ? AND sv.vacancy_id = v.id
           )
+          {age_sql}
         ORDER BY v.found_at DESC
         """,
         (category_code, user_id),
     )
-    return [
-        {
-            "id": r[0], "source": r[1], "text": r[2], "link": r[3], "contact": r[4], "address": r[5],
-            "found_at": r[6], "published_at": r[7],
-            "address_normalized": r[8], "location_lat": r[9], "location_lon": r[10],
-            "category_code": r[11], "geo_tags": r[12],
-            "rate_hourly": r[13], "rate_shift": r[14], "rate_effective_hourly": r[15],
-            "shift_date": r[16], "shift_time_start": r[17],
-        }
-        for r in rows
-    ]
+    return _map_feed_vacancy_rows(rows)
+
+
+def get_feed_vacancies_bulk_for_user(
+    user_id: int,
+    category_codes: list[str],
+    *,
+    max_hours: int,
+) -> list[dict]:
+    """Все непросмотренные вакансии пользователя по списку категорий — один запрос."""
+    if not category_codes:
+        return []
+    placeholders = ",".join("?" * len(category_codes))
+    age_sql = f" AND ({vacancy_sort_published_sql()}) >= {_feed_since_sql(max_hours)}"
+    rows = fetchall(
+        f"""
+        SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
+               v.author_contact, v.address, v.found_at, v.published_at,
+               v.address_normalized, v.location_lat, v.location_lon,
+               v.category_code, v.geo_tags, v.rate_hourly, v.rate_shift, v.rate_effective_hourly,
+               v.shift_date, v.shift_time_start
+        FROM vacancies v
+        WHERE v.category_code IN ({placeholders}) AND v.is_closed = {bool_false()}
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
+          AND NOT EXISTS (
+            SELECT 1 FROM sent_vacancies sv
+            WHERE sv.user_id = ? AND sv.vacancy_id = v.id
+          )
+          {age_sql}
+        ORDER BY v.found_at DESC
+        """,
+        (*category_codes, user_id),
+    )
+    return _map_feed_vacancy_rows(rows)
+
+
+def count_history_vacancies_by_categories(
+    user_id: int,
+    category_codes: list[str],
+    *,
+    max_hours: int = 720,
+) -> dict[str, int]:
+    if not category_codes:
+        return {}
+    placeholders = ",".join("?" * len(category_codes))
+    rows = fetchall(
+        f"""
+        SELECT v.category_code, COUNT(*) FROM sent_vacancies sv
+        JOIN vacancies v ON v.id = sv.vacancy_id
+        WHERE sv.user_id = ? AND v.category_code IN ({placeholders})
+          AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
+          AND sv.sent_at >= {_history_sent_since_sql(max_hours)}
+        GROUP BY v.category_code
+        """,
+        (user_id, *category_codes),
+    )
+    return {row[0]: int(row[1]) for row in rows}
 
 
 def _history_sent_since_sql(hours: int) -> str:
@@ -3040,7 +3123,7 @@ def get_complaint(complaint_id: int) -> dict | None:
     row = fetchone(
         """
         SELECT c.id, c.user_id, s.full_name, s.username, c.vacancy_id,
-               c.reason, c.complaint_text, c.created_at, c.resolved
+               c.reason, c.complaint_text, c.created_at, c.resolved, c.admin_response
         FROM complaints c
         LEFT JOIN subscribers s ON c.user_id = s.user_id
         WHERE c.id = ?
@@ -3059,6 +3142,7 @@ def get_complaint(complaint_id: int) -> dict | None:
         "complaint_text": row[6],
         "created_at": row[7],
         "resolved": bool(row[8]) if row[8] is not None else False,
+        "admin_response": row[9],
     }
 
 
@@ -3075,6 +3159,13 @@ def get_recent_complaints(limit: int = 20):
 
 def resolve_complaint(complaint_id: int):
     execute(f"UPDATE complaints SET resolved = {bool_true()} WHERE id = ?", (complaint_id,))
+
+
+def mark_complaint_answered(complaint_id: int, answer_text: str):
+    execute(
+        f"UPDATE complaints SET resolved = {bool_true()}, admin_response = ? WHERE id = ?",
+        (answer_text, complaint_id),
+    )
 
 
 # ========== ПОДДЕРЖКА ==========
@@ -3723,20 +3814,25 @@ def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
             (limit, offset),
         )
         rows = cur.fetchall()
+        user_ids = [row[0] for row in rows]
+        cats_by_user: dict[int, list[str]] = {uid: [] for uid in user_ids}
+        if user_ids:
+            placeholders = ",".join("?" * len(user_ids))
+            cur.execute(
+                q(f"""
+                    SELECT uc.user_id, c.emoji, c.name
+                    FROM user_categories uc
+                    JOIN categories c ON c.code = uc.category_code
+                    WHERE uc.user_id IN ({placeholders})
+                    ORDER BY c.name
+                """),
+                tuple(user_ids),
+            )
+            for uid, emoji, name in cur.fetchall():
+                cats_by_user.setdefault(uid, []).append(f"{emoji} {name}")
         cards = []
         for row in rows:
             user_id = row[0]
-            cur.execute(
-                q("""
-                    SELECT c.name, c.emoji
-                    FROM user_categories uc
-                    JOIN categories c ON c.code = uc.category_code
-                    WHERE uc.user_id = ?
-                    ORDER BY c.name
-                """),
-                (user_id,),
-            )
-            cats = [f"{c[1]} {c[0]}" for c in cur.fetchall()]
             cards.append({
                 "user_id": user_id,
                 "username": row[1],
@@ -3750,7 +3846,7 @@ def get_subscriber_cards(limit: int = 20, offset: int = 0) -> list:
                 "plan": row[9] or "free",
                 "paid_until": row[10],
                 "is_premium": bool(row[11]),
-                "categories": cats,
+                "categories": cats_by_user.get(user_id, []),
             })
     return cards
 

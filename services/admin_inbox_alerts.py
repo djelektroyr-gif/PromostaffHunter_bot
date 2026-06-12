@@ -32,9 +32,15 @@ def complaint_action_keyboard(complaint_id: int, user_id: int) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
+                text="✉️ Ответить",
+                callback_data=f"cmp_r:{complaint_id}",
+            ),
+            InlineKeyboardButton(
                 text="✅ Обработано",
                 callback_data=f"cmp_ok:{complaint_id}",
             ),
+        ],
+        [
             InlineKeyboardButton(
                 text="👤 Карточка",
                 callback_data=f"adm_u_{user_id}_0",

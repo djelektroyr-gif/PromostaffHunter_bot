@@ -9,7 +9,11 @@ import pytest
 
 from db import add_subscriber, add_support_request, get_user_categories, init_db, set_user_plan
 from db_backend import IS_POSTGRES
-from services.admin_inbox_alerts import format_complaint_admin_html, format_support_admin_html
+from services.admin_inbox_alerts import (
+    complaint_action_keyboard,
+    format_complaint_admin_html,
+    format_support_admin_html,
+)
 from services.onboarding_deeplink import apply_vacancy_deeplink_category_preselect
 
 
@@ -48,6 +52,13 @@ def test_format_support_admin_html():
     assert "#7" in text
     assert "123" in text
     assert "push" in text
+
+
+def test_complaint_keyboard_has_reply_button():
+    kb = complaint_action_keyboard(9, 456)
+    callbacks = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+    assert "cmp_r:9" in callbacks
+    assert "cmp_ok:9" in callbacks
 
 
 def test_format_complaint_admin_html():
