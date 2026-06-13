@@ -59,7 +59,7 @@ LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
 LLM_DAILY_LIMIT_PREMIUM = int(os.getenv("LLM_DAILY_LIMIT_PREMIUM", "20"))
 
 # Telegram Stars — отклик и расширенный отклик
-STARS_ENABLED = os.getenv("STARS_ENABLED", "1").strip().lower() in ("1", "true", "yes")
+STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 STARS_RESPONSE_PRICE = int(os.getenv("STARS_RESPONSE_PRICE", "3"))
 STARS_EXTENDED_RESPONSE_PRICE = int(os.getenv("STARS_EXTENDED_RESPONSE_PRICE", "35"))
 

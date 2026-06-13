@@ -130,6 +130,26 @@ def test_extended_star_separate_from_response_pay(tmp_db):
     assert not has_paid_response_unlock(user_id, vac)
 
 
+def test_trial_used_without_responses_needs_paywall(tmp_db):
+    user_id = _seed_user()
+    execute("UPDATE subscribers SET trial_used = 1 WHERE user_id = ?", (user_id,))
+    access = resolve_response_access(user_id, "vac_test_1")
+    assert access.allowed is False
+    assert access.needs_paywall is True
+
+
+def test_first_trial_before_credits(tmp_db):
+    user_id = _seed_user()
+    _seed_vacancy()
+    add_response_credits(user_id, 5)
+    access = resolve_response_access(user_id, "vac_test_1")
+    assert access.reason == "first_trial"
+    ok, info = consume_response_slot(user_id, "vac_test_1")
+    assert ok is True
+    assert info["trial_granted"] is True
+    assert get_response_credits(user_id) == 5
+
+
 def test_setup_trial_adds_category(tmp_db):
     user_id = _seed_user()
     _seed_vacancy(category="loader")

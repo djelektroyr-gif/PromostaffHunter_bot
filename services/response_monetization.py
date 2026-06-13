@@ -12,6 +12,7 @@ from config import (
 )
 from db import (
     count_user_responses,
+    get_subscriber_profile,
     get_vacancy_push_row,
     grant_trial_if_eligible,
     has_paid_response_unlock,
@@ -30,6 +31,18 @@ class ResponseAccess:
     reason: str
 
 
+def _first_response_trial_eligible(user_id: int) -> bool:
+    """Первый отклик + trial ещё не использовали."""
+    if not TRIAL_ON_FIRST_RESPONSE:
+        return False
+    if count_user_responses(user_id) > 0:
+        return False
+    profile = get_subscriber_profile(user_id)
+    if profile and profile.get("trial_used"):
+        return False
+    return True
+
+
 def resolve_response_access(user_id: int, vacancy_id: str) -> ResponseAccess:
     """Можно ли отправить отклик без оплаты прямо сейчас."""
     if is_user_premium(user_id):
@@ -38,10 +51,10 @@ def resolve_response_access(user_id: int, vacancy_id: str) -> ResponseAccess:
         return ResponseAccess(True, False, False, "free_legacy")
     if has_paid_response_unlock(user_id, vacancy_id):
         return ResponseAccess(True, False, False, "star_paid")
+    if _first_response_trial_eligible(user_id):
+        return ResponseAccess(True, False, True, "first_trial")
     if get_response_credits(user_id) > 0:
         return ResponseAccess(True, False, False, "credit")
-    if TRIAL_ON_FIRST_RESPONSE and count_user_responses(user_id) == 0:
-        return ResponseAccess(True, False, True, "first_trial")
     return ResponseAccess(False, True, False, "paywall")
 
 
@@ -67,7 +80,7 @@ def setup_trial_from_first_response(user_id: int, vacancy_id: str) -> dict:
 
 def consume_response_slot(user_id: int, vacancy_id: str) -> tuple[bool, dict | None]:
     """
-    Списать платный слот перед add_response.
+    Списать платный слот после успешного add_response.
     Возвращает (ok, trial_info) — trial_info только при первом отклике.
     """
     if is_user_premium(user_id):
@@ -76,7 +89,7 @@ def consume_response_slot(user_id: int, vacancy_id: str) -> tuple[bool, dict | N
         return True, None
     if has_paid_response_unlock(user_id, vacancy_id):
         return True, None
-    if TRIAL_ON_FIRST_RESPONSE and count_user_responses(user_id) == 0:
+    if _first_response_trial_eligible(user_id):
         info = setup_trial_from_first_response(user_id, vacancy_id)
         return True, info
     if consume_response_credit(user_id):

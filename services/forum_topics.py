@@ -50,3 +50,8 @@ def topic_message_kwargs(user_id: int, topic_key: str | None) -> dict:
     if thread_id:
         return {"message_thread_id": thread_id}
     return {}
+
+
+def merge_send_kwargs(caller_kwargs: dict, topic_kwargs: dict) -> dict:
+    """Слияние kwargs для send_message: маршрут в топик (topic_kwargs) важнее caller."""
+    return {**caller_kwargs, **topic_kwargs}

@@ -297,6 +297,7 @@ RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
 GIFT_PRESET_DAYS = (7, 14, 30, 90)
 _processing_finish: set[int] = set()
+_processing_respond: set[int] = set()
 _broadcast_lock = asyncio.Lock()
 
 
@@ -654,10 +655,9 @@ def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> s
         limit_line = f"💎 Premium: все категории и push. Выбрано: *{selected_count}*."
     else:
         trial_line = ""
-        if not trial_used and TRIAL_DAYS > 0:
+        if not trial_used and TRIAL_DAYS > 0 and TRIAL_ON_FIRST_RESPONSE:
             trial_line = (
-                f"\n🎁 Пробный Premium *{TRIAL_DAYS} дн.* — все категории и push "
-                f"(один раз после «✅ Завершить выбор»)."
+                f"\n🎁 Пробный Premium *{TRIAL_DAYS} дн.* — при первом отклике на вакансию."
             )
         limit_line = (
             f"🆓 *Free:* {_free_category_hint_short()} — только лента «🔍 Посмотреть…», без push.\n"
@@ -1123,13 +1123,27 @@ async def setup_forum_topics_for_user(user_id: int):
 
 async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwargs):
     """send_message в тему лички (или general без topic_key)."""
+    from services.forum_topics import merge_send_kwargs, topic_message_kwargs
+
     extra: dict = {}
     if topic_key and FORUM_TOPICS_ENABLED:
         if not get_user_topic_thread_id(user_id, topic_key):
             await setup_forum_topics_for_user(user_id)
-        from services.forum_topics import topic_message_kwargs
         extra = topic_message_kwargs(user_id, topic_key)
-    return await send_message_with_retry(user_id, **extra, **kwargs)
+    payload = merge_send_kwargs(kwargs, extra)
+    try:
+        return await send_message_with_retry(user_id, **payload)
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
+            logger.warning(
+                "send_user_message: тема недоступна user=%s key=%s, fallback в общий чат",
+                user_id,
+                topic_key,
+            )
+            payload.pop("message_thread_id", None)
+            return await send_message_with_retry(user_id, **payload)
+        raise
 
 
 async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy_id: str):
@@ -1424,10 +1438,9 @@ def format_subscription_screen(user_id: int) -> str:
         )
     pay_block = "\n".join(pay_lines)
     trial_hint = ""
-    if not trial_used and TRIAL_DAYS > 0 and not premium:
+    if not trial_used and TRIAL_DAYS > 0 and not premium and TRIAL_ON_FIRST_RESPONSE:
         trial_hint = (
-            f"\n\n🎁 Новым пользователям — пробный Premium "
-            f"<b>{TRIAL_DAYS} дн.</b> после выбора категорий."
+            f"\n\n🎁 Пробный Premium <b>{TRIAL_DAYS} дн.</b> — при первом отклике на вакансию."
         )
     return (
         f"💎 <b>Подписка Promostaff Hunter</b>\n\n"
@@ -1533,12 +1546,12 @@ async def send_admin_stats_screen(message: types.Message, *, hours: int = 24) ->
         await notice.edit_text(
             text,
             parse_mode="HTML",
-            reply_markup=get_admin_stats_keyboard(),
             disable_web_page_preview=True,
         )
     except TelegramBadRequest:
         plain = re.sub(r"<[^>]*>", "", text)
-        await notice.edit_text(plain, reply_markup=get_admin_stats_keyboard())
+        await notice.edit_text(plain)
+    await message.answer("👇 Период и отчёты", reply_markup=get_admin_stats_keyboard())
 
 
 class BroadcastState(StatesGroup):
@@ -1671,10 +1684,10 @@ def build_user_help_html(user_id: int) -> str:
         )
 
     trial_block = ""
-    if not premium and not trial_used and TRIAL_DAYS > 0:
+    if not premium and not trial_used and TRIAL_DAYS > 0 and TRIAL_ON_FIRST_RESPONSE:
         trial_block = (
-            f"\n\n🎁 После «✅ Завершить выбор» категорий — пробный Premium "
-            f"<b>{TRIAL_DAYS} дн.</b> (push + фильтры)."
+            f"\n\n🎁 Пробный Premium <b>{TRIAL_DAYS} дн.</b> — при первом отклике "
+            f"(push + фильтры)."
         )
 
     premium_extra = ""
@@ -2677,6 +2690,8 @@ async def send_vacancy_to_subscribers(order: dict):
             else:
                 await send_vacancy_card(uid, text, reply_markup=keyboard, topic_key=None)
             sent_count += 1
+            from services.feed_loader import invalidate_feed_cache
+            invalidate_feed_cache(uid)
             await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
         except Exception as e:
             unreserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
@@ -3191,8 +3206,7 @@ async def role_candidate_pick(callback: types.CallbackQuery, state: FSMContext):
         "без этого «✋ Откликнуться» не сработает.\n\n"
         f"*Тариф:* бесплатно — *1 категория* (лента без push). "
         f"*2 категории и больше* + push — Premium ({escape_markdown(SUBSCRIPTION_PRICE_RUB)} ₽/мес).\n"
-        f"🎁 Один раз — пробный Premium *{TRIAL_DAYS} дн.* после выбора категорий "
-        "(все роли + push + метро).\n\n"
+        f"🎁 Пробный Premium *{TRIAL_DAYS} дн.* — при первом отклике на вакансию.\n\n"
         "Как вас зовут? (ФИО полностью)\n\nПример: *Иван Петров*",
         parse_mode="Markdown",
     )
@@ -3991,14 +4005,19 @@ async def _load_feed_snapshot_async(user_id: int, *, force_refresh: bool = False
 
 
 async def _send_feed_loading_notice(message: types.Message, user_id: int) -> types.Message:
-    from services.chat_feedback import thread_id_from_message, topic_thread_id
+    from services.chat_feedback import (
+        message_answer_injects_thread_id,
+        thread_id_from_message,
+        topic_thread_id,
+    )
     from services.forum_topics import TOPIC_VACANCIES
 
-    extra: dict = {}
     thread_id = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
+    if message_answer_injects_thread_id(message):
+        return await message.answer("⏳ Собираю ленту…")
     if thread_id is not None:
-        extra["message_thread_id"] = thread_id
-    return await message.answer("⏳ Собираю ленту…", **extra)
+        return await bot.send_message(message.chat.id, "⏳ Собираю ленту…", message_thread_id=thread_id)
+    return await message.answer("⏳ Собираю ленту…")
 
 
 async def _delete_feed_loading_notice(notice: types.Message | None) -> None:
@@ -4468,7 +4487,9 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
             try:
                 await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
                 if feed_mode != "history":
-                    try_reserve_vacancy_sent_to_user(vac["id"], user_id)
+                    if try_reserve_vacancy_sent_to_user(vac["id"], user_id):
+                        from services.feed_loader import invalidate_feed_cache
+                        invalidate_feed_cache(user_id)
                 await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"Ошибка отправки вакансии: {e}")
@@ -5642,13 +5663,18 @@ async def _prompt_response_registration(
     await state.set_state(RegistrationState.waiting_for_name)
 
 
+async def _apply_response_slot_charge(user_id: int, vacancy_id: str) -> None:
+    """Списать trial/кредит после успешного add_response."""
+    from services.response_monetization import consume_response_slot
+    _, trial_info = await run_db(consume_response_slot, user_id, vacancy_id)
+    await _notify_first_response_trial(user_id, trial_info)
+
+
 async def _execute_response_flow(
     callback: types.CallbackQuery | None,
     user_id: int,
     vacancy_id: str,
     state: FSMContext,
-    *,
-    trial_info: dict | None = None,
 ) -> None:
     profile = get_subscriber_profile(user_id)
     if not profile:
@@ -5689,7 +5715,7 @@ async def _execute_response_flow(
             await send_to_admin(
                 callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
             )
-        await _notify_first_response_trial(user_id, trial_info)
+        await _apply_response_slot_charge(user_id, vacancy_id)
         return
     if not add_response(
         user_id,
@@ -5706,6 +5732,7 @@ async def _execute_response_flow(
         return
     from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
     record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id})
+    await _apply_response_slot_charge(user_id, vacancy_id)
     if callback:
         await _mark_vacancy_card_responded(callback, vacancy_id, address)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
@@ -5788,7 +5815,6 @@ async def _execute_response_flow(
             employer_contact=employer_contact,
             reason=f"Первичная ошибка ({e}), черновик доставлен текстом.",
         )
-    await _notify_first_response_trial(user_id, trial_info)
 
 
 async def continue_response_after_registration(
@@ -5797,7 +5823,7 @@ async def continue_response_after_registration(
     vacancy_id: str,
     state: FSMContext,
 ) -> None:
-    from services.response_monetization import resolve_response_access, consume_response_slot, response_paywall_text
+    from services.response_monetization import resolve_response_access, response_paywall_text
     if is_already_responded(user_id, vacancy_id):
         await message.answer("❌ Вы уже откликались на эту вакансию.")
         return
@@ -5815,21 +5841,7 @@ async def continue_response_after_registration(
             reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
         )
         return
-    ok, trial_info = await run_db(consume_response_slot, user_id, vacancy_id)
-    if not ok:
-        credits = get_response_credits(user_id)
-        await message.answer(
-            response_paywall_text(
-                credits=credits,
-                stars_price=STARS_RESPONSE_PRICE,
-                pack_credits=RESPONSE_PACK_CREDITS,
-                pack_price=RESPONSE_PACK_PRICE_RUB,
-            ),
-            parse_mode="Markdown",
-            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
-        )
-        return
-    await _execute_response_flow(None, user_id, vacancy_id, state, trial_info=trial_info)
+    await _execute_response_flow(None, user_id, vacancy_id, state)
 
 
 @dp.callback_query(
@@ -5845,6 +5857,9 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if is_already_responded(user_id, vacancy_id):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
+    if user_id in _processing_respond:
+        await callback.answer("⏳ Уже отправляем отклик…")
+        return
     profile = get_subscriber_profile(user_id)
     if not profile or not profile.get("full_name") or not profile.get("phone"):
         await _prompt_response_registration(callback, state, vacancy_id)
@@ -5852,7 +5867,7 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if not get_vacancy_row(vacancy_id):
         await callback.answer("❌ Вакансия не найдена", show_alert=True)
         return
-    from services.response_monetization import resolve_response_access, consume_response_slot, response_paywall_text
+    from services.response_monetization import resolve_response_access, response_paywall_text
     access = await run_db(resolve_response_access, user_id, vacancy_id)
     if access.needs_paywall:
         credits = get_response_credits(user_id)
@@ -5869,22 +5884,11 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
         )
         return
-    ok, trial_info = await run_db(consume_response_slot, user_id, vacancy_id)
-    if not ok:
-        credits = get_response_credits(user_id)
-        await callback.answer("Нет платных откликов", show_alert=True)
-        await callback.message.answer(
-            response_paywall_text(
-                credits=credits,
-                stars_price=STARS_RESPONSE_PRICE,
-                pack_credits=RESPONSE_PACK_CREDITS,
-                pack_price=RESPONSE_PACK_PRICE_RUB,
-            ),
-            parse_mode="Markdown",
-            reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
-        )
-        return
-    await _execute_response_flow(callback, user_id, vacancy_id, state, trial_info=trial_info)
+    _processing_respond.add(user_id)
+    try:
+        await _execute_response_flow(callback, user_id, vacancy_id, state)
+    finally:
+        _processing_respond.discard(user_id)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_llm_"))
 async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
@@ -5904,6 +5908,13 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         return
     vacancy_text = row[0] or ""
     employer_contact = pick_employer_contact_for_response(row[3], vacancy_text)
+    push_row = get_vacancy_push_row(vacancy_id)
+    poster_username = push_row[10] if push_row and len(push_row) > 10 else None
+    from services.employer_contact import coalesce_employer_contact_for_deeplink
+    employer_contact = coalesce_employer_contact_for_deeplink(
+        employer_contact,
+        poster_username=poster_username,
+    ) or employer_contact
     await callback.answer("Составляю текст…")
     from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
     from services.llm_client import ask_llm
@@ -5929,7 +5940,7 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     link = build_contact_link(employer_contact, draft) if employer_contact else None
     lines = ["✨ *Улучшенный черновик:*", "", draft]
     if not link and employer_contact:
-        lines.append(manual_contact_hint(employer_contact, draft).lstrip("\n"))
+        lines.append(manual_contact_hint(employer_contact, draft, vacancy_text=vacancy_text).lstrip("\n"))
     kb = [[_inline_btn("Открыть чат", url=link, style="success")]] if link else []
     await send_user_message_safe_buttons(
         user_id,
@@ -6171,7 +6182,7 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
             await message.answer("✅ Оплата принята. Вы уже откликались на эту вакансию.")
             return
         await message.answer("✅ Оплата принята! Отправляю отклик…")
-        await _execute_response_flow(None, user_id, vacancy_id, state, trial_info=None)
+        await _execute_response_flow(None, user_id, vacancy_id, state)
         return
     if not payload.startswith("ext_resp:"):
         return
@@ -6189,6 +6200,13 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
         return
     vacancy_text = row[0] or ""
     employer_contact = pick_employer_contact_for_response(row[3], vacancy_text)
+    push_row = get_vacancy_push_row(vacancy_id)
+    poster_username = push_row[10] if push_row and len(push_row) > 10 else None
+    from services.employer_contact import coalesce_employer_contact_for_deeplink
+    employer_contact = coalesce_employer_contact_for_deeplink(
+        employer_contact,
+        poster_username=poster_username,
+    ) or employer_contact
     prefix = "⭐ Приоритетный отклик через Promostaff Hunter\n\n"
     draft = build_candidate_profile_text(profile)
     if LLM_ENABLED and is_user_premium(user_id):
@@ -6208,7 +6226,7 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
     from services.forum_topics import TOPIC_RESPONSES
     body = "✅ *Расширенный отклик активирован!*\n\n" + draft
     if not link and employer_contact:
-        body += manual_contact_hint(employer_contact, draft)
+        body += manual_contact_hint(employer_contact, draft, vacancy_text=vacancy_text)
     kb = [[_inline_btn("Открыть чат и отправить", url=link, style="success")]] if link else []
     await send_user_message_safe_buttons(
         user_id,
@@ -7358,13 +7376,17 @@ async def deliver_support_answer(req_id: int, answer_text: str) -> tuple[bool, s
     if not req or req.get("answered"):
         return False, "not_found"
     user_id = req["user_id"]
+    try:
+        await send_user_message(
+            user_id,
+            topic_key="support",
+            text=f"📞 <b>Ответ от администратора</b>\n\n{escape_html(answer_text)}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("deliver_support_answer req=%s user=%s: %s", req_id, user_id, e)
+        return False, "send_failed"
     mark_support_answered(req_id, answer_text)
-    await send_user_message(
-        user_id,
-        topic_key="support",
-        text=f"📞 <b>Ответ от администратора</b>\n\n{escape_html(answer_text)}",
-        parse_mode="HTML",
-    )
     return True, user_id
 
 
@@ -7376,16 +7398,20 @@ async def deliver_complaint_answer(complaint_id: int, answer_text: str) -> tuple
     if not complaint or complaint.get("resolved"):
         return False, "not_found"
     user_id = complaint["user_id"]
+    try:
+        await send_user_message(
+            user_id,
+            topic_key="support",
+            text=(
+                f"📞 <b>Ответ по вашей жалобе #{complaint_id}</b>\n\n"
+                f"{escape_html(answer_text)}"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.exception("deliver_complaint_answer #%s user=%s: %s", complaint_id, user_id, e)
+        return False, "send_failed"
     mark_complaint_answered(complaint_id, answer_text)
-    await send_user_message(
-        user_id,
-        topic_key="support",
-        text=(
-            f"📞 <b>Ответ по вашей жалобе #{complaint_id}</b>\n\n"
-            f"{escape_html(answer_text)}"
-        ),
-        parse_mode="HTML",
-    )
     return True, user_id
 
 

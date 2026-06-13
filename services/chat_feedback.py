@@ -67,6 +67,11 @@ def topic_thread_id(user_id: int, topic_key: str) -> int | None:
     return get_user_topic_thread_id(user_id, topic_key) or None
 
 
+def message_answer_injects_thread_id(message: Message | None) -> bool:
+    """aiogram Message.answer() сам задаёт message_thread_id в forum-топике — не дублировать в **kwargs."""
+    return bool(message and getattr(message, "is_topic_message", False))
+
+
 @asynccontextmanager
 async def typing_keepalive(
     bot: Bot,

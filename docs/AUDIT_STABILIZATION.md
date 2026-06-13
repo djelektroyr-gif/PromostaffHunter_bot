@@ -1,22 +1,117 @@
 # Аудит стабилизации PromostaffHunter_bot
 
-> Зафиксировано: **2026-06-07** · репозиторий `PromostaffHunter_bot`  
-> Тесты на момент аудита: **113 passed** · прод: `origin/main` @ `91fe302`
+> Обновлено: **2026-06-13** · репозиторий `PromostaffHunter_bot`  
+> Тесты: **329+ passed** · `main.py` ~8300 строк · **прод БД: PostgreSQL** (`DATABASE_URL`)
 
 Живой план исправлений. Обновлять при закрытии волн.
+
+**Источник правды по БД:** прод = **PostgreSQL** (с ~2026-06-05). SQLite — только локальный dev и pytest (в тестах явно `DATABASE_URL=""`). См. `docs/DEVELOPMENT.md` §11.
 
 ---
 
 ## Суть проблемы
 
-Бот **работает**, но архитектура («всё в `main.py` ~5800 строк + in-memory FSM + check-then-act в БД») даёт:
+Бот **работает**, но архитектура («всё в `main.py` + in-memory FSM + check-then-act в БД») даёт:
 
 - зависания парсера и «⏳ в процессе»;
 - двойные отклики и дубли при быстрых нажатиях;
 - «Нет доступа» / тишина / лишние сообщения;
-- фичи в коде, но **не видны** (typing без `message_thread_id` в forum topics лички — исправлено 2026-06-03).
+- фичи в коде, но **не видны** без прохода сценария подписчиком (trial, Free-категории, paywall);
+- баги **админки и forum topics**, которые **не ловятся** unit-тестами парсера (см. волна 4).
 
-Тесты хорошо покрывают **фильтр парсера, ленту, premium downgrade, категории**. Слабо: **отклики, модерация, channel post, race conditions, lifecycle парсера**.
+Тесты хорошо покрывают **фильтр парсера, ленту, premium downgrade, monetization**. Слабо: **хендлеры aiogram, админ-экраны, E2E подписчик, PostgreSQL-путь в CI**.
+
+---
+
+## Волна 4 — админ, forum topics, видимость (2026-06-13)
+
+Ошибки всплыли **только из прод-логов** (`notify_admin_handler_error`), не из прежнего аудита.
+
+| ID | Проблема | Где | Эффект | Статус |
+|----|----------|-----|--------|--------|
+| F1 | Дубль `message_thread_id` | `_send_feed_loading_notice` + `Message.answer()` | `SendMessage() got multiple values…`, лента «зависает» | ✅ fix |
+| F2 | `ReplyKeyboardMarkup` в `edit_text` | `send_admin_stats_screen` | «📊 Статистика» падает | ✅ fix |
+| F3 | Техрассылка / ответ поддержки | `send_user_message` без fallback топика | Тишина или 0 доставлено | ✅ fix + fallback |
+| F4 | Trial / Free / paywall | `response_monetization`, UI-тексты | Пользователь не видит проблему; админ не знает без SQL | ✅ частично (#1–#8) |
+| F5 | **Слепая зона** | нет smoke/E2E подписчика | Неизвестно, сколько багов ещё в `main.py` | 🟠 в работе |
+
+### Почему аудит волн 1–3 это не поймал
+
+1. Фокус: парсер, отклики, race, деньги — не проход по **каждой кнопке админки**.
+2. Forum topics помечены «✅» по коду, но не по **живому чату** с `FORUM_TOPICS_ENABLED=1`.
+3. pytest гоняется на **SQLite**; прод на **PostgreSQL** — расхождения типов/SQL редки, но возможны.
+4. Подписчики молчат → нет обратной связи по trial/категориям; баги видны только в БД или при целенаправленном тесте.
+
+---
+
+## Smoke-чеклист админа (после каждого деплоя, ~15 мин)
+
+Выполнять **вторым аккаунтом** или с тестового TG. `FORUM_TOPICS_ENABLED=1` как на проде.
+
+| # | Действие | Ожидание | Ловит |
+|---|----------|----------|-------|
+| A1 | 📊 Статистика | Дайджест без «🚨 Ошибка в боте» | F2, edit_text |
+| A2 | 📣 Техсообщение → текст → **✅ Отправить** | «Доставлено: N», нет 0/N без причины | F3, рассылка |
+| A3 | ❓ Поддержка (админ) → ответ на обращение | Текст у подписчика в топике «Поддержка» | deliver_support |
+| A4 | 📢 Рассылка (обычная) | ≥1 доставлено на тестового подписчика | broadcast |
+| A5 | 📋 Список откликов → карточка | Открывается, нет «Нет доступа» | R4 |
+| A6 | Алерт «🚨 Ошибка в боте» за 24 ч | 0 новых после чеклиста | регрессии |
+
+---
+
+## Smoke-чеклист подписчика (живое поведение, ~20 мин)
+
+**Второй телефон / тестовый аккаунт** — иначе вы не видите то, что видит пользователь.
+
+| # | Сценарий | Ожидание | Ловит |
+|---|----------|----------|-------|
+| S1 | `/start` → регистрация → категории → finish | Меню, темы «Вакансии/Отклики/Поддержка» | forum, FSM |
+| S2 | Free: выбрать **2+ категории** | Ограничение или paywall (см. `FREE_CATEGORY_LIMIT`) | Free |
+| S3 | 🔍 Посмотреть новые (из топика «Вакансии») | «Собираю ленту…» → карточки, без ошибки | F1 |
+| S4 | Первый отклик на вакансию | Trial Premium **или** paywall (не оба молча) | trial/paywall |
+| S5 | Второй отклик без Premium | Paywall / Stars / пакет 99₽ | monetization |
+| S6 | ❓ Поддержка → вопрос | Подтверждение + ответ админа в топике | support |
+| S7 | 💎 Подписка | Тексты совпадают с `docs/SUBSCRIPTION.md` | UX/конфиг |
+
+Записывать скрин + время. Если молчание — смотреть алерт админу и логи Bothost.
+
+---
+
+## Как оценить «сколько ещё таких ошибок»
+
+Точное число **неизвестно** без наблюдаемости. Практичный план:
+
+1. **Smoke A1–A6 + S1–S7** после каждого деплоя — закрывает класс «кнопка падает / тишина».
+2. **Счётчик алертов** `notify_admin_handler_error` — цель: 0 за неделю после волны 4.
+3. **Метрики в БД (раз в неделю, SQL):**
+   - `trial_used=1` и `responses=0` — обход paywall;
+   - подписчики с 0 категорий, но `notify=1`;
+   - `support_requests` без ответа > 48 ч;
+   - отклики `draft_status=failed`.
+4. **Тесты-хелперы** `tests/test_forum_send_safety.py` — регрессии merge `message_thread_id` и edit_text.
+5. **Рефакторинг `main.py`** (ниже) — уменьшает площадь «непросмотренного» кода.
+
+Полной гарантии без реальных пользователей нет; smoke + алерты + SQL сужают риск с «неизвестно» до «контролируемый список».
+
+---
+
+## Рефакторинг `main.py` — предложение (не откладывать бесконечно)
+
+**Почему не предлагали раньше в каждом таске:** сначала закрывали прод-пожары точечно; большой рефактор во время инцидентов повышает риск новых поломок.
+
+**Почему пора:** ~8300 строк, ~200 хендлеров — любой новый фикс может задеть соседний сценарий; аудит по файлу не масштабируется.
+
+### Порядок (инкрементально, без «переписать всё»)
+
+| Этап | Вынос | Файл | Зачем |
+|------|-------|------|-------|
+| R1 | Отправка в топики | `services/user_messaging.py` (`send_user_message`, broadcast) | F1–F3, один вход |
+| R2 | Админ-меню | `handlers/admin/` (stats, broadcast, support reply) | A1–A3, smoke |
+| R3 | Подписчик: лента + отклики | `handlers/feed.py`, `handlers/responses.py` | S3–S5 |
+| R4 | Регистрация / категории | `handlers/onboarding.py` | S1–S2 |
+| R5 | `main.py` | только `dp`, startup, импорт роутеров | <1500 строк |
+
+Каждый этап = отдельный деплой + smoke A+S. **Не смешивать** с крупными фичами.
 
 ---
 
@@ -100,7 +195,15 @@
 - [x] FSM — `UserMenuFsmEscapeMiddleware` + `user_fsm_menu_escape()` для всех `USER_MENU_BUTTONS`
 - [x] Feed — `user_feed_sessions` в БД + `_get_user_feed()` после рестарта
 - [x] FSM storage — `REDIS_URL` → RedisStorage, иначе MemoryStorage
-- [x] Тесты `test_wave3_stabilization.py` (P1, R3, premium, moderation, wave3)
+### Волна 4 — админ + forum + наблюдаемость 🟠
+
+- [x] F1–F3: `message_thread_id`, статистика, fallback техрассылки
+- [x] Monetization bugs #1–#8 (trial, paywall, cache)
+- [x] `tests/test_forum_send_safety.py`
+- [x] Smoke-чеклисты A1–A6, S1–S7 (этот документ)
+- [ ] R1: вынести `send_user_message` / broadcast в `services/user_messaging.py`
+- [ ] R2: `handlers/admin/`
+- [ ] Опционально: pytest с testcontainers PostgreSQL для 5–10 критичных SQL
 
 ---
 
@@ -111,9 +214,10 @@
 | Фильтр, dedupe, quality gate | `handle_response` E2E |
 | Feed, freshness | Moderation → push E2E |
 | Premium extend, downgrade | Channel post E2E (Telegram) |
-| Category toggle atomic | — |
-| Response card format | — |
-| P1 cursor, R3 отклики, idempotent stars/push/channel | — |
+| Category toggle atomic | Админ-кнопки (до `test_forum_send_safety`) |
+| Response card format | **PostgreSQL в CI** (все тесты SQLite) |
+| Monetization unit | Подписчик smoke S1–S7 (ручной) |
+| forum send merge (`test_forum_send_safety`) | Полный рефактор `main.py` |
 
 ---
 
@@ -125,3 +229,4 @@
 | 2026-06-07 | 1 | Parser cursor + mark scanned; UNIQUE отклики; admin card; `/start` clear FSM; parser lock/typing UX |
 | 2026-06-07 | 2 | Atomic premium/moderation; respond keyboard lock; broadcast lock; feed session expired UX |
 | 2026-06-07 | 3 | Idempotent stars/push/channel; FSM menu escape; feed persist; RedisStorage optional; wave3 tests |
+| 2026-06-13 | 4 | F1–F3 fix; smoke A/S чеклисты; monetization #1–#8; `test_forum_send_safety`; план рефакторинга R1–R5; PG = прод |
