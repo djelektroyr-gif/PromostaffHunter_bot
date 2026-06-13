@@ -5,6 +5,21 @@
 
 Формат: **1080×1080**, квадрат 1:1 для Telegram.
 
+### Живое фото в канале (опционально)
+
+При `CHANNEL_LIVE_PHOTO_ENABLED=1` к каждому PNG нужен **короткий MP4** (1–3 сек) с тем же именем:  
+`vacancy-promoter-1.png` + `vacancy-promoter-1.mp4`. См. [`BOT_API_ADOPTION.md`](BOT_API_ADOPTION.md).
+
+**Автогенерация из PNG (ffmpeg):**
+
+```bash
+python scripts/generate_live_photo_mp4.py
+python scripts/generate_live_photo_mp4.py --force
+python scripts/generate_live_photo_mp4.py vacancy-promoter-1.png
+```
+
+Нужен **ffmpeg** в PATH. По умолчанию — лёгкий зум 2.5 с, все `*.png` в `assets/channel_images/`.
+
 ---
 
 ## Базовый стиль (добавлять в каждый промпт)

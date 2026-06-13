@@ -564,12 +564,29 @@ def format_vacancy_card_html(
 
 async def send_vacancy_card(
     chat_id: int,
-    text: str,
+    text: str | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
     *,
     topic_key: str | None = "vacancies",
+    card_input: "VacancyCardInput | None" = None,
+    expanded: bool = False,
+    html_suffix: str | None = None,
 ):
-    """HTML-карточка вакансии с fallback без разметки."""
+    """Карточка вакансии: Rich Message (10.1) или HTML fallback."""
+    if card_input is not None:
+        from services.vacancy_card_send import send_vacancy_card_message
+
+        return await send_vacancy_card_message(
+            bot,
+            chat_id,
+            card_input,
+            reply_markup=reply_markup,
+            expanded=expanded,
+            topic_key=topic_key,
+            html_suffix=html_suffix,
+        )
+    if not text:
+        raise ValueError("send_vacancy_card: нужен text или card_input")
     extra: dict = {}
     if topic_key and FORUM_TOPICS_ENABLED:
         if not get_user_topic_thread_id(chat_id, topic_key):
@@ -1158,16 +1175,19 @@ async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy
     if not inp:
         await message.answer("❌ Вакансия не найдена.")
         return
-    from services.vacancy_card import build_vacancy_preview_html
-
-    text = build_vacancy_preview_html(inp)
+    html_suffix = None
     if TRIAL_ON_FIRST_RESPONSE:
-        text += (
+        html_suffix = (
             f"\n\n<i>Нажмите «Откликнуться» — короткая анкета (имя и телефон).</i>\n"
             f"<i>🎁 Первый отклик — пробный Premium {TRIAL_DAYS} дн.</i>"
         )
     keyboard = build_vacancy_keyboard(vacancy_id, collapsed=False, **map_fields)
-    await send_vacancy_card(user_id, text, reply_markup=keyboard)
+    await send_vacancy_card(
+        user_id,
+        reply_markup=keyboard,
+        card_input=inp,
+        html_suffix=html_suffix,
+    )
 
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown", chunk_size: int = 3800):
     """Разбивает длинный текст на части (лимит Telegram ~4096)."""
@@ -2586,7 +2606,7 @@ async def send_vacancy_to_subscribers(order: dict):
     published_at = format_publication_time(published_raw)
     freshness = get_freshness_label(published_raw)
     cat_name = get_category_name(category_code)
-    from services.vacancy_card import build_vacancy_preview_html, card_input_from_order
+    from services.vacancy_card import card_input_from_order
 
     card_inp = card_input_from_order(
         order,
@@ -2596,7 +2616,6 @@ async def send_vacancy_to_subscribers(order: dict):
         category_name=cat_name,
         category_emoji=get_category_emoji(category_code),
     )
-    text = build_vacancy_preview_html(card_inp)
 
     address = order.get('address') or extract_address_from_text(msg_text)
     keyboard = build_vacancy_preview_keyboard(
@@ -2688,7 +2707,12 @@ async def send_vacancy_to_subscribers(order: dict):
                 if not ok:
                     raise RuntimeError("pinned general push failed")
             else:
-                await send_vacancy_card(uid, text, reply_markup=keyboard, topic_key=None)
+                await send_vacancy_card(
+                    uid,
+                    reply_markup=keyboard,
+                    topic_key=None,
+                    card_input=card_inp,
+                )
             sent_count += 1
             from services.feed_loader import invalidate_feed_cache
             invalidate_feed_cache(uid)
@@ -4473,7 +4497,7 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
             cat_code = vac.get("category_code") or "promoter"
             emoji = get_category_emoji(cat_code)
             cat_name = get_category_name(cat_code)
-            from services.vacancy_card import build_vacancy_preview_html, card_input_from_feed_vac
+            from services.vacancy_card import card_input_from_feed_vac
 
             card_inp = card_input_from_feed_vac(
                 vac,
@@ -4482,10 +4506,13 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
                 category_name=cat_name,
                 category_emoji=emoji,
             )
-            text = build_vacancy_preview_html(card_inp)
             keyboard = build_vacancy_preview_keyboard(vac["id"], **_map_fields_from_vacancy(vac))
             try:
-                await send_vacancy_card(message.chat.id, text, reply_markup=keyboard)
+                await send_vacancy_card(
+                    message.chat.id,
+                    reply_markup=keyboard,
+                    card_input=card_inp,
+                )
                 if feed_mode != "history":
                     if try_reserve_vacancy_sent_to_user(vac["id"], user_id):
                         from services.feed_loader import invalidate_feed_cache
@@ -5132,34 +5159,21 @@ async def _edit_vacancy_card_message(
     inp, map_fields = _vacancy_card_bundle_from_id(vacancy_id)
     if not inp or not callback.message:
         return False
-    from services.vacancy_card import build_vacancy_full_html, build_vacancy_preview_html
 
     if expanded:
-        text = build_vacancy_full_html(inp)
         kb = build_vacancy_keyboard(vacancy_id, **map_fields)
     else:
-        text = build_vacancy_preview_html(inp)
         kb = build_vacancy_preview_keyboard(vacancy_id, **map_fields)
-    try:
-        await callback.message.edit_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=kb,
-            disable_web_page_preview=True,
-        )
-        return True
-    except TelegramBadRequest as e:
-        if "parse" in str(e).lower():
-            plain = re.sub(r"<[^>]*>", "", text)
-            await callback.message.edit_text(
-                plain,
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            )
-            return True
-        if "not modified" in str(e).lower():
-            return True
-        raise
+    from services.vacancy_card_send import edit_vacancy_card_message
+
+    return await edit_vacancy_card_message(
+        bot,
+        callback.message.chat.id,
+        callback.message.message_id,
+        inp,
+        kb,
+        expanded=expanded,
+    )
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_open_"))
@@ -5917,9 +5931,9 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
     ) or employer_contact
     await callback.answer("Составляю текст…")
     from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
-    from services.llm_client import ask_llm
     from services.llm_prompts import build_response_draft_prompt
     from services.forum_topics import TOPIC_RESPONSES
+    from config import LLM_MESSAGE_DRAFT_ENABLED
     resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
     cat_row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
     cat_code = cat_row[0] if cat_row else "promoter"
@@ -5928,8 +5942,23 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         category_name=get_category_name(cat_code),
         profile_summary=build_candidate_profile_text(profile),
     )
-    async with typing_keepalive(bot, callback.message.chat.id, message_thread_id=resp_thread):
-        draft = await ask_llm(prompt)
+    draft_mode = "none"
+    if LLM_MESSAGE_DRAFT_ENABLED:
+        from services.message_draft import ask_llm_with_draft
+
+        draft, draft_mode = await ask_llm_with_draft(
+            bot,
+            user_id,
+            user_id,
+            prompt,
+            seed=vacancy_id,
+            message_thread_id=resp_thread,
+        )
+    else:
+        from services.llm_client import ask_llm
+
+        async with typing_keepalive(bot, callback.message.chat.id, message_thread_id=resp_thread):
+            draft = await ask_llm(prompt)
     if not draft:
         await send_user_message(
             user_id, topic_key=TOPIC_RESPONSES,
@@ -5938,16 +5967,38 @@ async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
         return
     increment_llm_usage(user_id, usage_day)
     link = build_contact_link(employer_contact, draft) if employer_contact else None
-    lines = ["✨ *Улучшенный черновик:*", "", draft]
+    hint = ""
     if not link and employer_contact:
-        lines.append(manual_contact_hint(employer_contact, draft, vacancy_text=vacancy_text).lstrip("\n"))
+        hint = manual_contact_hint(employer_contact, draft, vacancy_text=vacancy_text).lstrip("\n")
     kb = [[_inline_btn("Открыть чат", url=link, style="success")]] if link else []
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+    if draft_mode == "rich":
+        from html import escape as escape_html
+        from services.message_draft import build_llm_enhanced_rich_html
+        from services.telegram_rich_message import send_user_rich_message_html
+
+        hint_html = f"<p>{escape_html(hint)}</p>" if hint else None
+        html = build_llm_enhanced_rich_html(draft, hint_html=hint_html)
+        try:
+            await send_user_rich_message_html(
+                bot,
+                user_id,
+                html,
+                topic_key=TOPIC_RESPONSES,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as exc:
+            logger.warning("sendRichMessage LLM enhance failed, Markdown fallback: %s", exc)
+    lines = ["✨ *Улучшенный черновик:*", "", draft]
+    if hint:
+        lines.append(hint)
     await send_user_message_safe_buttons(
         user_id,
         topic_key=TOPIC_RESPONSES,
         text="\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb) if kb else None,
+        reply_markup=reply_markup,
     )
 
 

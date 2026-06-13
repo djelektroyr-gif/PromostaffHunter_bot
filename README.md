@@ -12,6 +12,10 @@ Telegram-бот для парсинга вакансий (хелперы, гру
 
 **[docs/AUDIT_STABILIZATION.md](docs/AUDIT_STABILIZATION.md)** — живой аудит, smoke-чеклисты админа и подписчика, план рефакторинга `main.py`.
 
+**[docs/BOT_API_ADOPTION.md](docs/BOT_API_ADOPTION.md)** — обновление aiogram, флаги новых методов API.
+
+**[docs/BOT_API_RICH_MESSAGES.md](docs/BOT_API_RICH_MESSAGES.md)** — Rich Messages 10.1, карточки вакансий, бэклог.
+
 ## Быстрый старт
 
 1. Скопировать `.env` (см. `config.example.py` / переменные в DEVELOPMENT.md).

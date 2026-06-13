@@ -129,6 +129,16 @@ def _resolve_image(filename: str) -> Path | None:
     return None
 
 
+def resolve_live_video_path(photo_path: Path | None) -> Path | None:
+    """Парный MP4 к PNG: vacancy-promoter-1.png → vacancy-promoter-1.mp4."""
+    if not photo_path or not photo_path.is_file():
+        return None
+    video_path = photo_path.with_suffix(".mp4")
+    if video_path.is_file():
+        return video_path
+    return None
+
+
 def _variant_index(seed: str | None, count: int) -> int:
     if count <= 1:
         return 0
@@ -229,8 +239,36 @@ async def send_channel_post(
     reply_markup: InlineKeyboardMarkup | None = None,
     photo_path: Path | None = None,
 ) -> Message:
-    """Фото + caption или текст, если файла нет."""
+    """Фото / живое фото + caption или текст, если файла нет."""
+    from config import CHANNEL_LIVE_PHOTO_ENABLED
+    from services.telegram_api_capabilities import supports_live_photo
+
     if photo_path and photo_path.is_file():
+        video_path = (
+            resolve_live_video_path(photo_path)
+            if CHANNEL_LIVE_PHOTO_ENABLED
+            else None
+        )
+        if video_path and supports_live_photo(bot):
+            logger.debug(
+                "Channel post with live photo: %s + %s",
+                photo_path.name,
+                video_path.name,
+            )
+            try:
+                return await bot.send_live_photo(
+                    chat_id,
+                    photo=FSInputFile(photo_path),
+                    live_photo=FSInputFile(video_path),
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "send_live_photo failed (%s), fallback to send_photo",
+                    exc,
+                )
         logger.debug("Channel post with photo: %s", photo_path.name)
         return await bot.send_photo(
             chat_id,

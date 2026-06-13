@@ -15,6 +15,7 @@ from services.channel_images import (
     VACANCY_IMAGE_BY_CATEGORY,
     get_channel_images_dir,
     next_vacancy_image_variant_index,
+    resolve_live_video_path,
     resolve_promo_image_path,
     resolve_vacancy_image_path,
     send_channel_post,
@@ -142,3 +143,68 @@ def test_send_channel_post_fallback_text_when_no_file():
 
     bot.send_message.assert_awaited_once()
     bot.send_photo.assert_not_awaited()
+
+
+def test_resolve_live_video_path_pairs_png(tmp_path):
+    photo = tmp_path / "vacancy-promoter-1.png"
+    photo.write_bytes(b"\x89PNG\r\n\x1a\n")
+    assert resolve_live_video_path(photo) is None
+    video = tmp_path / "vacancy-promoter-1.mp4"
+    video.write_bytes(b"fake-mp4")
+    assert resolve_live_video_path(photo) == video
+
+
+def test_send_channel_post_live_photo(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "1")
+    import importlib
+    import config
+
+    importlib.reload(config)
+
+    photo = tmp_path / "vacancy-promoter-1.png"
+    photo.write_bytes(b"\x89PNG\r\n\x1a\n")
+    video = tmp_path / "vacancy-promoter-1.mp4"
+    video.write_bytes(b"fake-mp4")
+
+    bot = MagicMock()
+    bot.send_live_photo = AsyncMock(return_value=MagicMock(message_id=3))
+    bot.send_photo = AsyncMock()
+    bot.send_message = AsyncMock()
+
+    asyncio.run(send_channel_post(
+        bot,
+        -100123,
+        text="<b>live</b>",
+        photo_path=photo,
+    ))
+
+    bot.send_live_photo.assert_awaited_once()
+    bot.send_photo.assert_not_awaited()
+
+
+def test_send_channel_post_live_photo_fallback_on_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "1")
+    import importlib
+    import config
+
+    importlib.reload(config)
+
+    photo = tmp_path / "vacancy-promoter-1.png"
+    photo.write_bytes(b"\x89PNG\r\n\x1a\n")
+    video = tmp_path / "vacancy-promoter-1.mp4"
+    video.write_bytes(b"fake-mp4")
+
+    bot = MagicMock()
+    bot.send_live_photo = AsyncMock(side_effect=RuntimeError("api"))
+    bot.send_photo = AsyncMock(return_value=MagicMock(message_id=4))
+    bot.send_message = AsyncMock()
+
+    asyncio.run(send_channel_post(
+        bot,
+        -100123,
+        text="fallback",
+        photo_path=photo,
+    ))
+
+    bot.send_live_photo.assert_awaited_once()
+    bot.send_photo.assert_awaited_once()

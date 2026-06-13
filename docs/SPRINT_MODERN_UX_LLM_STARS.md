@@ -67,7 +67,7 @@ STARS_ENABLED=0
 | **3b** | **Канал:** кросс-пост | `channel_post.py`, `?start=vac_`, env `HUNTER_CHANNEL_ID` |
 | **4** | LLM: клиент | `services/llm_client.py` |
 | **5** | LLM: черновик отклика | Промпт + интеграция в `respond_*`, кнопка «✨ Улучшить текст», fallback на шаблон |
-| **6** | LLM: UX | `send_chat_action(typing)`, опционально `sendMessageDraft`, лимиты/ошибки |
+| **6** | LLM: UX | `send_chat_action(typing)` + **`sendMessageDraft`** (`LLM_MESSAGE_DRAFT_ENABLED`) |
 | **7** | Stars: продукт + БД | Спека «Расширенный отклик», `star_purchases`, цена в Stars |
 | **8** | Stars: invoice | `sendInvoice` / `pre_checkout_query`, связка с откликом |
 | **9** | Stars: выдача фичи | После оплаты — расширенный текст + пометка в `responses`; админ-стат |
@@ -195,7 +195,7 @@ LLM_DAILY_LIMIT_PREMIUM=20
 **День 6**
 
 - [x] Лимиты Premium/Free, запись в `llm_usage`.
-- [ ] Опционально: **`sendMessageDraft`** для поэтапного появления текста (если aiogram/API на Bothost ок).
+- [x] **`sendMessageDraft`** — `services/message_draft.py`, флаг `LLM_MESSAGE_DRAFT_ENABLED` (aiogram 3.28.2).
 - [x] Не логировать телефон/ФИО в prompt logs — только `user_id`, `vacancy_id`.
 
 ### Критерии приёмки (LLM)
@@ -292,7 +292,7 @@ LLM_DAILY_LIMIT_PREMIUM=20
 | LLM gateway недоступен | `LLM_ENABLED=0`, шаблон |
 | Stars не проходят на prod | Пилот только после test; кнопку скрыть флагом `STARS_ENABLED` |
 | Flood при создании тем 1000+ users | Создавать темы лениво при первом push, не при `/start` массово |
-| aiogram без `sendMessageDraft` | Пропустить draft, оставить typing + одно сообщение |
+| aiogram без `sendMessageDraft` | Флаг `LLM_MESSAGE_DRAFT_ENABLED=0` → typing + одно сообщение |
 
 ---
 

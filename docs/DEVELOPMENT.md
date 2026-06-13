@@ -3,7 +3,24 @@
 > Живой конспект проекта. Обновлять при каждой заметной доработке бота, парсера или продуктовых решений.  
 > Репозиторий: **PromostaffHunter_bot** (не путать с **promostaff-agency-bot** и **promostaff-bot**).
 
-Последнее обновление: **2026-06-10** (ingest roadmap, масштаб парсера)
+Последнее обновление: **2026-06-11** (Rich Messages 10.1 — карточки вакансий)
+
+### Сделано за сессию (2026-06-11, Rich Messages)
+
+| Область | Что |
+|---------|-----|
+| **Bot API 10.1** | `sendRichMessage` для карточек вакансий (таблица, details, footer) |
+| **Доки** | **[`BOT_API_RICH_MESSAGES.md`](BOT_API_RICH_MESSAGES.md)** — живой конспект 10.1 |
+| **Fallback** | `RICH_VACANCY_CARDS_ENABLED` → HTML при ошибке API |
+
+### Сделано за сессию (2026-06-11, утро)
+
+| Область | Что |
+|---------|-----|
+| **Зависимости** | aiogram **3.15 → 3.28.2** (Bot API ~10.0) |
+| **LLM UX** | `sendMessageDraft` — черновик над полем ввода при «✨ Улучшить текст» (`LLM_MESSAGE_DRAFT_ENABLED`) |
+| **Канал** | `sendLivePhoto` — PNG + парный MP4 (`CHANNEL_LIVE_PHOTO_ENABLED`, fallback на `send_photo`) |
+| **Процесс** | Dependabot weekly + **[`BOT_API_ADOPTION.md`](BOT_API_ADOPTION.md)** |
 
 ### Сделано за сессию (2026-06-10, вечер)
 

@@ -57,6 +57,32 @@ LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "").strip()
 LLM_INTERNAL_TOKEN = os.getenv("LLM_INTERNAL_TOKEN", "").strip()
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
 LLM_DAILY_LIMIT_PREMIUM = int(os.getenv("LLM_DAILY_LIMIT_PREMIUM", "20"))
+# Черновик над полем ввода (sendMessageDraft, Bot API 9.3+) — «живой» LLM
+LLM_MESSAGE_DRAFT_ENABLED = os.getenv("LLM_MESSAGE_DRAFT_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+# Rich-черновик над полем ввода (sendRichMessageDraft + tg-thinking, Bot API 10.1)
+LLM_RICH_MESSAGE_DRAFT_ENABLED = os.getenv("LLM_RICH_MESSAGE_DRAFT_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Живое фото в канале (sendLivePhoto, Bot API 10.0): PNG + парный короткий MP4
+CHANNEL_LIVE_PHOTO_ENABLED = os.getenv("CHANNEL_LIVE_PHOTO_ENABLED", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Rich Messages для карточек вакансий (sendRichMessage, Bot API 10.1)
+RICH_VACANCY_CARDS_ENABLED = os.getenv("RICH_VACANCY_CARDS_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Telegram Stars — отклик и расширенный отклик
 STARS_ENABLED = os.getenv("STARS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
