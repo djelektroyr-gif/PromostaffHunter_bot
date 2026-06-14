@@ -70,10 +70,10 @@ Hunter **не** копирует «100% сообщений в БД», но **с�
 
 - [x] **P1 (2026-06):** волна 1 категорий: `booth`, `merchandiser`, `host_mc`, `dj`, `electrician`, `misc` + группы в настройках.
 - [x] **P1 (2026-06):** специалисты не reject — маршрут в `electrician`; fallback `misc` при найме+оплате без роли.
-- [ ] **P1:** multi-score в БД (`category_scores_json` или отдельная таблица) — без смены UX подписки.
+- [x] **P1 (2026-06):** multi-score в БД (`category_scores_json`) — ingest, backfill, лента/push по secondary.
 - [ ] **P1:** ingest «мягкий режим» — `staff_job` + weak category → save as `uncertain` + primary guess.
-- [ ] **P2:** Premium keywords (+ / − фразы) в `subscriber_filter_prefs`.
-- [ ] **P2:** push/feed match по тегам, не только `category_code`.
+- [x] **P2 (2026-06):** Premium keywords (+ / − фразы) в `subscriber_filter_prefs` + UI.
+- [x] **P2 (2026-06):** push/feed match по тегам, не только `category_code`.
 - [ ] **P1:** дашборд «отсеяно vs сохранено» по категории/чату за 7 д (уже частично: покрытие каналов).
 - [ ] **Ops:** регламент после правок парсера — `/enrich_backfill 30` на проде.
 

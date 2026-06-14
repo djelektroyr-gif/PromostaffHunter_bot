@@ -625,6 +625,9 @@ async def _save_parsed_vacancy_block(
     if enrichment.address_normalized:
         address = enrichment.address_normalized
     enrich_kwargs = enrichment.to_db_kwargs()
+    from services.category_scores import compute_category_scores, scores_to_json
+
+    category_scores_json = scores_to_json(compute_category_scores(full_text or eval_text))
 
     dedupe_key = build_vacancy_dedupe_key(cleaned_text, author_contact)
 
@@ -679,6 +682,7 @@ async def _save_parsed_vacancy_block(
         None,
         "approved",
         **enrich_kwargs,
+        category_scores_json=category_scores_json,
     )
     _bump_chat_stat(stats, chat_title, "matched")
     if stats is not None:
@@ -708,6 +712,7 @@ async def _save_parsed_vacancy_block(
         "shift_time_start": enrichment.shift_time_start,
         "dedupe_key": dedupe_key,
         "published_at": message.date.strftime("%Y-%m-%d %H:%M:%S"),
+        "category_scores_json": category_scores_json,
         "poster_user_id": poster.get("user_id"),
         "poster_username": poster.get("username"),
         "contact_source": contact_source,

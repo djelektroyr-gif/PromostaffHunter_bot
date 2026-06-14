@@ -40,6 +40,7 @@ from services.push_notify import (
     parse_quiet_hours_input,
     paused_until_iso,
 )
+from services.text_keyword_prefs import format_keyword_list, parse_keyword_list
 
 BTN_PREMIUM_FILTERS = "🎯 Фильтры Premium"
 PF_PREFIX = "pf:"
@@ -60,6 +61,7 @@ class PremiumFilterState(StatesGroup):
     waiting_metro = State()
     waiting_rate_value = State()
     waiting_quiet_hours = State()
+    waiting_keywords = State()
 
 
 def _premium_required_keyboard() -> InlineKeyboardMarkup:
@@ -176,6 +178,38 @@ def _notify_summary_lines(prefs: dict) -> list[str]:
     return lines
 
 
+def _keywords_summary_lines(prefs: dict) -> list[str]:
+    keywords = prefs.get("keywords") or {}
+    include = keywords.get("include") or []
+    exclude = keywords.get("exclude") or []
+    if not include and not exclude:
+        return ["• Без фильтра по словам"]
+    lines = []
+    if include:
+        lines.append(f"• Плюс: {escape_html(format_keyword_list(include))}")
+    if exclude:
+        lines.append(f"• Минус: {escape_html(format_keyword_list(exclude))}")
+    return lines
+
+
+def build_keywords_keyboard(prefs: dict) -> InlineKeyboardMarkup:
+    keywords = prefs.get("keywords") or {}
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"➕ Плюс: {format_keyword_list(keywords.get('include') or [], limit=2)}",
+            callback_data=f"{PF_PREFIX}kw:include",
+        )],
+        [InlineKeyboardButton(
+            text=f"➖ Минус: {format_keyword_list(keywords.get('exclude') or [], limit=2)}",
+            callback_data=f"{PF_PREFIX}kw:exclude",
+        )],
+        [
+            InlineKeyboardButton(text="🗑 Сбросить", callback_data=f"{PF_PREFIX}kw:clear"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data=f"{PF_PREFIX}home"),
+        ],
+    ])
+
+
 def build_main_screen_text(prefs: dict, user_id: int) -> str:
     summary = format_prefs_summary(prefs)
     feed_line = "да" if prefs.get("apply_to_feed") else "нет (только push)"
@@ -188,6 +222,8 @@ def build_main_screen_text(prefs: dict, user_id: int) -> str:
         + "\n".join(_rates_summary_lines(prefs, user_id))
         + f"\n\n<b>📅 Смена</b>\n"
         + "\n".join(_shift_summary_lines(prefs))
+        + f"\n\n<b>🔤 Ключевые слова</b>\n"
+        + "\n".join(_keywords_summary_lines(prefs))
         + f"\n\n<b>🔔 Push</b>\n"
         + "\n".join(_notify_summary_lines(prefs))
         + f"\n\n<b>📋 Лента</b>\n"
@@ -201,6 +237,7 @@ def build_main_keyboard(prefs: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📍 География", callback_data=f"{PF_PREFIX}geo")],
         [InlineKeyboardButton(text="💰 Ставка", callback_data=f"{PF_PREFIX}rates")],
         [InlineKeyboardButton(text="📅 Смена", callback_data=f"{PF_PREFIX}shift")],
+        [InlineKeyboardButton(text="🔤 Ключевые слова", callback_data=f"{PF_PREFIX}keywords")],
         [InlineKeyboardButton(text="🔔 Push и уведомления", callback_data=f"{PF_PREFIX}notify")],
         [InlineKeyboardButton(
             text=f"{'☑' if feed_on else '☐'} Фильтры и в ленте",
@@ -570,6 +607,46 @@ async def premium_filters_callback(callback: types.CallbackQuery, state: FSMCont
         await show_premium_filters_screen(callback, user_id)
         return
 
+    if action == "keywords":
+        await callback.answer()
+        await _edit_or_send(
+            callback,
+            "🔤 <b>Ключевые слова</b>\n\n"
+            "Плюс — показывать только если фраза есть в тексте.\n"
+            "Минус — скрывать, если фраза есть.\n"
+            "Через запятую, до 20 слов.",
+            build_keywords_keyboard(_load_prefs(user_id)),
+        )
+        return
+
+    if action.startswith("kw:"):
+        sub = action.split(":", 1)[1]
+        if sub == "clear":
+            prefs = _load_prefs(user_id)
+            prefs["keywords"] = {"include": [], "exclude": []}
+            _save_prefs(user_id, prefs)
+            await callback.answer("Сброшено")
+            await _edit_or_send(
+                callback,
+                "🔤 <b>Ключевые слова</b>",
+                build_keywords_keyboard(_load_prefs(user_id)),
+            )
+            return
+        if sub in ("include", "exclude"):
+            await callback.answer()
+            await state.set_state(PremiumFilterState.waiting_keywords)
+            await state.update_data(pf_kw_kind=sub)
+            label = "плюс" if sub == "include" else "минус"
+            current = (_load_prefs(user_id).get("keywords") or {}).get(sub) or []
+            preview = format_keyword_list(current) if current else "—"
+            await callback.message.answer(
+                f"🔤 Введите <b>{label}</b>-слова через запятую.\n"
+                f"Сейчас: {escape_html(preview)}\n\n"
+                "Отправьте <code>-</code> чтобы очистить список.",
+                parse_mode="HTML",
+            )
+        return
+
     if action == "shift":
         await callback.answer()
         await _edit_or_send(
@@ -804,6 +881,34 @@ async def premium_filters_rate_input(message: types.Message, state: FSMContext) 
     _save_prefs(user_id, prefs)
     await state.clear()
     await message.answer("✅ Порог сохранён.")
+    await show_premium_filters_screen(message, user_id)
+
+
+@router.message(PremiumFilterState.waiting_keywords)
+async def premium_filters_keywords_input(message: types.Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    data = await state.get_data()
+    kind = data.get("pf_kw_kind")
+    if kind not in ("include", "exclude"):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    prefs = _load_prefs(user_id)
+    keywords = dict(prefs.get("keywords") or {"include": [], "exclude": []})
+    if text in ("-", "—", "0"):
+        keywords[kind] = []
+    else:
+        words = parse_keyword_list(text)
+        if not words:
+            await message.answer("❌ Укажите слова через запятую или <code>-</code> для сброса.", parse_mode="HTML")
+            return
+        keywords[kind] = words
+    prefs["keywords"] = keywords
+    _save_prefs(user_id, prefs)
+    await state.clear()
+    label = "Плюс" if kind == "include" else "Минус"
+    preview = format_keyword_list(keywords[kind]) if keywords[kind] else "очищено"
+    await message.answer(f"✅ {label}: {escape_html(preview)}", parse_mode="HTML")
     await show_premium_filters_screen(message, user_id)
 
 

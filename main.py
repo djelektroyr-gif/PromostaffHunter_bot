@@ -156,6 +156,9 @@ async def publish_employer_vacancy(user: types.User, category_code: str, vacancy
         category_code=category_code,
         bot_user_id=user.id,
     )
+    from services.category_scores import compute_category_scores, scores_to_json
+
+    category_scores_json = scores_to_json(compute_category_scores(body))
     save_vacancy(
         vacancy_id,
         f"employer_{user.id}",
@@ -176,6 +179,7 @@ async def publish_employer_vacancy(user: types.User, category_code: str, vacancy
         user.id,
         "pending",
         **enrich_kwargs,
+        category_scores_json=category_scores_json,
     )
     return True, vacancy_id
 
@@ -2590,7 +2594,10 @@ async def send_vacancy_to_subscribers(order: dict):
     if mod_row and mod_row[11] not in (None, "approved"):
         logger.info(f"Push skip {vacancy_id}: moderation_status={mod_row[11]}")
         return
-    subscribers = get_subscribers_by_category(category_code)
+    subscribers = get_subscribers_for_vacancy(
+        category_code,
+        order.get("category_scores_json"),
+    )
     if not subscribers:
         logger.info(f"Нет подписчиков на категорию {category_code}")
         return
@@ -2627,6 +2634,7 @@ async def send_vacancy_to_subscribers(order: dict):
     skipped_feed_only = 0
     from services.subscriber_match import build_vacancy_match_dict, vacancy_matches_subscriber
     from services.push_notify import evaluate_push_delivery
+    from services.vacancy_category_match import vacancy_matching_user_categories
     from db import add_push_digest_pending
 
     vac_match = build_vacancy_match_dict(
@@ -2646,6 +2654,7 @@ async def send_vacancy_to_subscribers(order: dict):
         ),
         location_lat=order.get("location_lat") or (mod_row[14] if mod_row else None),
         location_lon=order.get("location_lon") or (mod_row[15] if mod_row else None),
+        category_scores_json=order.get("category_scores_json"),
     )
     for subscriber in subscribers:
         if not is_user_premium(subscriber['user_id']):
@@ -2662,8 +2671,11 @@ async def send_vacancy_to_subscribers(order: dict):
         if not ok:
             skipped_filter += 1
             continue
+        user_cat_codes = [c["code"] for c in get_user_categories(subscriber["user_id"])]
+        matched_cats = vacancy_matching_user_categories(vac_match, user_cat_codes)
+        push_cat = matched_cats[0] if matched_cats else category_code
         can_push, push_reason, queue_digest = evaluate_push_delivery(
-            prefs or {}, category_code,
+            prefs or {}, push_cat,
         )
         if not can_push:
             if push_reason == "quiet":
@@ -5489,7 +5501,8 @@ async def enrich_backfill_cmd(message: types.Message):
     if isinstance(result, dict):
         await message.answer(
             f"✅ Backfill: enrichment {result.get('enrichment', 0)}, "
-            f"перекатегоризировано {result.get('recategorized', 0)}."
+            f"перекатегоризировано {result.get('recategorized', 0)}, "
+            f"скоры {result.get('scores', 0)}."
         )
     else:
         await message.answer(f"✅ Enrichment backfill: обновлено {result} вакансий.")

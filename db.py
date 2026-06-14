@@ -380,6 +380,7 @@ def init_db():
             ("location_lat", "ALTER TABLE vacancies ADD COLUMN location_lat REAL DEFAULT NULL"),
             ("location_lon", "ALTER TABLE vacancies ADD COLUMN location_lon REAL DEFAULT NULL"),
             ("enrichment_version", "ALTER TABLE vacancies ADD COLUMN enrichment_version INTEGER DEFAULT NULL"),
+            ("category_scores_json", "ALTER TABLE vacancies ADD COLUMN category_scores_json TEXT DEFAULT NULL"),
         ):
             add_column_if_missing("vacancies", col, ddl, cur=cur)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_vacancies_dedupe_key ON vacancies(dedupe_key)")
@@ -1768,6 +1769,36 @@ def get_subscribers_by_category(category_code: str) -> list:
     ]
 
 
+def get_subscribers_for_vacancy(
+    category_code: str | None,
+    category_scores_json=None,
+) -> list[dict]:
+    """Подписчики по primary и secondary category scores (без дублей user_id)."""
+    from services.vacancy_category_match import vacancy_category_codes
+
+    vacancy = {
+        "category_code": category_code,
+        "category_scores_json": category_scores_json,
+    }
+    codes = vacancy_category_codes(vacancy)
+    if not codes:
+        return []
+    placeholders = ",".join("?" * len(codes))
+    rows = fetchall(
+        f"""
+        SELECT DISTINCT s.user_id, s.full_name, s.phone, s.username, s.metro_zones
+        FROM subscribers s
+        JOIN user_categories uc ON s.user_id = uc.user_id
+        WHERE uc.category_code IN ({placeholders}) AND s.is_active = {bool_true()}
+        """,
+        tuple(codes),
+    )
+    return [
+        {"user_id": r[0], "full_name": r[1], "phone": r[2], "username": r[3], "metro_zones": r[4]}
+        for r in rows
+    ]
+
+
 # ========== ВАКАНСИИ ==========
 def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  category_code: str, message_text: str, message_link: str,
@@ -1781,7 +1812,8 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
                  rate_hourly: int = None, rate_shift: int = None, min_hours: int = None,
                  rate_effective_hourly: int = None, shift_date: str = None,
                  shift_time_start: str = None, location_lat: float = None,
-                 location_lon: float = None, enrichment_version: int = None):
+                 location_lon: float = None, enrichment_version: int = None,
+                 category_scores_json: str = None):
     # PostgreSQL: в ON CONFLICT нужен префикс vacancies. — иначе ambiguous column
     v = "vacancies." if IS_POSTGRES else ""
     mod = moderation_status or "approved"
@@ -1793,8 +1825,8 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
          employer_id, posted_by_bot_user_id, moderation_status,
          address_normalized, geo_tags, rate_hourly, rate_shift, min_hours,
          rate_effective_hourly, shift_date, shift_time_start, location_lat, location_lon,
-         enrichment_version)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         enrichment_version, category_scores_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             source_chat_title = excluded.source_chat_title,
             category_code = excluded.category_code,
@@ -1821,7 +1853,8 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
             shift_time_start = COALESCE(excluded.shift_time_start, {v}shift_time_start),
             location_lat = COALESCE(excluded.location_lat, {v}location_lat),
             location_lon = COALESCE(excluded.location_lon, {v}location_lon),
-            enrichment_version = COALESCE(excluded.enrichment_version, {v}enrichment_version)
+            enrichment_version = COALESCE(excluded.enrichment_version, {v}enrichment_version),
+            category_scores_json = COALESCE(excluded.category_scores_json, {v}category_scores_json)
     """, (
         vacancy_id, source_chat, source_chat_title, category_code, message_text, message_link,
         author_contact, address, is_closed, dedupe_key, published_at,
@@ -1829,7 +1862,7 @@ def save_vacancy(vacancy_id: str, source_chat: str, source_chat_title: str,
         employer_id, posted_by_bot_user_id, mod,
         address_normalized, geo_tags, rate_hourly, rate_shift, min_hours,
         rate_effective_hourly, shift_date, shift_time_start, location_lat, location_lon,
-        enrichment_version,
+        enrichment_version, category_scores_json,
     ))
 
 
@@ -1839,7 +1872,7 @@ def update_vacancy_enrichment(vacancy_id: str, enrichment_kwargs: dict) -> None:
     allowed = (
         "address_normalized", "geo_tags", "rate_hourly", "rate_shift", "min_hours",
         "rate_effective_hourly", "shift_date", "shift_time_start",
-        "location_lat", "location_lon", "enrichment_version",
+        "location_lat", "location_lon", "enrichment_version", "category_scores_json",
     )
     parts = []
     values = []
@@ -1855,11 +1888,12 @@ def update_vacancy_enrichment(vacancy_id: str, enrichment_kwargs: dict) -> None:
 
 def backfill_vacancy_enrichment(days: int = 3) -> dict[str, int]:
     from parser import detect_category
+    from services.category_scores import compute_category_scores, scores_to_json
     from services.vacancy_enrichment import ENRICHMENT_VERSION, enrich_vacancy_text, is_plausible_map_address
 
     rows = fetchall(
         f"""
-        SELECT id, message_text, address, category_code, enrichment_version
+        SELECT id, message_text, address, category_code, enrichment_version, category_scores_json
         FROM vacancies
         WHERE is_closed = {bool_false()}
           AND found_at >= {now_minus_days(days)}
@@ -1868,9 +1902,10 @@ def backfill_vacancy_enrichment(days: int = 3) -> dict[str, int]:
     )
     enrichment_updated = 0
     recategorized = 0
+    scores_updated = 0
     for row in rows:
-        vid, message_text, address, category_code, enrichment_version = (
-            row[0], row[1] or "", row[2], row[3], row[4]
+        vid, message_text, address, category_code, enrichment_version, scores_json = (
+            row[0], row[1] or "", row[2], row[3], row[4], row[5]
         )
         new_cat = detect_category(message_text)
         if new_cat and new_cat != category_code:
@@ -1879,6 +1914,14 @@ def backfill_vacancy_enrichment(days: int = 3) -> dict[str, int]:
                 (new_cat, vid),
             )
             recategorized += 1
+            category_code = new_cat
+        new_scores = scores_to_json(compute_category_scores(message_text))
+        if new_scores and new_scores != scores_json:
+            execute(
+                "UPDATE vacancies SET category_scores_json = ? WHERE id = ?",
+                (new_scores, vid),
+            )
+            scores_updated += 1
         if enrichment_version is not None and enrichment_version >= ENRICHMENT_VERSION:
             continue
         enrichment = enrich_vacancy_text(message_text, legacy_address=address)
@@ -1892,7 +1935,11 @@ def backfill_vacancy_enrichment(days: int = 3) -> dict[str, int]:
             kwargs["address"] = enrichment.address_normalized
         update_vacancy_enrichment(vid, kwargs)
         enrichment_updated += 1
-    return {"enrichment": enrichment_updated, "recategorized": recategorized}
+    return {
+        "enrichment": enrichment_updated,
+        "recategorized": recategorized,
+        "scores": scores_updated,
+    }
 
 
 _VACANCY_VISIBLE_SQL = "(moderation_status IS NULL OR moderation_status = 'approved')"
@@ -2530,9 +2577,34 @@ def _map_feed_vacancy_rows(rows) -> list[dict]:
             "category_code": r[11], "geo_tags": r[12],
             "rate_hourly": r[13], "rate_shift": r[14], "rate_effective_hourly": r[15],
             "shift_date": r[16], "shift_time_start": r[17],
+            "category_scores_json": r[18] if len(r) > 18 else None,
         }
         for r in rows
     ]
+
+
+def _feed_category_match_sql(category_codes: list[str], *, min_score: int = 6) -> str:
+    """SQL-фрагмент: primary category_code или secondary score в JSON."""
+    if not category_codes:
+        return "0"
+    placeholders = ",".join("?" * len(category_codes))
+    primary = f"v.category_code IN ({placeholders})"
+    if IS_POSTGRES:
+        secondary = f"""
+            EXISTS (
+                SELECT 1 FROM json_each_text(v.category_scores_json::json) AS t(key, value)
+                WHERE t.key IN ({placeholders})
+                  AND t.value::int >= {int(min_score)}
+            )
+        """
+    else:
+        secondary = f"""
+            EXISTS (
+                SELECT 1 FROM json_each(v.category_scores_json) je
+                WHERE je.key IN ({placeholders}) AND CAST(je.value AS INTEGER) >= {int(min_score)}
+            )
+        """
+    return f"(({primary}) OR (v.category_scores_json IS NOT NULL AND {secondary}))"
 
 
 def get_feed_vacancies_for_user(
@@ -2542,18 +2614,21 @@ def get_feed_vacancies_for_user(
     max_hours: int | None = None,
 ) -> list:
     """Открытые вакансии категории, которые пользователь ещё не получал (push/лента)."""
+    from services.vacancy_category_match import SECONDARY_CATEGORY_MIN_SCORE
+
     age_sql = ""
     if max_hours is not None:
         age_sql = f" AND ({vacancy_sort_published_sql()}) >= {_feed_since_sql(max_hours)}"
+    match_sql = _feed_category_match_sql([category_code], min_score=SECONDARY_CATEGORY_MIN_SCORE)
     rows = fetchall(
         f"""
         SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
                v.author_contact, v.address, v.found_at, v.published_at,
                v.address_normalized, v.location_lat, v.location_lon,
                v.category_code, v.geo_tags, v.rate_hourly, v.rate_shift, v.rate_effective_hourly,
-               v.shift_date, v.shift_time_start
+               v.shift_date, v.shift_time_start, v.category_scores_json
         FROM vacancies v
-        WHERE v.category_code = ? AND v.is_closed = {bool_false()}
+        WHERE {match_sql} AND v.is_closed = {bool_false()}
           AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
           AND NOT EXISTS (
             SELECT 1 FROM sent_vacancies sv
@@ -2562,7 +2637,7 @@ def get_feed_vacancies_for_user(
           {age_sql}
         ORDER BY v.found_at DESC
         """,
-        (category_code, user_id),
+        (category_code, category_code, user_id),
     )
     return _map_feed_vacancy_rows(rows)
 
@@ -2576,17 +2651,21 @@ def get_feed_vacancies_bulk_for_user(
     """Все непросмотренные вакансии пользователя по списку категорий — один запрос."""
     if not category_codes:
         return []
+    from services.vacancy_category_match import SECONDARY_CATEGORY_MIN_SCORE
+
     placeholders = ",".join("?" * len(category_codes))
     age_sql = f" AND ({vacancy_sort_published_sql()}) >= {_feed_since_sql(max_hours)}"
+    match_sql = _feed_category_match_sql(category_codes, min_score=SECONDARY_CATEGORY_MIN_SCORE)
+    params = (*category_codes, *category_codes, user_id)
     rows = fetchall(
         f"""
         SELECT v.id, v.source_chat_title, v.message_text, v.message_link,
                v.author_contact, v.address, v.found_at, v.published_at,
                v.address_normalized, v.location_lat, v.location_lon,
                v.category_code, v.geo_tags, v.rate_hourly, v.rate_shift, v.rate_effective_hourly,
-               v.shift_date, v.shift_time_start
+               v.shift_date, v.shift_time_start, v.category_scores_json
         FROM vacancies v
-        WHERE v.category_code IN ({placeholders}) AND v.is_closed = {bool_false()}
+        WHERE {match_sql} AND v.is_closed = {bool_false()}
           AND (v.moderation_status IS NULL OR v.moderation_status = 'approved')
           AND NOT EXISTS (
             SELECT 1 FROM sent_vacancies sv
@@ -2595,7 +2674,7 @@ def get_feed_vacancies_bulk_for_user(
           {age_sql}
         ORDER BY v.found_at DESC
         """,
-        (*category_codes, user_id),
+        params,
     )
     return _map_feed_vacancy_rows(rows)
 

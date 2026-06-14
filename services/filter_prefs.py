@@ -37,6 +37,10 @@ def default_prefs() -> dict:
             "category_push": {},
             "digest_after_pause": True,
         },
+        "keywords": {
+            "include": [],
+            "exclude": [],
+        },
     }
 
 
@@ -137,6 +141,24 @@ def normalize_prefs(raw: dict | None) -> dict:
                 k: v for k, v in cp.items()
                 if v in ("priority", "normal", "feed_only")
             }
+    kw = raw.get("keywords")
+    if isinstance(kw, dict):
+        from services.text_keyword_prefs import parse_keyword_list
+
+        inc = kw.get("include")
+        exc = kw.get("exclude")
+        if isinstance(inc, str):
+            prefs["keywords"]["include"] = parse_keyword_list(inc)
+        elif isinstance(inc, list):
+            prefs["keywords"]["include"] = [
+                str(w).strip().lower() for w in inc if w and str(w).strip()
+            ][:20]
+        if isinstance(exc, str):
+            prefs["keywords"]["exclude"] = parse_keyword_list(exc)
+        elif isinstance(exc, list):
+            prefs["keywords"]["exclude"] = [
+                str(w).strip().lower() for w in exc if w and str(w).strip()
+            ][:20]
     return prefs
 
 
@@ -176,6 +198,11 @@ def has_active_shift_filter(prefs: dict) -> bool:
         or shift.get("only_today_tomorrow")
         or shift.get("earliest_start")
     )
+
+
+def has_active_keyword_filter(prefs: dict) -> bool:
+    keywords = prefs.get("keywords") or {}
+    return bool(keywords.get("include") or keywords.get("exclude"))
 
 
 def has_active_rate_filter(prefs: dict) -> bool:
@@ -227,6 +254,18 @@ def format_prefs_summary(prefs: dict) -> str:
         shift_bits.append(f"с {shift['earliest_start']}")
     if shift_bits:
         parts.append(", ".join(shift_bits))
+    keywords = prefs.get("keywords") or {}
+    kw_bits = []
+    if keywords.get("include"):
+        from services.text_keyword_prefs import format_keyword_list
+
+        kw_bits.append("+" + format_keyword_list(keywords["include"], limit=3))
+    if keywords.get("exclude"):
+        from services.text_keyword_prefs import format_keyword_list
+
+        kw_bits.append("−" + format_keyword_list(keywords["exclude"], limit=3))
+    if kw_bits:
+        parts.append("слова: " + ", ".join(kw_bits))
     if prefs.get("apply_to_feed"):
         parts.append("фильтры в ленте")
     notify = prefs.get("notify") or {}

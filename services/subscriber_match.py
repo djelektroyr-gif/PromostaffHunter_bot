@@ -17,6 +17,7 @@ from services.shift_match import (
     shift_date_matches_today_tomorrow,
     time_start_before,
 )
+from services.text_keyword_prefs import vacancy_matches_keyword_prefs
 
 
 def _parse_geo_tags(vacancy: dict) -> set[str]:
@@ -175,6 +176,8 @@ def vacancy_matches_subscriber(
         return False, "rate"
     if not _matches_shift(vacancy, prefs):
         return False, "shift"
+    if not vacancy_matches_keyword_prefs(vacancy.get("message_text") or "", prefs):
+        return False, "keywords"
     return True, None
 
 
@@ -192,6 +195,7 @@ def build_vacancy_match_dict(
     shift_time_start: str | None = None,
     location_lat: float | None = None,
     location_lon: float | None = None,
+    category_scores_json=None,
 ) -> dict:
     return {
         "message_text": message_text or "",
@@ -206,4 +210,5 @@ def build_vacancy_match_dict(
         "shift_time_start": shift_time_start,
         "location_lat": location_lat,
         "location_lon": location_lon,
+        "category_scores_json": category_scores_json,
     }
