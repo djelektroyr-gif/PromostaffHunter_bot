@@ -426,7 +426,7 @@ def build_vacancy_preview_keyboard(
     location_lon: float | None = None,
 ) -> InlineKeyboardMarkup:
     """Компактная карточка — открыть подробности или карту."""
-    buttons = [[_inline_btn("📋 Открыть вакансию", callback_data=f"vac_open_{vacancy_id}", style="primary")]]
+    buttons = [[_inline_btn("📋 Открыть вакансию", callback_data=f"vac_open_{vacancy_id}", style="success")]]
     maps_url = build_maps_url(
         address,
         address_normalized=address_normalized,
@@ -434,7 +434,7 @@ def build_vacancy_preview_keyboard(
         location_lon=location_lon,
     )
     if maps_url:
-        buttons.append([_inline_btn("🗺 На карте", url=maps_url)])
+        buttons.append([_inline_btn("🗺 На карте", url=maps_url, style="primary")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -6857,10 +6857,10 @@ async def list_chats_cmd(message: types.Message):
         chats, parser_status = await inspect_parser_chats()
         report = format_parser_chats_report(chats, parser_status)
         if len(report) > 4000:
-            await status_msg.edit_text(report[:4000], parse_mode="Markdown")
-            await message.answer(report[4000:], parse_mode="Markdown")
+            await status_msg.edit_text(report[:4000], parse_mode="HTML")
+            await message.answer(report[4000:], parse_mode="HTML")
         else:
-            await status_msg.edit_text(report, parse_mode="Markdown")
+            await status_msg.edit_text(report, parse_mode="HTML")
     except Exception as e:
         logger.exception("list_chats_cmd")
         await status_msg.edit_text(f"❌ Ошибка проверки чатов: {str(e)[:120]}")

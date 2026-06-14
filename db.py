@@ -2923,7 +2923,7 @@ def delete_vacancy_completely(vacancy_id: str) -> dict | None:
 
 
 def mark_vacancy_closed(message_id: str, chat_id: str):
-    """Помечает вакансию закрытой и возвращает (canonical_id, user_ids для уведомления)."""
+    """Помечает вакансию закрытой (и кластер cross-channel) → (canonical_id, user_ids)."""
     legacy_id = f"{chat_id}_{message_id}"
     with db_conn() as conn:
         cur = conn.cursor()
@@ -2940,16 +2940,49 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
         if not row:
             return None, []
         vacancy_id = row[0]
-        cur.execute(q("SELECT user_id FROM sent_vacancies WHERE vacancy_id = ?"), (vacancy_id,))
-        users = [r[0] for r in cur.fetchall()]
-        cur.execute(q("SELECT user_id FROM responses WHERE vacancy_id = ?"), (vacancy_id,))
-        for r in cur.fetchall():
-            if r[0] not in users:
-                users.append(r[0])
         cur.execute(
-            q(f"UPDATE vacancies SET is_closed = {bool_true()} WHERE id = ? OR id = ?"),
-            (vacancy_id, legacy_id),
+            q("SELECT message_text, category_code, author_contact FROM vacancies WHERE id = ?"),
+            (vacancy_id,),
         )
+        vac_row = cur.fetchone()
+        cluster_ids = [vacancy_id]
+        if vac_row and vac_row[0]:
+            try:
+                from parser import find_cluster_vacancy_ids
+
+                extra = find_cluster_vacancy_ids(
+                    vac_row[0],
+                    vac_row[2],
+                    vac_row[1],
+                    exclude_id=vacancy_id,
+                    max_age_days=3,
+                )
+                cluster_ids.extend(extra)
+            except Exception:
+                pass
+        users: list[int] = []
+        seen_users: set[int] = set()
+        for vid in cluster_ids:
+            cur.execute(q("SELECT user_id FROM sent_vacancies WHERE vacancy_id = ?"), (vid,))
+            for r in cur.fetchall():
+                if r[0] not in seen_users:
+                    seen_users.add(r[0])
+                    users.append(r[0])
+            cur.execute(q("SELECT user_id FROM responses WHERE vacancy_id = ?"), (vid,))
+            for r in cur.fetchall():
+                if r[0] not in seen_users:
+                    seen_users.add(r[0])
+                    users.append(r[0])
+        for vid in cluster_ids:
+            cur.execute(
+                q(f"UPDATE vacancies SET is_closed = {bool_true()} WHERE id = ?"),
+                (vid,),
+            )
+        if legacy_id not in cluster_ids:
+            cur.execute(
+                q(f"UPDATE vacancies SET is_closed = {bool_true()} WHERE id = ?"),
+                (legacy_id,),
+            )
     return vacancy_id, users
 
 

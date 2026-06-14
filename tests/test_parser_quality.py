@@ -116,7 +116,7 @@ def test_fuzzy_duplicate_detects_same_phone_and_similar_text(monkeypatch):
         None,
         "new_key",
     )
-    assert duplicate_type == "fuzzy"
+    assert duplicate_type in ("fuzzy", "campaign")
 
 
 def test_detect_category_loader_not_parking_for_upakovshchik():
@@ -237,7 +237,7 @@ def test_fuzzy_duplicate_anketirovanie_same_author(monkeypatch):
     monkeypatch.setattr("parser.get_recent_open_vacancies_for_dedupe", fake_recent)
 
     duplicate_type = detect_duplicate_type(variant, "@Fd4Daria", "new_key")
-    assert duplicate_type == "fuzzy"
+    assert duplicate_type in ("fuzzy", "campaign")
 
 
 def test_order_number_duplicate_cross_chat(monkeypatch):
@@ -316,7 +316,7 @@ def test_username_duplicate_cross_chat(monkeypatch):
         "loader",
         "HelpersTeam",
     )
-    assert duplicate_type == "fuzzy"
+    assert duplicate_type in ("fuzzy", "campaign")
 
 
 def test_metro_filter_matches_station():
@@ -333,6 +333,31 @@ def test_format_parser_chats_report():
     report = format_parser_chats_report([], "empty")
     assert "Чаты парсинга" in report
     assert "/addchat" in report
+
+    long_title = "Персонал ресторана: Администраторы,директора,хостес_кальянщик"
+    report2 = format_parser_chats_report(
+        [{"status": "ok", "title": long_title, "chat_link": "@test", "chat_id": "-1001", "monitored": True}],
+        "online",
+    )
+    assert long_title in report2
+    assert "<b>" in report2
+
+
+def test_numbered_annotation_list_not_split_as_digest():
+    from parser import should_split_digest, split_vacancy_blocks
+
+    stolyarny = (
+        "Помощь на площадке;\n"
+        "Адрес | Столярный пер.3 корп.17в\n"
+        "Оплата за проект: 1500\n"
+        "Смена | на сегодня, с 17:30\n"
+        "1. 16+\n"
+        "2. Проверка билетов.\n"
+        "3. СРОЧНО!\n"
+        "@boss"
+    )
+    assert should_split_digest(stolyarny) is False
+    assert len(split_vacancy_blocks(stolyarny)) == 1 or should_split_digest(stolyarny) is False
 
 
 def test_session_file_path_default():

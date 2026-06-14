@@ -1,0 +1,89 @@
+"""Тесты кластерного дедупа вакансий."""
+
+from __future__ import annotations
+
+from services.vacancy_dedupe import (
+    extract_headline_fingerprint,
+    headline_similarity,
+)
+
+
+def test_headline_fingerprint_hostess():
+    t1 = "‼️ **МОСКВА. ХОСТЕС-ПРОМО НА СТЕНД (3 ИЮЛЯ) ‼️**"
+    t2 = "‼️ **МОСКВА. ХОСТЕС-ПРОМО НА СТЕНД (3 ИЮЛЯ) ‼️**"
+    fp1 = extract_headline_fingerprint(t1)
+    fp2 = extract_headline_fingerprint(t2)
+    assert fp1 and fp2
+    assert headline_similarity(fp1, fp2) >= 0.99
+
+
+def test_cross_channel_headline_duplicate(monkeypatch):
+    import parser as p
+
+    hostess_a = (
+        "‼️ **МОСКВА. ХОСТЕС-ПРОМО НА СТЕНД (3 ИЮЛЯ) ‼️**\n"
+        "📍 Москва\n"
+        "💰 900 ₽/ч\n"
+        "👩‍💼 ХОСТЕС-ПРОМО (4 девушки)"
+    )
+    hostess_b = (
+        "‼️ **МОСКВА. ХОСТЕС-ПРОМО НА СТЕНД (3 ИЮЛЯ) ‼️**\n"
+        "📍 уточняется\n"
+        "💰 900 ₽/ч\n"
+        "🗓 Дата: 3 июля 2026 (пятница)"
+    )
+
+    def fake_exact(*_a, **_k):
+        return False
+
+    def fake_recent(*_a, **_k):
+        return [{
+            "id": "v_host_a",
+            "message_text": hostess_a,
+            "author_contact": None,
+            "dedupe_key": "k1",
+            "source_chat_title": "Channel A",
+            "category_code": "promoter",
+        }]
+
+    monkeypatch.setattr(p, "has_recent_duplicate_vacancy", fake_exact)
+    monkeypatch.setattr(p, "get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    dup = p.detect_duplicate_type(hostess_b, None, "k2", "promoter", "Channel B")
+    assert dup in ("headline", "campaign", "fuzzy")
+
+
+def test_find_cluster_vacancy_ids_cross_channel(monkeypatch):
+    import parser as p
+
+    loader_a = (
+        "Завтра 14.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38, к. 1\n"
+        "офисный переезд\n"
+        "450/4/1800\n"
+        "👉 Евгений"
+    )
+    loader_b = (
+        "Завтра 14.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38, к. 1\n"
+        "офисный переезд: помощь в упаковке\n"
+        "450/4/1800, доп час 450\n"
+        "@evgeniy_boss"
+    )
+
+    def fake_recent(*_a, **_k):
+        return [{
+            "id": "v_loader_a",
+            "message_text": loader_a,
+            "author_contact": "@Evgeniy",
+            "dedupe_key": "x",
+            "source_chat_title": "Channel A",
+            "category_code": "loader",
+        }]
+
+    monkeypatch.setattr(p, "get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    cluster = p.find_cluster_vacancy_ids(loader_b, "@evgeniy_boss", "loader")
+    assert "v_loader_a" in cluster

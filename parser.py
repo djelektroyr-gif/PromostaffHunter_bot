@@ -2,6 +2,7 @@ import re
 import os
 import logging
 import hashlib
+from html import escape as escape_html
 from difflib import SequenceMatcher
 from telethon import TelegramClient, events
 from telethon import errors
@@ -35,6 +36,7 @@ PARSER_HEALTH_INTERVAL_SEC = 600
 PARSER_RECONNECT_DELAY_SEC = 30
 PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
+PARSER_INCREMENTAL_LOOKBACK = max(0, int(os.getenv("PARSER_INCREMENTAL_LOOKBACK", "30")))
 AUDIT_SCAN_LIMIT = 20
 REJECT_SAMPLES_MAX = 12
 PARSER_SCAN_TIMEOUT_SEC = 1200
@@ -521,7 +523,7 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
                 if scanned
                 else "прогон: новых постов не было"
             )
-            lines.append(f"• *{title}* — БД **{db_n}**, {scan_part}")
+            lines.append(f"• <b>{escape_html(title)}</b> — БД <b>{db_n}</b>, {escape_html(scan_part)}")
         lines.append("")
 
     silent_db = [r for r in rows if r[0] == 0 and r[3] == 0]
@@ -773,7 +775,13 @@ async def _process_single_message(
         if stats is not None:
             stats["digest_posts"] = stats.get("digest_posts", 0) + 1
         orders = []
+        digest_cluster_keys: set[str] = set()
         for idx, block in enumerate(blocks):
+            cluster_key = _preview_digest_cluster_key(block, message, poster, idx)
+            if cluster_key and cluster_key in digest_cluster_keys:
+                if stats is not None:
+                    stats["duplicates_fuzzy"] = stats.get("duplicates_fuzzy", 0) + 1
+                continue
             order = await _save_parsed_vacancy_block(
                 block_text=block,
                 message=message,
@@ -786,6 +794,8 @@ async def _process_single_message(
                 stats=stats,
             )
             if order:
+                if cluster_key:
+                    digest_cluster_keys.add(cluster_key)
                 orders.append(order)
         await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         if stats is not None:
@@ -888,7 +898,8 @@ async def _scan_all_chats(
         if incremental and not audit_only:
             last_id = await run_db(get_last_processed_id, chat_id)
             if last_id:
-                iter_kwargs["min_id"] = last_id
+                lookback = PARSER_INCREMENTAL_LOOKBACK
+                iter_kwargs["min_id"] = max(0, last_id - lookback) if lookback else last_id
 
         if stats is not None:
             run_kind = stats.get("run_kind") or "scan"
@@ -1376,6 +1387,16 @@ def get_last_debug_report() -> str:
         f"Локальных ошибок: {s.get('errors', 0)}",
     ]
 
+    scanned = s.get("messages_scanned", 0)
+    run_kind = s.get("run_kind") or ""
+    if scanned == 0 and run_kind in ("periodic", "manual", "startup", "check_now"):
+        lines.append(
+            "\nℹ️ *Нули в incremental — нормально:* парсер смотрит только посты "
+            "после курсора `last_processed` (с lookback "
+            f"{PARSER_INCREMENTAL_LOOKBACK} сообщ.). Если новых не было — 0. "
+            "Вакансии могли прийти через realtime — в логах `⚡ новое сообщение`."
+        )
+
     if not s.get("finished_at"):
         try:
             started = datetime.strptime(s["started_at"], "%Y-%m-%d %H:%M:%S")
@@ -1632,26 +1653,41 @@ def _extract_phone_digits(text: str) -> str:
     return digits if len(digits) == 11 else None
 
 def _extract_campaign_fingerprint(text: str) -> str | None:
-    """Заголовок кампании (промо-проект) для дедупа коротких дублей из одного канала."""
-    if not text:
-        return None
-    for line in text.splitlines()[:6]:
-        stripped = line.strip().strip("*_").strip()
-        if len(stripped) < 18:
-            continue
-        tl = stripped.lower()
-        if not any(
-            w in tl for w in (
-                "раздача листовок", "промоутер", "супервайзер", "требуются",
-                "большой проект", "длительный проект",
-            )
-        ):
-            continue
-        norm = re.sub(r"[^\w\sа-яё\-]", " ", tl, flags=re.I)
-        norm = re.sub(r"\s+", " ", norm).strip()
-        if len(norm) >= 18:
-            return norm[:140]
-    return None
+    from services.vacancy_dedupe import extract_campaign_fingerprint
+
+    return extract_campaign_fingerprint(text)
+
+
+def _extract_headline_fingerprint(text: str) -> str | None:
+    from services.vacancy_dedupe import extract_headline_fingerprint
+
+    return extract_headline_fingerprint(text)
+
+
+def find_cluster_vacancy_ids(
+    text: str,
+    author_contact: str | None,
+    category_code: str | None,
+    *,
+    exclude_id: str | None = None,
+    max_age_days: int = 3,
+) -> list[str]:
+    """Открытые вакансии того же кластера (cross-channel headline/campaign/fuzzy)."""
+    from services.vacancy_dedupe import find_cluster_vacancy_ids as _find_ids
+
+    recent = get_recent_open_vacancies_for_dedupe(max_age_days=max_age_days, limit=400)
+    return _find_ids(
+        text,
+        author_contact,
+        category_code,
+        recent,
+        exclude_id=exclude_id,
+        normalize_for_dedupe=_normalize_for_dedupe,
+        normalize_for_fuzzy_dedupe=_normalize_for_fuzzy_dedupe,
+        extract_order_numbers=_extract_order_numbers,
+        extract_phone_digits=_extract_phone_digits,
+        extract_telegram_usernames=_extract_telegram_usernames,
+    )
 
 
 def detect_duplicate_type(
@@ -1667,52 +1703,35 @@ def detect_duplicate_type(
     fuzzy_text = _normalize_for_fuzzy_dedupe(text)
     if not normalized_text:
         return None
+    from services.vacancy_dedupe import cluster_duplicate_reason, extract_campaign_fingerprint
+
     order_numbers = _extract_order_numbers(text)
     phone_digits = _extract_phone_digits(text)
     usernames = _extract_telegram_usernames(text, author_contact)
-    normalized_contact = (author_contact or "").strip().lower()
-    campaign_fp = _extract_campaign_fingerprint(text)
+    campaign_fp = extract_campaign_fingerprint(text)
+    headline_fp = _extract_headline_fingerprint(text)
     recent = get_recent_open_vacancies_for_dedupe(max_age_days=1, limit=250)
-    if campaign_fp and source_chat_title:
-        src = source_chat_title.strip()
-        for row in recent:
-            if category_code and row.get("category_code") and category_code != row.get("category_code"):
-                continue
-            if (row.get("source_chat_title") or "").strip() != src:
-                continue
-            cand_fp = _extract_campaign_fingerprint(row.get("message_text", ""))
-            if cand_fp and SequenceMatcher(None, campaign_fp, cand_fp).ratio() >= 0.55:
-                return "campaign"
     for row in recent:
-        candidate_text = _normalize_for_dedupe(row.get("message_text", ""))
-        if not candidate_text:
-            continue
-        if order_numbers and order_numbers & _extract_order_numbers(row.get("message_text", "")):
-            return "order_number"
-        if category_code and row.get("category_code") and category_code != row.get("category_code"):
-            continue
-        candidate_usernames = _extract_telegram_usernames(
-            row.get("message_text", ""), row.get("author_contact"),
+        reason = cluster_duplicate_reason(
+            text,
+            author_contact,
+            category_code,
+            row,
+            normalized_text=normalized_text,
+            fuzzy_text=fuzzy_text,
+            order_numbers=order_numbers,
+            phone_digits=phone_digits,
+            usernames=usernames,
+            campaign_fp=campaign_fp,
+            headline_fp=headline_fp,
+            extract_order_numbers=_extract_order_numbers,
+            extract_phone_digits=_extract_phone_digits,
+            extract_telegram_usernames=_extract_telegram_usernames,
+            normalize_for_dedupe=_normalize_for_dedupe,
+            normalize_for_fuzzy_dedupe=_normalize_for_fuzzy_dedupe,
         )
-        same_contact = normalized_contact and normalized_contact == (row.get("author_contact") or "").strip().lower()
-        same_phone = phone_digits and phone_digits == _extract_phone_digits(row.get("message_text", ""))
-        same_username = bool(usernames & candidate_usernames)
-        if not (same_contact or same_phone or same_username):
-            continue
-        if campaign_fp:
-            cand_fp = _extract_campaign_fingerprint(row.get("message_text", ""))
-            if cand_fp:
-                fp_sim = SequenceMatcher(None, campaign_fp, cand_fp).ratio()
-                if fp_sim >= 0.55:
-                    return "campaign"
-        similarity = SequenceMatcher(None, normalized_text, candidate_text).ratio()
-        fuzzy_similarity = SequenceMatcher(
-            None, fuzzy_text, _normalize_for_fuzzy_dedupe(row.get("message_text", ""))
-        ).ratio()
-        threshold = 0.50 if (same_contact or same_username) else 0.55
-        fuzzy_threshold = 0.45 if (same_contact or same_username) else 0.50
-        if similarity >= threshold or fuzzy_similarity >= fuzzy_threshold:
-            return "fuzzy"
+        if reason:
+            return reason
     return None
 
 def is_message_recent(message_dt: datetime, max_age_hours: int = None) -> bool:
@@ -1829,12 +1848,12 @@ def format_parser_chats_report(chats: list, parser_status: str) -> str:
         "empty": "📭 чатов нет",
     }
     lines = [
-        f"💬 *Чаты парсинга* ({PARSER_LABEL})",
-        f"Статус: {status_labels.get(parser_status, parser_status)}",
+        f"💬 <b>Чаты парсинга</b> ({escape_html(PARSER_LABEL)})",
+        f"Статус: {escape_html(status_labels.get(parser_status, parser_status))}",
         "",
     ]
     if not chats:
-        lines.append("Добавьте чат: `/addchat @channel`")
+        lines.append("Добавьте чат: <code>/addchat @channel</code>")
         return "\n".join(lines)
 
     ok = sum(1 for c in chats if c.get("status") == "ok")
@@ -1845,17 +1864,17 @@ def format_parser_chats_report(chats: list, parser_status: str) -> str:
     icons = {"ok": "✅", "no_access": "❌", "parser_offline": "⏳", "disabled": "🚫"}
     for i, chat in enumerate(chats, 1):
         icon = icons.get(chat.get("status"), "❓")
-        title = chat.get("title") or "—"
-        link = chat["chat_link"]
-        cid = chat.get("chat_id") or "—"
+        title = escape_html(chat.get("title") or "—")
+        link = escape_html(chat["chat_link"])
+        cid = escape_html(str(chat.get("chat_id") or "—"))
         monitored = "📡" if chat.get("monitored") else "—"
         if chat.get("status") == "disabled":
-            lines.append(f"{i}. {icon} `{link}` (отключён)")
+            lines.append(f"{i}. {icon} <code>{link}</code> (отключён)")
         else:
-            lines.append(f"{i}. {icon} *{title}* {monitored}")
-            lines.append(f"   `{link}` → id `{cid}`")
+            lines.append(f"{i}. {icon} <b>{title}</b> {monitored}")
+            lines.append(f"   <code>{link}</code> → id <code>{cid}</code>")
     lines.append("")
-    lines.append("Добавить: `/addchat @channel` · Удалить: `/removechat`")
+    lines.append("Добавить: <code>/addchat @channel</code> · Удалить: <code>/removechat</code>")
     return "\n".join(lines)
 
 def _keyword_in_text(keyword: str, text_lower: str) -> bool:
@@ -2570,9 +2589,94 @@ def resolve_vacancy_contact(text: str, poster: dict | None = None) -> tuple[str 
     return None, None
 
 
+_DIGEST_HIRING_MARKERS = (
+    "требу", "нужен", "нужны", "ищем", "ищу", "ваканс", "набор",
+    "промоутер", "грузчик", "хостес", "официант", "аниматор", "водитель",
+)
+
+
+def _is_numbered_annotation_list(text: str) -> bool:
+    """«1. 16+ 2. СРОЧНО» под одной шапкой — одна вакансия, не digest."""
+    if _numbered_vacancy_count(text) < 2:
+        return False
+    blocks = split_vacancy_blocks(text)
+    if len(blocks) < 3:
+        return False
+    header_block = blocks[0]
+    numbered = blocks[1:]
+    if not all(len(b.strip()) < 72 for b in numbered):
+        return False
+    header_lower = header_block.lower()
+    if not (
+        extract_address_from_text(header_block)
+        or has_payment_signal(header_block)
+        or "смена" in header_lower
+        or "адрес" in header_lower
+    ):
+        return False
+    for nb in numbered:
+        nl = nb.lower()
+        if any(m in nl for m in _DIGEST_HIRING_MARKERS):
+            return False
+    return True
+
+
+def _digest_cluster_key(order: dict) -> str | None:
+    """Ключ кластера внутри одного digest-поста (адрес + смена + категория)."""
+    addr = order.get("address_normalized") or order.get("address")
+    if not addr and not order.get("shift_date"):
+        return None
+    parts = [
+        order.get("category_code") or order.get("category") or "",
+        (addr or "").strip().lower(),
+        str(order.get("shift_date") or ""),
+        str(order.get("shift_time_start") or ""),
+    ]
+    if not any(parts):
+        return None
+    return "|".join(parts)
+
+
+def _preview_digest_cluster_key(
+    block_text: str,
+    message,
+    poster: dict,
+    block_index: int,
+) -> str | None:
+    """Ключ кластера до save — чтобы не плодить дубли из одного digest."""
+    eval_text = block_text
+    if block_index is not None and message.text:
+        eval_text = enrich_digest_block(block_text, message.text)
+    accepted, category, _, _ = evaluate_vacancy(eval_text, poster)
+    if not accepted or not category:
+        return None
+    address = extract_address_from_text(eval_text) or extract_address_from_text(message.text or "")
+    full_text = "\n".join(part for part in (eval_text, message.text or "") if part)
+    msg_lat, msg_lon = _extract_message_geo(message)
+    from services.vacancy_enrichment import enrich_vacancy_text
+
+    enrichment = enrich_vacancy_text(
+        full_text,
+        legacy_address=address,
+        location_lat=msg_lat,
+        location_lon=msg_lon,
+    )
+    if enrichment.address_normalized:
+        address = enrichment.address_normalized
+    return _digest_cluster_key({
+        "category_code": category,
+        "address": address,
+        "address_normalized": enrichment.address_normalized,
+        "shift_date": enrichment.shift_date,
+        "shift_time_start": enrichment.shift_time_start,
+    })
+
+
 def should_split_digest(text: str) -> bool:
     """Нумерованный digest «1. … 2. …» — разбираем по блокам, не одной вакансией."""
     if not text:
+        return False
+    if _is_numbered_annotation_list(text):
         return False
     if _numbered_vacancy_count(text) < 2:
         return False
