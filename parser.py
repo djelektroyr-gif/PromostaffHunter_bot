@@ -401,19 +401,22 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
             chats_ok = s.get("chats_ok") or 0
             chats_total = s.get("chats_total") or 0
             return (
-                "📊 *Шум по чатам*\n\n"
+                "📊 <b>Шум по чатам</b>\n\n"
                 f"Прогон ещё идёт: сообщений {scanned}, чатов {chats_ok}/{chats_total}.\n"
                 "Отчёт появится после завершения — или нажмите снова через пару минут."
             )
         if scanned and s.get("finished_at"):
             return (
-                "📊 *Шум по чатам*\n\n"
+                "📊 <b>Шум по чатам</b>\n\n"
                 f"Последний прогон просмотрел {scanned} сообщ., "
                 f"но почти все уже были в БД или без текста для фильтра.\n"
                 "Шум считается только по сообщениям, прошедшим через фильтр категорий."
             )
-        return "📊 *Шум по чатам*\n\nНет данных — запустите «🔍 Ручная проверка» или дождитесь планового прогона."
-    lines = ["📊 *Шум по чатам* (последний прогон)", ""]
+        return (
+            "📊 <b>Шум по чатам</b>\n\n"
+            "Нет данных — запустите «🔍 Ручная проверка» или дождитесь планового прогона."
+        )
+    lines = ["📊 <b>Шум по чатам</b> (последний прогон)", ""]
     ranked = []
     for title, bucket in by_chat.items():
         scanned = bucket.get("scanned") or 0
@@ -434,10 +437,12 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
         already = bucket.get("already_sent") or 0
         al = f", уже в БД: {already}" if already else ""
         lines.append(
-            f"• *{title}* — шум ~{noise_pct}% ({bucket.get('rejected', 0)}/{total}), "
-            f"в ленту: {bucket.get('matched', 0)}{mm}{al}{top_reason}"
+            f"• <b>{escape_html(title)}</b> — шум ~{noise_pct}% "
+            f"({bucket.get('rejected', 0)}/{total}), "
+            f"в ленту: {bucket.get('matched', 0)}{escape_html(mm)}{escape_html(al)}"
+            f"{escape_html(top_reason)}"
         )
-    lines.append("\nПрофиль чата: `/setchatroles ссылка promoter,helper,loader`")
+    lines.append("\nПрофиль чата: <code>/setchatroles ссылка promoter,helper,loader</code>")
     return "\n".join(lines)
 
 
@@ -448,34 +453,37 @@ def format_reject_samples_report(stats: dict | None = None) -> str:
         run_kind = s.get("run_kind")
         hint = (
             "Запустите «🔬 Аудит фильтра» — прогонит последние посты из каждого чата "
-            "через фильтр *без сохранения* и покажет, что отсеяно."
+            "через фильтр <b>без сохранения</b> и покажет, что отсеяно."
         )
         if run_kind and run_kind != "audit":
             hint = (
-                "В обычном прогоне примеры копятся только по *новым* сообщениям, прошедшим фильтр.\n"
+                "В обычном прогоне примеры копятся только по <b>новым</b> сообщениям, "
+                "прошедшим фильтр.\n"
                 + hint
             )
         return (
-            f"📋 *Примеры отсева*\n\n"
+            "📋 <b>Примеры отсева</b>\n\n"
             "Пока нет отсеянных постов в памяти последнего прогона.\n\n"
-            "Это *не* вакансии в ленте — только то, что парсер отбросил.\n"
+            "Это <b>не</b> вакансии в ленте — только то, что парсер отбросил.\n"
             f"{hint}"
         )
     lines = [
-        "📋 *Примеры отсева* (последний прогон)",
+        "📋 <b>Примеры отсева</b> (последний прогон)",
         "",
-        "Посты из чатов, которые парсер *не сохранил* в ленту. "
+        "Посты из чатов, которые парсер <b>не сохранил</b> в ленту. "
         "Причина в названии строки — фильтр считает, что это не подходящая вакансия.",
         "",
-        f"Тип прогона: {s.get('run_kind') or '—'} · показано {len(samples)}",
+        f"Тип прогона: {escape_html(str(s.get('run_kind') or '—'))} · показано {len(samples)}",
         "",
     ]
     for i, sample in enumerate(reversed(samples), 1):
-        label = reject_reason_label(sample.get("reason"))
+        label = escape_html(reject_reason_label(sample.get("reason")))
         cat = sample.get("category")
-        cat_part = f" → `{cat}`" if cat else ""
-        lines.append(f"{i}. *{sample.get('chat', '—')}* — {label}{cat_part}")
-        lines.append(f"   _{sample.get('preview', '')}_")
+        cat_part = f" → <code>{escape_html(cat)}</code>" if cat else ""
+        chat = escape_html(sample.get("chat") or "—")
+        preview = escape_html(sample.get("preview") or "")
+        lines.append(f"{i}. <b>{chat}</b> — {label}{cat_part}")
+        lines.append(f"   <i>{preview}</i>")
         lines.append("")
     lines.append("Подсказка: если видите ложный отсев — пришлите номер примера, поправим фильтр.")
     return "\n".join(lines).strip()
@@ -489,7 +497,7 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
     all_titles = set(by_chat.keys()) | set(db_counts.keys())
     if not all_titles and not s.get("started_at"):
         return (
-            "📡 *Покрытие каналов*\n\n"
+            "📡 <b>Покрытие каналов</b>\n\n"
             "Нет данных. Запустите «🔬 Аудит фильтра» или дождитесь прогона."
         )
 
@@ -506,17 +514,17 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
     rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     lines = [
-        "📡 *Покрытие каналов*",
+        "📡 <b>Покрытие каналов</b>",
         "",
-        "*За 7 дней в БД* — сколько вакансий сохранено из чата.",
-        "*Последний прогон* — что парсер увидел в *новых* постах (incremental).",
+        "<b>За 7 дней в БД</b> — сколько вакансий сохранено из чата.",
+        "<b>Последний прогон</b> — что парсер увидел в <b>новых</b> постах (incremental).",
         "Если «прогон 0» — новых сообщений не было; realtime или прошлый прогон уже забрали.",
         "",
     ]
 
     active_db = [r for r in rows if r[0] > 0]
     if active_db:
-        lines.append(f"*Дают вакансии ({len(active_db)} чатов):*")
+        lines.append(f"<b>Дают вакансии ({len(active_db)} чатов):</b>")
         for db_n, matched, rejected, scanned, already, title, b in active_db[:14]:
             scan_part = (
                 f"прогон: +{matched} в ленту, {rejected} отсеяно, {already} уже в БД"
@@ -528,9 +536,9 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
 
     silent_db = [r for r in rows if r[0] == 0 and r[3] == 0]
     if silent_db:
-        lines.append(f"*Молчат в БД ({len(silent_db)} чатов, 0 вакансий за 7 д):*")
+        lines.append(f"<b>Молчат в БД ({len(silent_db)} чатов, 0 вакансий за 7 д):</b>")
         for *_, title, _b in silent_db[:8]:
-            lines.append(f"  • {title}")
+            lines.append(f"  • {escape_html(title)}")
         if len(silent_db) > 8:
             lines.append(f"  … и ещё {len(silent_db) - 8}")
         lines.append("")
@@ -541,7 +549,7 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
 
     if s.get("run_kind") == "audit" and by_chat:
         lines.append("")
-        lines.append("*Аудит (последние посты, без сохранения):*")
+        lines.append("<b>Аудит (последние посты, без сохранения):</b>")
         audit_rows = sorted(
             by_chat.items(),
             key=lambda x: (x[1].get("matched") or 0, x[1].get("rejected") or 0),
@@ -551,7 +559,7 @@ def format_channel_coverage_report(stats: dict | None, db_counts: dict[str, int]
             if not (b.get("scanned") or 0):
                 continue
             lines.append(
-                f"• {title}: в ленту {b.get('matched', 0)}, "
+                f"• {escape_html(title)}: в ленту {b.get('matched', 0)}, "
                 f"отсеяно {b.get('rejected', 0)} из {b.get('scanned', 0)}"
             )
 
@@ -1202,13 +1210,14 @@ def get_parser_status_snapshot() -> dict:
 def format_parser_status_line(snapshot: dict) -> str:
     if not snapshot.get("session_file"):
         return (
-            f"❌ {PARSER_LABEL}: нет файла `{session_file_path()}`\n"
-            f"   Загрузите авторизованную сессию на сервер (см. docs/DEVELOPMENT.md §11)"
+            f"❌ {escape_html(PARSER_LABEL)}: нет файла "
+            f"<code>{escape_html(session_file_path())}</code>\n"
+            "   Загрузите авторизованную сессию на сервер (см. docs/DEVELOPMENT.md §11)"
         )
     if snapshot["online"]:
-        line = f"✅ {PARSER_LABEL}: подключён"
+        line = f"✅ {escape_html(PARSER_LABEL)}: подключён"
     else:
-        line = f"⏳ {PARSER_LABEL}: не подключён"
+        line = f"⏳ {escape_html(PARSER_LABEL)}: не подключён"
     line += f"\n   Чатов в БД: {snapshot['active_chats']}"
     if snapshot["online"]:
         resolved = snapshot.get("resolved_chats", 0)
@@ -1363,19 +1372,19 @@ def get_last_debug_report() -> str:
 
     if not s.get("started_at"):
         return (
-            "🧪 *Последний прогон парсера*\n\n"
+            "🧪 <b>Последний прогон парсера</b>\n\n"
             "Ещё не было завершённого прогона после перезапуска.\n"
             f"{parser_line}\n\n"
-            "Запустите `/check_now` или дождитесь плановой проверки (~5 мин)."
+            "Запустите <code>/check_now</code> или дождитесь плановой проверки (~5 мин)."
         )
 
     lines = [
-        "🧪 *Последний прогон парсера*",
-        f"Тип: {s.get('run_kind') or '—'}",
-        f"Старт: {s.get('started_at')}",
-        f"Финиш: {s.get('finished_at') or '⏳ в процессе…'}",
+        "🧪 <b>Последний прогон парсера</b>",
+        f"Тип: {escape_html(str(s.get('run_kind') or '—'))}",
+        f"Старт: {escape_html(str(s.get('started_at')))}",
+        f"Финиш: {escape_html(str(s.get('finished_at') or '⏳ в процессе…'))}",
         parser_line,
-        f"Фаза: {s.get('phase') or ('scan' if parser_scan_in_progress() else '—')}",
+        f"Фаза: {escape_html(str(s.get('phase') or ('scan' if parser_scan_in_progress() else '—')))}",
         f"Чатов: {s.get('chats_ok', 0)}/{s.get('chats_total', 0)} успешно, ошибок: {s.get('chats_failed', 0)}",
         f"Сообщений просмотрено: {s.get('messages_scanned', 0)}",
         f"Совпадений найдено: {s.get('matched', 0)}",
@@ -1391,10 +1400,10 @@ def get_last_debug_report() -> str:
     run_kind = s.get("run_kind") or ""
     if scanned == 0 and run_kind in ("periodic", "manual", "startup", "check_now"):
         lines.append(
-            "\nℹ️ *Нули в incremental — нормально:* парсер смотрит только посты "
-            "после курсора `last_processed` (с lookback "
+            "\nℹ️ <b>Нули в incremental — нормально:</b> парсер смотрит только посты "
+            "после курсора <code>last_processed</code> (с lookback "
             f"{PARSER_INCREMENTAL_LOOKBACK} сообщ.). Если новых не было — 0. "
-            "Вакансии могли прийти через realtime — в логах `⚡ новое сообщение`."
+            "Вакансии могли прийти через realtime — в логах <code>⚡ новое сообщение</code>."
         )
 
     if not s.get("finished_at"):
@@ -1403,30 +1412,33 @@ def get_last_debug_report() -> str:
             age_min = (datetime.now() - started).total_seconds() / 60
             if not parser_scan_in_progress() and age_min > 2:
                 lines.append(
-                    f"\n⚠️ *Прогон без финиша*, но lock свободен ({int(age_min)} мин назад) — "
+                    f"\n⚠️ <b>Прогон без финиша</b>, но lock свободен ({int(age_min)} мин назад) — "
                     "отчёт мог быть перезаписан новым прогоном. Смотрите логи Bothost."
                 )
             elif parser_scan_in_progress() and age_min > 15:
                 lines.append(
-                    f"\n⚠️ *Прогон «в процессе» уже {int(age_min)} мин* — "
-                    "возможно зависание Telethon. После деплоя fix — перезапуск или `/check_now`."
+                    f"\n⚠️ <b>Прогон «в процессе» уже {int(age_min)} мин</b> — "
+                    "возможно зависание Telethon. После деплоя fix — перезапуск или <code>/check_now</code>."
                 )
         except ValueError:
             pass
     err = s.get("error")
     if err:
-        lines.append(f"\n❌ Ошибка прогона: `{err}`")
+        lines.append(f"\n❌ Ошибка прогона: <code>{escape_html(str(err))}</code>")
     categories = s.get("categories") or {}
     if categories:
-        lines.append("\n📊 *Распределение по категориям:*")
+        lines.append("\n📊 <b>Распределение по категориям:</b>")
         for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True):
-            lines.append(f"  • {cat}: {count}")
+            lines.append(f"  • {escape_html(cat)}: {count}")
     reasons = s.get("reasons") or {}
     if reasons:
         top = sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:8]
-        lines.append("\n📋 *Топ причин фильтра:*")
+        lines.append("\n📋 <b>Топ причин фильтра:</b>")
         for reason, count in top:
-            lines.append(f"  • {reject_reason_label(reason)} (`{reason}`): {count}")
+            lines.append(
+                f"  • {escape_html(reject_reason_label(reason))} "
+                f"(<code>{escape_html(reason)}</code>): {count}"
+            )
     samples = s.get("reject_samples") or []
     if samples:
         lines.append(f"\n📋 Примеры отсева: {len(samples)} шт. — кнопка «📋 Примеры отсева»")
@@ -1434,10 +1446,10 @@ def get_last_debug_report() -> str:
     if chat_errors:
         lines.append("\n⚠️ Ошибки по чатам:")
         for chat, count in sorted(chat_errors.items(), key=lambda x: x[1], reverse=True)[:5]:
-            lines.append(f"  • {chat}: {count}")
+            lines.append(f"  • {escape_html(chat)}: {count}")
     by_chat = s.get("by_chat") or {}
     if by_chat:
-        lines.append("\n📊 *Шум по чатам (топ):*")
+        lines.append("\n📊 <b>Шум по чатам (топ):</b>")
         ranked = []
         for title, bucket in by_chat.items():
             total = (bucket.get("scanned") or 0) or (
@@ -1449,7 +1461,7 @@ def get_last_debug_report() -> str:
             ranked.append((noise, title, bucket))
         for noise, title, bucket in sorted(ranked, reverse=True)[:5]:
             lines.append(
-                f"  • {title}: шум {noise}%, в ленту {bucket.get('matched', 0)}"
+                f"  • {escape_html(title)}: шум {noise}%, в ленту {bucket.get('matched', 0)}"
             )
     return "\n".join(lines)
 

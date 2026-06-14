@@ -1202,15 +1202,15 @@ async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown
 
 
 async def answer_admin_report(message: types.Message, text: str):
-    """Отчёт админу: Markdown, при ошибке разметки — plain text."""
+    """Отчёт админу: HTML (как справка и карточки), при ошибке — plain text."""
     try:
         if len(text) > 3800:
-            await send_long_message(message.chat.id, text, parse_mode="Markdown")
+            await send_long_message(message.chat.id, text, parse_mode="HTML")
         else:
-            await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+            await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
     except TelegramBadRequest as e:
-        logger.warning("answer_admin_report Markdown failed: %s", e)
-        plain = re.sub(r"[*_`]", "", text)
+        logger.warning("answer_admin_report HTML failed: %s", e)
+        plain = re.sub(r"<[^>]*>", "", text)
         if len(plain) > 3800:
             await send_long_message(message.chat.id, plain, parse_mode=None)
         else:
