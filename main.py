@@ -1249,6 +1249,8 @@ async def admin_fsm_menu_escape(message: types.Message, state: FSMContext) -> bo
         await send_reject_samples_report(message)
     elif text == "📡 Покрытие каналов":
         await send_channel_coverage_report(message)
+    elif text == "📊 Ingest 7 дн":
+        await send_ingest_dashboard_report(message)
     elif text == "📡 Парсер":
         await send_admin_parser_intro(message)
     elif text == "📺 Канал":
@@ -1296,6 +1298,15 @@ async def send_channel_coverage_report(message: types.Message):
         if r.get("source_chat_title")
     }
     await answer_admin_report(message, format_channel_coverage_report(get_stats_for_filter_reports(), db_map))
+
+
+async def send_ingest_dashboard_report(message: types.Message):
+    if message.from_user.id != YOUR_USER_ID:
+        return
+    from services.ingest_dashboard import build_ingest_dashboard_report
+
+    text = await run_db(build_ingest_dashboard_report, days=7)
+    await answer_admin_report(message, text)
 
 def build_admin_dashboard_text() -> str:
     stats = get_admin_stats()
@@ -2851,7 +2862,8 @@ def get_admin_stats_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text=ADMIN_BTN_STATS_24H), KeyboardButton(text=ADMIN_BTN_STATS_TOTAL)],
             [KeyboardButton(text="📊 Шум по чатам"), KeyboardButton(text="📡 Покрытие каналов")],
-            [KeyboardButton(text="📋 Примеры отсева"), KeyboardButton(text="📊 Статистика канала")],
+            [KeyboardButton(text="📋 Примеры отсева"), KeyboardButton(text="📊 Ingest 7 дн")],
+            [KeyboardButton(text="📊 Статистика канала")],
             [KeyboardButton(text="📝 Отчёт парсера")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
@@ -3070,7 +3082,7 @@ ADMIN_MENU_BUTTONS = {
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
     "🗑 Удалить вакансию",
-    "🔬 Аудит фильтра", "📋 Примеры отсева", "📡 Покрытие каналов",
+    "🔬 Аудит фильтра", "📋 Примеры отсева", "📡 Покрытие каналов", "📊 Ingest 7 дн",
     "📺 Канал", "📺 Статус канала", "📊 Статистика канала",
     "📣 Вакансия в канал", "📣 В канал", "📝 Новость в канал", "📢 Промо в канал",
     "✏️ Тексты промо",
@@ -7870,6 +7882,11 @@ async def admin_reject_samples_button(message: types.Message):
 @dp.message(lambda m: m.text == "📡 Покрытие каналов")
 async def admin_channel_coverage_button(message: types.Message):
     await send_channel_coverage_report(message)
+
+
+@dp.message(lambda m: m.text == "📊 Ingest 7 дн")
+async def admin_ingest_dashboard_button(message: types.Message):
+    await send_ingest_dashboard_report(message)
 
 
 @dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == "📺 Канал")

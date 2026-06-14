@@ -257,6 +257,9 @@ def reject_reason_label(reason: str | None) -> str:
         return f"качество ({reason.split(':', 1)[1].strip()})"
     if reason == "ambiguous_category":
         return "роль не определена"
+    if reason.startswith("soft_ingest:"):
+        guessed = reason.split(":", 1)[1].strip()
+        return f"мягкий ingest ({guessed} → misc)"
     if reason == "digest_split_required":
         return "digest (разбивается на блоки)"
     return reason
@@ -575,6 +578,16 @@ def _flatten_parser_result(result):
     return [result]
 
 
+def _log_parser_ingest(event: str, meta: dict) -> None:
+    """Лёгкий лог ingest для 7-дневного дашборда (без блокировки парсера)."""
+    try:
+        from db import log_bot_event
+
+        log_bot_event(None, event, meta)
+    except Exception:
+        pass
+
+
 async def _save_parsed_vacancy_block(
     *,
     block_text: str,
@@ -597,6 +610,12 @@ async def _save_parsed_vacancy_block(
     if not accepted or not category:
         _bump_chat_stat(stats, chat_title, "rejected", reason)
         _record_reject_sample(stats, chat_title, reason, eval_text)
+        if stats is None or stats.get("run_kind") != "audit":
+            _log_parser_ingest("parser_rejected", {
+                "reason": reason,
+                "chat_title": chat_title,
+                "category": category,
+            })
         return None
 
     expected = _chat_expected_roles.get(str(chat_id)) or _chat_expected_roles.get(chat_id)
@@ -687,6 +706,12 @@ async def _save_parsed_vacancy_block(
     _bump_chat_stat(stats, chat_title, "matched")
     if stats is not None:
         stats["matched"] += 1
+    if stats is None or stats.get("run_kind") != "audit":
+        _log_parser_ingest("parser_saved", {
+            "category": category,
+            "chat_title": chat_title,
+            "reason": reason,
+        })
 
     return {
         "vacancy_id": vacancy_id,
@@ -2010,6 +2035,7 @@ _HELPER_EVENT_HINTS = (
     "мероприят", "площадк", "хелпер", "хэлпер", "регистрац", "конференц",
     "саммит", "summit", "к мероприятию", "демонтаж", "монтажник", "монтажн",
     "на такси на площадку", "монтаж",
+    "зоопарк", "сафари", "выставочн", "павильон", "экспозиц",
 )
 _HELPER_HEADCOUNT_RE = re.compile(
     r"(?:нужн\w*|требу\w*)\s+\d+\s+х[еэ]лпер|\d+\s+х[еэ]лпер",
@@ -2341,6 +2367,39 @@ _SHIFT_JOB_MARKERS = (
 )
 _SHORT_TERM_SHIFT_MARKERS = _SHIFT_JOB_MARKERS
 
+_SOFT_PERMANENT_PHRASES = (
+    "на постоянную основу", "постоянную основу",
+    "на постоянную работу", "на постоянку", "постоянная работа",
+)
+
+_HOURLY_RATE_RE = re.compile(
+    r"(?:"
+    r"\d+\s*(?:руб|₽|р)\s*/\s*ч"
+    r"|\d+\s*рублей\s+в\s+час"
+    r"|\d+\s*₽/\s*ч"
+    r"|\d+\s*р/\s*ч"
+    r"|\d+\s*руб/\s*ч"
+    r")",
+    re.I,
+)
+
+_SHIFT_DATE_RE = re.compile(
+    r"(?:"
+    r"\d{1,2}[.,:/]\d{1,2}(?:[.,:/]\d{2,4})?"
+    r"|\d{1,2}\s+(?:янв|фев|мар|апр|мая|июн|июл|авг|сен|окт|ноя|дек)\w*"
+    r"|(?:сегодня|завтра)"
+    r")",
+    re.I,
+)
+
+
+def _looks_like_hourly_shift_job(text: str) -> bool:
+    """Даты смены + почасовая ставка — не считаем «постоянкой» на ingest."""
+    if not text:
+        return False
+    tl = text.lower()
+    return bool(_SHIFT_DATE_RE.search(tl) and _HOURLY_RATE_RE.search(tl))
+
 _PRO_CASTING_MARKERS = (
     "спектакл", "гастрол", "проф. артист", "профессиональный акт",
     "актер в ", "актёр в ", "командировка в ",
@@ -2501,6 +2560,8 @@ def is_permanent_job_spam(text: str) -> bool:
         if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
     if not any(m in tl for m in _PERMANENT_JOB_MARKERS):
+        return False
+    if any(m in tl for m in _SOFT_PERMANENT_PHRASES) and _looks_like_hourly_shift_job(text):
         return False
     if any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
         return False
@@ -2871,6 +2932,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
     tl = text.lower()
     if category == "misc":
         return has_hiring_signal(text) and has_payment_signal(text)
+    if category == "helper" and _has_technician_role(tl):
+        return True
     if category == "driver" and _is_driver_role(tl):
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False
@@ -2896,6 +2959,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "к мероприятию", "деловое мероприятие", "приготовить площадку",
             "расставить", "площадку к мероприятию",
             "бекфотограф", "бэкстейдж", "бэкстейж", "ассистент по акт", "ассистент на площадке",
+            "зоопарк", "сафари", "выставочн", "павильон",
         )
         if not any(_helper_quality_marker_hit(tl, m) for m in helper_markers):
             return False
@@ -2911,6 +2975,9 @@ def passes_quality_gate(category: str, text: str) -> bool:
         ):
             return False
     elif category == "loader":
+        if any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
+            if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS + _SOFT_EVENT_CONTEXT_MARKERS):
+                return False
         if any(w in tl for w in _HANDYMAN_LOADER_REJECT) and not any(w in tl for w in _LOADER_CORE_HINTS):
             return False
         if any(w in tl for w in _LOADER_CORE_HINTS):
@@ -2985,6 +3052,46 @@ def passes_quality_gate(category: str, text: str) -> bool:
     return True
 
 
+SOFT_INGEST_MIN_SCORE = 4
+
+_SOFT_EVENT_CONTEXT_MARKERS = (
+    "мероприят", "смен", "съемк", "съёмк", "ивент", "event", "промо", "выставк",
+    "фестив", "концерт", "площадк", "зоопарк", "сафари", "павильон", "стенд",
+    "форум", "конференц", "экспо", "шоу", "турнир", "регистрац",
+)
+
+
+def _eligible_for_soft_ingest(category: str, text: str) -> bool:
+    """
+    Мягкий ingest: staff gate пройден, quality gate — нет.
+    Сохраняем как misc, угаданная роль уходит в category_scores_json.
+    """
+    if not text or not category or category == "misc":
+        return False
+    if is_non_event_labor_spam(text) or is_permanent_job_spam(text):
+        return False
+    if is_office_staff_spam(text) or is_academic_writing_spam(text):
+        return False
+    if is_digital_work_spam(text) or is_remote_office_job_spam(text):
+        return False
+    tl = text.lower()
+    scores = _score_categories_weighted(text)
+    cat_score = scores.get(category, 0)
+    has_event_ctx = any(m in tl for m in _SOFT_EVENT_CONTEXT_MARKERS)
+    has_shift_ctx = any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS)
+    if any(m in tl for m in _NON_EVENT_LABOR_MARKERS) and not (has_event_ctx or has_shift_ctx):
+        return False
+    if cat_score < SOFT_INGEST_MIN_SCORE and not (has_event_ctx or has_shift_ctx):
+        return False
+    if category in ("loader", "handyman") and "производств" in tl:
+        if not (has_event_ctx or has_shift_ctx):
+            return False
+    if category == "loader" and any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
+        if not (has_event_ctx or has_shift_ctx):
+            return False
+    return True
+
+
 def evaluate_vacancy(
     text: str, poster: dict | None = None, *, force_category: str | None = None,
 ) -> tuple[bool, str | None, str, list]:
@@ -2997,9 +3104,11 @@ def evaluate_vacancy(
     category = force_category or detect_category(text)
     if not category:
         return False, None, "ambiguous_category", keywords
-    if not passes_quality_gate(category, text):
-        return False, None, f"quality_gate:{category}", keywords
-    return True, category, "accepted", keywords
+    if passes_quality_gate(category, text):
+        return True, category, "accepted", keywords
+    if not force_category and _eligible_for_soft_ingest(category, text):
+        return True, "misc", f"soft_ingest:{category}", keywords
+    return False, None, f"quality_gate:{category}", keywords
 
 
 def vacancy_matches_category(text: str, category_code: str) -> bool:

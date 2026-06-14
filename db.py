@@ -3769,6 +3769,48 @@ def get_vacancy_counts_by_chat(days: int = 7) -> list[dict]:
         return [{"source_chat_title": r[0], "count": r[1]} for r in cur.fetchall()]
 
 
+def get_vacancy_counts_by_category(days: int = 7) -> list[dict]:
+    """Сохранённые вакансии по category_code за последние N дней."""
+    with db_conn(commit=False) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(f"""
+                SELECT category_code, COUNT(*) AS cnt
+                FROM vacancies
+                WHERE category_code IS NOT NULL
+                  AND category_code != ''
+                  AND found_at >= {now_minus_days(days)}
+                GROUP BY category_code
+                ORDER BY cnt DESC
+            """),
+        )
+        return [{"category_code": r[0], "count": r[1]} for r in cur.fetchall()]
+
+
+def get_parser_ingest_event_rows(days: int = 7) -> list[dict]:
+    """События parser_saved / parser_rejected из bot_events."""
+    import json
+
+    rows = fetchall(
+        q("""
+            SELECT event, meta_json
+            FROM bot_events
+            WHERE event IN ('parser_saved', 'parser_rejected')
+              AND created_at >= """
+        + now_minus_days(days)),
+    )
+    out: list[dict] = []
+    for event, meta_json in rows:
+        meta = {}
+        if meta_json:
+            try:
+                meta = json.loads(meta_json)
+            except json.JSONDecodeError:
+                meta = {}
+        out.append({"event": event, **meta})
+    return out
+
+
 def get_admin_stats() -> dict:
     with db_conn(commit=False) as conn:
         cur = conn.cursor()
