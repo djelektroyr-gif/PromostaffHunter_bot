@@ -40,7 +40,7 @@ def test_preview_rich_has_heading_and_table():
     assert "@" not in html
 
 
-def test_full_rich_has_details_block():
+def test_full_rich_shows_visible_description():
     inp = VacancyCardInput(
         category_code="helper",
         category_name="Хелпер",
@@ -50,6 +50,47 @@ def test_full_rich_has_details_block():
         published_at="09.06.2026 12:00 МСК",
     )
     html = build_vacancy_full_rich_html(inp)
-    assert "<details>" in html
-    assert "<summary>Полный текст вакансии</summary>" in html
+    assert "<details>" not in html
+    assert "Описание" in html
     assert "демонтаж" in html.lower()
+
+
+def _zoo_helper_body() -> str:
+    return (
+        "Добрый день!\n"
+        "Требуются сотрудники на мероприятие (монтаж) 🛠️\n\n"
+        "📍 Локация: Московский зоопарк\n"
+        "📅 Дата: 14.06.2026\n"
+        "💰 Оплата за проект: 5.400 руб.\n"
+        "Выплата через неделю после конца (15.06) проекта\n\n"
+        "Вакансия: ХЕЛПЕР-ГРУЗЧИК\n"
+        "👥 Количество: 2 человека\n"
+        "⏰ Время работы: с 21:00 до 09:00\n"
+        "Задачи:\n"
+        "• Физическая помощь на демонтаже\n"
+        "Как откликнуться:\n"
+        "📲 @oneday_hr3 с пометкой «НОЧЬ»"
+    )
+
+
+def test_zoo_vacancy_rich_card_has_rate_date_and_body():
+    inp = VacancyCardInput(
+        category_code="helper",
+        category_name="Хелпер",
+        category_emoji="👷",
+        body=_zoo_helper_body(),
+        freshness="🟢 Свежая: несколько часов назад",
+        published_at="14.06.2026 12:43 МСК",
+    )
+    preview = build_vacancy_preview_rich_html(inp)
+    full = build_vacancy_full_rich_html(inp)
+    assert "5400" in preview
+    assert "за проект" in preview
+    assert "14.06.2026" in preview
+    assert "21:00" in preview
+    assert "09:00" in preview
+    assert "Требуются сотрудники" in preview
+    assert "Добрый день" not in preview.split("Описание")[0]
+    assert "зоопарк" in full.lower()
+    assert "демонтаж" in full.lower()
+    assert "@" not in full

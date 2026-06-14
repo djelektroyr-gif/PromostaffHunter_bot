@@ -278,3 +278,64 @@ def test_technician_with_driver_license_plus_is_helper_not_driver():
         assert cat == "helper"
     else:
         assert reason != "quality_gate:driver"
+
+
+def test_electrician_vacancy_classified_as_electrician():
+    text = (
+        "Требуются :\n"
+        "-электромонтажники-мастера\n"
+        "-электромонтажники-помощники\n\n"
+        "Работа в магазинах в отдельностоящих зданиях.\n"
+        "Инструмент, СИЗы, расходники и материал выдаем!\n"
+        "Оплата 500 р/ч\n"
+        "+79198040280"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok, reason
+    assert cat == "electrician"
+    assert detect_category(text) == "electrician"
+
+
+def test_booth_montage_not_helper():
+    text = (
+        "Нужны монтажники стендов на выставку\n"
+        "Сборка конструкций, баннеры, Octanorm\n"
+        "4500 руб за смену @stand_hr"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok, reason
+    assert cat == "booth"
+
+
+def test_misc_fallback_when_hiring_and_payment_but_no_role():
+    text = (
+        "Срочно на объект, нужны 3 человека\n"
+        "Работа с 10:00 до 18:00\n"
+        "Оплата 3000 руб\n"
+        "@shift_boss"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok, reason
+    assert cat == "misc"
+
+
+def test_helper_montazhnik_on_event_still_helper():
+    text = (
+        "Нужны 2 хелпера на мероприятие\n"
+        "Помощь монтажникам сцен, расстановка\n"
+        "500 р/ч @eventboss"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok, reason
+    assert cat == "helper"
+
+
+def test_loader_takelazh_keywords():
+    text = (
+        "Нужны 2 грузчика на такелаж\n"
+        "Подъём на этаж, разгрузка фуры\n"
+        "4500 руб за смену @loader_hr"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text)
+    assert ok, reason
+    assert cat == "loader"

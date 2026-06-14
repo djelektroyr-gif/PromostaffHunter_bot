@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import re
 
+_EU_THOUSANDS_RE = re.compile(r"\b(\d{1,3}(?:\.\d{3})+)\b")
+
+_PROJECT_RATE_PATTERNS = (
+    re.compile(r"оплат\w*\s+за\s+проект\s*[:\s]*(\d[\d\s.,]*)\s*(?:руб|₽|р)", re.I),
+    re.compile(r"(\d[\d\s.,]*)\s*(?:руб|₽|р\.?)\s*за\s+проект", re.I),
+)
+
 _TRIPLE_RATE_RE = re.compile(
     r"(\d{3,4})\s*/\s*(\d{1,2})\s*/\s*(\d{3,5})",
     re.I,
@@ -38,10 +45,37 @@ _MIN_HOURS_PATTERNS = (
 )
 
 
+def _normalize_amount_text(text: str) -> str:
+    """5.400 руб → 5400 руб — европейский разделитель тысяч в постах."""
+    if not text:
+        return text
+
+    def repl(match: re.Match[str]) -> str:
+        return match.group(1).replace(".", "")
+
+    return _EU_THOUSANDS_RE.sub(repl, text)
+
+
+def _parse_rub_amount(raw: str) -> int | None:
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    try:
+        value = int(digits)
+    except ValueError:
+        return None
+    if 1000 <= value <= 100_000:
+        return value
+    return None
+
+
 def extract_hourly_rate_rub(text: str) -> int | None:
     """Максимальная найденная почасовая ставка в ₽/ч или None."""
     if not text:
         return None
+    text = _normalize_amount_text(text)
     found: list[int] = []
     triple = _TRIPLE_RATE_RE.search(text)
     if triple:
@@ -65,7 +99,13 @@ def extract_hourly_rate_rub(text: str) -> int | None:
 def extract_shift_rate_rub(text: str) -> int | None:
     if not text:
         return None
+    text = _normalize_amount_text(text)
     found: list[int] = []
+    for pattern in _PROJECT_RATE_PATTERNS:
+        for match in pattern.finditer(text):
+            value = _parse_rub_amount(match.group(1))
+            if value is not None:
+                found.append(value)
     triple = _TRIPLE_RATE_RE.search(text)
     if triple:
         try:
@@ -88,6 +128,7 @@ def extract_shift_rate_rub(text: str) -> int | None:
 def extract_min_hours(text: str) -> int | None:
     if not text:
         return None
+    text = _normalize_amount_text(text)
     triple = _TRIPLE_RATE_RE.search(text)
     if triple:
         try:

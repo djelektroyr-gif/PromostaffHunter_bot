@@ -683,11 +683,13 @@ def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> s
             f"Выбрано: *{selected_count}*."
         )
     hint_line = f"\n\n{hint}" if hint else ""
+    from services.category_catalog import group_legend_text
     return (
         "⚙️ *Настройки — категории вакансий*\n\n"
         "✅ — выбраны · ⬜ — добавить\n"
         f"{limit_line}{hint_line}\n\n"
-        "Готово — «✅ Завершить выбор»"
+        "Готово — «✅ Завершить выбор»\n\n"
+        f"{group_legend_text()}"
     )
 
 
@@ -700,9 +702,9 @@ def build_categories_markup(selected_codes: list, user_id: int) -> InlineKeyboar
             text=f"{prefix} {cat['emoji']} {cat['name']}",
             callback_data=f"cat_{cat['code']}",
         ))
-        if len(row) == 2 or i == len(all_cats) - 1:
-            buttons.append(row)
-            row = []
+        # Одна кнопка в ряд — проще читать при 18+ категориях
+        buttons.append(row)
+        row = []
     if not is_user_premium(user_id):
         buttons.append([InlineKeyboardButton(
             text="💎 Premium — несколько категорий и push",
@@ -1666,23 +1668,13 @@ class HistorySearchState(StatesGroup):
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 def get_category_emoji(category_code: str) -> str:
-    emojis = {
-        "promoter": "📢", "hostess": "👩‍💼", "wardrobe": "🧥", "animator": "🎭",
-        "helper": "👷", "loader": "📦", "handyman": "🧹", "waiter": "🍽️", "driver": "🚐",
-        "security": "🛡️", "parking": "🚗", "supervisor": "👨‍💼"
-    }
-    return emojis.get(category_code, "📌")
+    from services.category_catalog import category_emoji as cat_emoji
+    return cat_emoji(category_code)
 
 
 def get_category_name(category_code: str) -> str:
-    names = {
-        "promoter": "Промоутер", "hostess": "Хостес", "wardrobe": "Гардеробщик",
-        "animator": "Аниматор", "helper": "Хелпер", "loader": "Грузчик",
-        "handyman": "Разнорабочий / клининг",
-        "waiter": "Официант", "driver": "Водитель", "security": "Охранник",
-        "parking": "Парковщик", "supervisor": "Супервайзер",
-    }
-    return names.get(category_code, category_code)
+    from services.category_catalog import category_name as cat_name
+    return cat_name(category_code)
 
 
 def build_user_help_html(user_id: int) -> str:
@@ -2252,7 +2244,8 @@ async def finish_profile_field_edit(message: types.Message, state: FSMContext, u
     update_candidate_questionnaire(user_id, questionnaire)
     keyboard, _ = get_main_keyboard(user_id)
     await state.clear()
-    await message.answer(notice, parse_mode="Markdown", reply_markup=keyboard)
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(bot, message, notice, keyboard, parse_mode="Markdown")
     await send_profile_data_screen(message.chat.id, user_id)
 
 def _normalize_ru_phone_digits(contact: str) -> str | None:
@@ -2762,6 +2755,7 @@ def get_employer_keyboard():
             [KeyboardButton(text=BTN_SWITCH_CANDIDATE), KeyboardButton(text="📖 Как пользоваться")],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -2779,7 +2773,8 @@ def get_main_keyboard(user_id: int):
             [KeyboardButton(text="💎 Подписка"), KeyboardButton(text=BTN_MY_DATA)],
             [KeyboardButton(text="📖 Как пользоваться"), KeyboardButton(text="❓ Поддержка")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        is_persistent=True,
     )
     return keyboard, status_text
 
@@ -2795,6 +2790,7 @@ def get_settings_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_SETTINGS_BACK)],
         ],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
@@ -3160,29 +3156,38 @@ async def start_cmd(message: types.Message, state: FSMContext):
         greet_name = escape_markdown(greeting_display_name(profile, message.from_user))
         if role == "employer":
             await setup_forum_topics_for_user(user_id)
-            await message.answer(
+            from services.user_reply_keyboard import answer_user_reply_keyboard
+            await answer_user_reply_keyboard(
+                bot,
+                message,
                 f"👋 С возвращением, {greet_name}!\n\n"
                 f"🏢 Режим заказчика — разместите вакансию или обновите контакты в «{BTN_MY_DATA}».",
-                reply_markup=get_employer_keyboard(),
+                get_employer_keyboard(),
             )
             return
         categories = get_user_categories(user_id)
         if categories:
             await setup_forum_topics_for_user(user_id)
             keyboard, status_text = get_main_keyboard(user_id)
-            await message.answer(
+            from services.user_reply_keyboard import answer_user_reply_keyboard
+            await answer_user_reply_keyboard(
+                bot,
+                message,
                 f"👋 С возвращением, {greet_name}!\n\n{status_text}\n\n"
                 f"Используйте кнопки меню. Инструкция — «📖 Как пользоваться» или /help",
-                reply_markup=keyboard
+                keyboard,
             )
             return
         if start_payload.startswith("vac_"):
             await setup_forum_topics_for_user(user_id)
             keyboard, _ = get_main_keyboard(user_id)
-            await message.answer(
+            from services.user_reply_keyboard import answer_user_reply_keyboard
+            await answer_user_reply_keyboard(
+                bot,
+                message,
                 f"👋 С возвращением, {greet_name}!\n\n"
                 "Вакансия выше — нажмите «Откликнуться».",
-                reply_markup=keyboard,
+                keyboard,
             )
             return
         fsm_data = await state.get_data()
@@ -3317,7 +3322,8 @@ async def employer_reg_phone(message: types.Message, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
-    await message.answer("Меню заказчика:", reply_markup=get_employer_keyboard())
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(bot, message, "Меню заказчика:", get_employer_keyboard())
 
 
 @dp.message(lambda m: m.text == BTN_EMPLOYER_POST)
@@ -3399,9 +3405,9 @@ async def employer_switch_to_candidate(message: types.Message, state: FSMContext
         categories = get_user_categories(user_id)
         if categories:
             keyboard, status_text = get_main_keyboard(user_id)
-            await message.answer(
-                f"👷 Режим исполнителя.\n\n{status_text}",
-                reply_markup=keyboard,
+            from services.user_reply_keyboard import answer_user_reply_keyboard
+            await answer_user_reply_keyboard(
+                bot, message, f"👷 Режим исполнителя.\n\n{status_text}", keyboard,
             )
             return
         await send_category_picker(message.chat.id, user_id)
@@ -3678,13 +3684,15 @@ async def disable_feed_confirm(callback: types.CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
         pass
-    await bot.send_message(
+    from services.user_reply_keyboard import bot_send_user_reply_keyboard
+    await bot_send_user_reply_keyboard(
+        bot,
         user_id,
         "🔕 *Рассылка отключена.*\n\n"
         "Профиль и отклики сохранены. Чтобы снова получать вакансии — "
         "«⚙️ Настройки» и выберите категории.",
+        keyboard,
         parse_mode="Markdown",
-        reply_markup=keyboard,
     )
 
 
@@ -3717,6 +3725,7 @@ async def finish_categories(callback: types.CallbackQuery):
             message_thread_id=thread_id_from_message(callback.message),
         ):
             await setup_forum_topics_for_user(user_id)
+        from services.user_reply_keyboard import bot_send_user_reply_keyboard
         title = "✅ *Категории сохранены!*"
         try:
             await callback.message.delete()
@@ -3725,7 +3734,8 @@ async def finish_categories(callback: types.CallbackQuery):
                 await callback.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:
                 pass
-        await bot.send_message(
+        await bot_send_user_reply_keyboard(
+            bot,
             user_id,
             f"{title}\n\n"
             f"📌 Ваши категории:\n{categories_text}\n\n"
@@ -3734,8 +3744,8 @@ async def finish_categories(callback: types.CallbackQuery):
             f"\n\n🎁 *Пробный Premium* выдаётся при первом отклике на вакансию ({TRIAL_DAYS} дн.).\n\n"
             f"📖 Инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
+            keyboard,
             parse_mode="Markdown",
-            reply_markup=keyboard,
         )
         from services.admin_ops_alerts import notify_admin_registration_success
         from services.bot_events import EVENT_REG_CATEGORIES_DONE, record_bot_event
@@ -4243,6 +4253,9 @@ async def show_feed_mode_menu(message: types.Message, user_id: int):
     if not user_categories:
         await message.answer("⚠️ Вы ещё не выбрали категории вакансий. Используйте «⚙️ Настройки»")
         return
+    keyboard, _ = get_main_keyboard(user_id)
+    from services.user_reply_keyboard import refresh_user_reply_keyboard
+    await refresh_user_reply_keyboard(bot, message.chat.id, keyboard)
     notice = await _send_feed_loading_notice(message, user_id)
     snap = await _load_feed_snapshot_async(user_id)
     await _delete_feed_loading_notice(notice)
@@ -4538,6 +4551,9 @@ async def send_vacancy_page(message: types.Message, user_id: int, page: int):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=nav_rows),
     )
+    keyboard, _ = get_main_keyboard(user_id)
+    from services.user_reply_keyboard import refresh_user_reply_keyboard
+    await refresh_user_reply_keyboard(bot, message.chat.id, keyboard)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("vac_page_"))
@@ -4795,7 +4811,10 @@ async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> boo
     elif text == BTN_SETTINGS_CATEGORIES:
         await send_category_picker(message.chat.id, user_id)
     elif text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, BTN_SETTINGS_BACK}:
-        await message.answer("⚙️ Настройки", reply_markup=get_settings_keyboard(user_id))
+        from services.user_reply_keyboard import answer_user_reply_keyboard
+        await answer_user_reply_keyboard(
+            bot, message, "⚙️ Настройки", get_settings_keyboard(user_id),
+        )
     elif text in {BTN_PREMIUM_FILTERS, BTN_METRO, "📍 Мои районы"}:
         from handlers.premium_filters import show_premium_filters_screen
         await show_premium_filters_screen(message, user_id)
@@ -4807,13 +4826,17 @@ async def user_fsm_menu_escape(message: types.Message, state: FSMContext) -> boo
         await send_user_help(message, user_id)
     elif text == "❓ Поддержка":
         keyboard, _ = get_main_keyboard(user_id)
-        await message.answer(
+        from services.user_reply_keyboard import answer_user_reply_keyboard
+        await answer_user_reply_keyboard(
+            bot,
+            message,
             "↩️ Шаг отменён. Напишите «❓ Поддержка» ещё раз, чтобы задать вопрос.",
-            reply_markup=keyboard,
+            keyboard,
         )
     else:
         keyboard, _ = get_main_keyboard(user_id)
-        await message.answer("↩️ Шаг отменён.", reply_markup=keyboard)
+        from services.user_reply_keyboard import answer_user_reply_keyboard
+        await answer_user_reply_keyboard(bot, message, "↩️ Шаг отменён.", keyboard)
     return True
 
 
@@ -4873,20 +4896,26 @@ async def setplan_cmd(message: types.Message):
 async def settings_back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     keyboard, status = get_main_keyboard(message.from_user.id)
-    await message.answer(f"🏠 Главное меню\n\n{status}", reply_markup=keyboard)
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(
+        bot, message, f"🏠 Главное меню\n\n{status}", keyboard,
+    )
 
 
 @dp.message(lambda m: m.text in {BTN_SETTINGS, BTN_SETTINGS_LEGACY, "📋 Мои категории", "✏️ Изменить категории"})
 async def open_settings_menu(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer(
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(
+        bot,
+        message,
         "⚙️ *Настройки*\n\n"
         "• 📌 *Категории* — какие вакансии присылать\n"
         "• 🎯 *Фильтры Premium* — geo, ставка, push\n"
         + ("• 📡 *Предложить канал* — заявка на мониторинг нового чата (Premium)\n" if is_user_premium(message.from_user.id) else "")
         + "\nВыберите пункт ниже.",
+        get_settings_keyboard(message.from_user.id),
         parse_mode="Markdown",
-        reply_markup=get_settings_keyboard(message.from_user.id),
     )
 
 
@@ -4907,7 +4936,10 @@ async def profile_back_menu(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_callback_answer(callback)
     keyboard, status = get_main_keyboard(callback.from_user.id)
-    await callback.message.answer(f"🏠 Главное меню\n\n{status}", reply_markup=keyboard)
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(
+        bot, callback.message, f"🏠 Главное меню\n\n{status}", keyboard,
+    )
 
 
 @dp.callback_query(lambda c: c.data == "profile_edit_cancel")
@@ -5079,11 +5111,14 @@ async def unsubscribe_user_legacy(message: types.Message):
     user_id = message.from_user.id
     set_user_categories(user_id, [])
     keyboard, _ = get_main_keyboard(user_id)
-    await message.answer(
+    from services.user_reply_keyboard import answer_user_reply_keyboard
+    await answer_user_reply_keyboard(
+        bot,
+        message,
         "🔕 *Рассылка отключена.*\n\n"
         "Профиль сохранён. Чтобы снова получать вакансии — «⚙️ Настройки».",
+        keyboard,
         parse_mode="Markdown",
-        reply_markup=keyboard,
     )
 
 @dp.message(lambda m: m.text == "❓ Поддержка")

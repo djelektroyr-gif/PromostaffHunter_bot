@@ -1906,8 +1906,9 @@ _BOUNDARY_KEYWORDS = frozenset({
 })
 
 _CATEGORY_TIEBREAK = (
-    "loader", "handyman", "promoter", "hostess", "waiter", "animator", "wardrobe",
-    "driver", "security", "parking", "supervisor", "helper",
+    "loader", "booth", "handyman", "merchandiser", "electrician",
+    "promoter", "host_mc", "dj", "hostess", "waiter", "animator", "wardrobe",
+    "driver", "security", "parking", "supervisor", "helper", "misc",
 )
 
 _CATEGORY_KEYWORDS = {
@@ -1915,6 +1916,7 @@ _CATEGORY_KEYWORDS = {
         "грузчик", "грузчики", "подсобник", "подсобный рабочий",
         "погрузка", "разгрузка", "выгрузка", "выгрузк", "разгрузк", "погрузк",
         "такелаж", "такелажник",
+        "подъем на этаж", "подъём на этаж", "подъем на этажи", "подъём на этажи",
         "помощь мастерам", "работа на лесах",
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
@@ -1973,6 +1975,30 @@ _CATEGORY_KEYWORDS = {
         "котломой", "дворник", "уборка помещен", "генеральная уборка",
         "клинер", "cleaning",
     ],
+    "booth": [
+        "монтаж стенд", "монтаж стендов", "монтаж выставоч", "застройка стенд",
+        "застройщик", "стендов", "выставочн", "баннер", "натяжк баннер",
+        "октанорм", "octanorm", "павильон", "конструкц", "забор стенд",
+        "сборка стенд", "демонтаж стенд",
+    ],
+    "merchandiser": [
+        "мерчендайз", "мерчанд", "выкладк", "дегустац", "трейд маркетинг",
+        "трейд-маркетинг", "промо в торгов", "промо в сет", "работа в торгов",
+    ],
+    "host_mc": [
+        "ведущий", "ведущая", "ведущие", "ведущ", "тамада",
+        "mc ", " mc", "эмси", "ведение мероприят", "ведущий мероприят",
+    ],
+    "dj": [
+        "dj", "диджей", "дидже", "#dj", "ди-джей",
+    ],
+    "electrician": [
+        "электромонтаж", "электрик", "электромонтер",
+        "сантехник", "сантехн", "сварщик", "газосварщик",
+        "штукатур", "маляр", "плиточник", "каменщик", "кровельщик",
+        "вентиляцион", "холодильн", "слесар",
+    ],
+    "misc": [],
 }
 
 _HELPER_EVENT_HINTS = (
@@ -1984,7 +2010,50 @@ _HELPER_HEADCOUNT_RE = re.compile(
     r"(?:нужн\w*|требу\w*)\s+\d+\s+х[еэ]лпер|\d+\s+х[еэ]лпер",
     re.I,
 )
+_SKILLED_TRADE_MARKERS = (
+    "электромонтаж", "электрик", "сантехник", "сантехн",
+    "сварщик", "газосварщик", "штукатур", "маляр", "плиточник",
+    "каменщик", "кровельщик", "вентиляцион", "холодильн",
+    "лифтмонтаж", "слесар",
+)
+_EVENT_STAFF_OVERRIDE_FOR_TRADE = (
+    "хелпер", "хэлпер", "мероприят", "промоутер", "грузчик", "аниматор",
+    "на площадке", "event staff", "демонтаж", "монтаж на площад",
+)
+_MONTAZHNIK_WORD_RE = re.compile(r"(?<![а-яё])монтажник", re.I)
 
+
+def _has_event_montazhnik(text_lower: str) -> bool:
+    """Монтажник на мероприятии — да; внутри «электромонтажник» — нет."""
+    if "электромонтаж" in text_lower:
+        return False
+    return bool(_MONTAZHNIK_WORD_RE.search(text_lower))
+
+
+def _helper_quality_marker_hit(text_lower: str, marker: str) -> bool:
+    if marker == "монтажник":
+        return _has_event_montazhnik(text_lower)
+    return marker in text_lower
+
+
+def is_skilled_trade_job(text_lower: str) -> bool:
+    """Профессия-специалист — отдельная категория electrician, не reject."""
+    if not text_lower:
+        return False
+    if not any(m in text_lower for m in _SKILLED_TRADE_MARKERS):
+        return False
+    return not any(w in text_lower for w in _EVENT_STAFF_OVERRIDE_FOR_TRADE)
+
+
+def is_skilled_trade_spam(text: str) -> bool:
+    """Обратная совместимость тестов: больше не отсекаем на ingest."""
+    return False
+
+
+_BOOTH_HINTS = (
+    "стенд", "выставочн", "баннер", "застройк", "октанорм", "octanorm",
+    "павильон", "конструкц",
+)
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
     "склад", "рохл", "паллет", "фасовоч", "конвейер", "50 кг",
@@ -2104,6 +2173,10 @@ def _score_categories(text_lower: str) -> dict:
                     continue
                 if any(m in text_lower for m in _NON_EVENT_LABOR_MARKERS):
                     continue
+            if category == "helper" and kw == "монтажник":
+                if _has_event_montazhnik(text_lower):
+                    scores[category] = scores.get(category, 0) + len(kw)
+                continue
             if _keyword_in_text(kw, text_lower):
                 scores[category] = scores.get(category, 0) + len(kw)
     if any(marker in text_lower for marker in _NON_SUPERVISOR_COORDINATOR):
@@ -2118,6 +2191,11 @@ def _has_explicit_helper_hiring(text_lower: str) -> bool:
 def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if not scores:
         return None
+    if is_skilled_trade_job(text_lower):
+        return "electrician"
+    if scores.get("booth") and scores.get("helper"):
+        if any(w in text_lower for w in _BOOTH_HINTS):
+            return "booth"
     if _has_explicit_helper_hiring(text_lower):
         return "helper"
     if _has_technician_role(text_lower) and scores.get("helper"):
@@ -2480,13 +2558,17 @@ def _detect_category_scored(text: str) -> str | None:
     if not text:
         return None
     text_lower = text.lower()
+    if is_skilled_trade_job(text_lower):
+        return "electrician"
+    if _has_technician_role(text_lower):
+        return "helper"
     if _is_driver_role(text_lower):
         return "driver"
     return _pick_category_from_scores(_score_categories_weighted(text), text_lower)
 
 
 def detect_category(text: str) -> str | None:
-    """Категория по тексту; без уверенного scoring — None (не fallback)."""
+    """Категория по тексту; при найме+оплате без роли — misc (не теряем вакансию)."""
     if not text:
         return None
     blocks = split_vacancy_blocks(text)
@@ -2494,7 +2576,12 @@ def detect_category(text: str) -> str | None:
         cat = _detect_category_scored(block)
         if cat:
             return cat
-    return _detect_category_scored(text)
+    cat = _detect_category_scored(text)
+    if cat:
+        return cat
+    if has_hiring_signal(text) and has_payment_signal(text):
+        return "misc"
+    return None
 
 
 def is_casting_call(text: str) -> bool:
@@ -2777,6 +2864,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
     if is_unpaid_vacancy(text):
         return False
     tl = text.lower()
+    if category == "misc":
+        return has_hiring_signal(text) and has_payment_signal(text)
     if category == "driver" and _is_driver_role(tl):
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False
@@ -2803,7 +2892,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "расставить", "площадку к мероприятию",
             "бекфотограф", "бэкстейдж", "бэкстейж", "ассистент по акт", "ассистент на площадке",
         )
-        if not any(m in tl for m in helper_markers):
+        if not any(_helper_quality_marker_hit(tl, m) for m in helper_markers):
             return False
         if any(w in tl for w in _PROMO_HINTS) and "промоутер" not in tl and "позиция: промо" not in tl:
             if not any(m in tl for m in ("хелпер", "хэлпер")):
@@ -2874,6 +2963,20 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "координатор проекта", "координатор мероприят",
         )):
             return False
+    elif category == "booth":
+        if not any(w in tl for w in _BOOTH_HINTS):
+            return False
+    elif category == "merchandiser":
+        if not any(w in tl for w in ("мерчендайз", "мерчанд", "выкладк", "дегустац", "трейд")):
+            return False
+    elif category == "host_mc":
+        if not any(w in tl for w in ("ведущ", "тамада", " mc", "mc ", "эмси")):
+            return False
+    elif category == "dj":
+        if not any(w in tl for w in ("dj", "диджей", "дидже", "ди-джей")):
+            return False
+    elif category == "electrician":
+        return is_skilled_trade_job(tl)
     return True
 
 

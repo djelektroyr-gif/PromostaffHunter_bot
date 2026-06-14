@@ -24,6 +24,18 @@ _HEADLINE_RE = re.compile(
     r"(?:^|\n)\s*((?:нужн\w*|требу\w*|ищ\w*)\s+\d+\s+[^\n]{3,60})",
     re.I | re.MULTILINE,
 )
+_HEADLINE_EVENT_RE = re.compile(
+    r"(?:^|\n)\s*((?:требуются|нужны)\s+сотрудник\w*[^\n]{3,80})",
+    re.I | re.MULTILINE,
+)
+_HEADLINE_ROLE_RE = re.compile(
+    r"(?:^|\n)\s*(?:вакансия\s*[:\-]?\s*)([^\n]{3,60})",
+    re.I | re.MULTILINE,
+)
+_GREETING_LINE_RE = re.compile(
+    r"^(?:добрый\s+(?:день|вечер|утро)|здравствуйте|привет)[!.,\s]*$",
+    re.I,
+)
 _HEADCOUNT_INLINE_RE = re.compile(
     r"(?:нужн\w*|требу\w*)\s+\d+\s+х[еэ]лпер\w*",
     re.I,
@@ -230,8 +242,16 @@ def _extract_headline(body: str, sanitized_lines: list[str]) -> str | None:
     m = _HEADLINE_RE.search(body)
     if m:
         return m.group(1).strip()
+    m = _HEADLINE_EVENT_RE.search(body)
+    if m:
+        return m.group(1).strip()
+    m = _HEADLINE_ROLE_RE.search(body)
+    if m:
+        return m.group(1).strip()
     for line in sanitized_lines:
         low = line.lower()
+        if _GREETING_LINE_RE.match(line.strip()):
+            continue
         if len(line) < 8 or len(line) > 90:
             continue
         if _RATE_LINE_RE.search(line):
@@ -239,6 +259,9 @@ def _extract_headline(body: str, sanitized_lines: list[str]) -> str | None:
         if any(k in low for k in ("адрес", "метро", "локация", "заявк", "контакт", "телефон")):
             continue
         return line
+    for line in sanitized_lines:
+        if not _GREETING_LINE_RE.match(line.strip()):
+            return line
     return sanitized_lines[0] if sanitized_lines else None
 
 
@@ -247,6 +270,8 @@ def _extract_task_hint(sanitized_lines: list[str], headline: str | None) -> str 
     for line in sanitized_lines:
         low = line.strip().lower()
         if not low or low == head_key:
+            continue
+        if _GREETING_LINE_RE.match(line.strip()):
             continue
         if low in head_key or head_key in low:
             continue
@@ -289,12 +314,14 @@ def _sanitized_lines(body: str) -> list[str]:
 
 
 def _shift_schedule_line(inp: VacancyCardInput) -> str | None:
-    """Когда смена: «на завтра, с 10:00»."""
+    """Когда смена: «14.06.2026, с 21:00 до 09:00»."""
     parts: list[str] = []
     if inp.shift_date == "today":
         parts.append("на сегодня")
     elif inp.shift_date == "tomorrow":
         parts.append("на завтра")
+    elif inp.shift_date and re.match(r"\d{1,2}\.\d{1,2}", inp.shift_date):
+        parts.append(inp.shift_date)
     body_low = (inp.body or "").lower()
     if not parts:
         if "на завтра" in body_low or re.search(r"\bзавтра\b", body_low):
@@ -303,6 +330,11 @@ def _shift_schedule_line(inp: VacancyCardInput) -> str | None:
             parts.append("на сегодня")
     if inp.shift_time_start:
         parts.append(f"с {inp.shift_time_start}")
+    end_match = re.search(r"до\s*(\d{1,2})[:.](\d{2})", inp.body or "", re.I)
+    if end_match:
+        hour, minute = int(end_match.group(1)), int(end_match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            parts.append(f"до {hour:02d}:{minute:02d}")
     if not parts:
         return None
     return ", ".join(parts)

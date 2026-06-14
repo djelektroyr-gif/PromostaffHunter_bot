@@ -87,8 +87,18 @@ def build_vacancy_preview_rich_html(
     return "\n".join(parts)
 
 
+def _format_public_body_rich_html(description: str) -> str:
+    lines = [ln.strip() for ln in description.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    parts = ["<p><b>Описание</b></p>"]
+    for line in lines[:45]:
+        parts.append(f"<p>{escape_html(line)}</p>")
+    return "\n".join(parts)
+
+
 def build_vacancy_full_rich_html(inp: VacancyCardInput) -> str:
-    """Полная rich-карточка: details с текстом + таблица."""
+    """Полная rich-карточка: факты + видимый текст (без details — Telegram Rich их не раскрывает)."""
     ctx = _merge_enrichment(inp)
     parts: list[str] = [
         f"<h3>{escape_html(ctx.category_emoji)} "
@@ -97,20 +107,18 @@ def build_vacancy_full_rich_html(inp: VacancyCardInput) -> str:
     if ctx.published_at and ctx.published_at not in ("сейчас", "—"):
         parts.append(f"<p><i>Опубликовано: {escape_html(ctx.published_at)}</i></p>")
 
+    table = _facts_table(ctx)
+    if table:
+        parts.append(table)
+
     description = sanitize_vacancy_public_body(ctx.body or "", max_len=3500)
-    if description:
-        parts.append(
-            "<details><summary>Полный текст вакансии</summary>"
-            f"<p>{escape_html(description)}</p></details>"
-        )
+    body_html = _format_public_body_rich_html(description)
+    if body_html:
+        parts.append(body_html)
     else:
         parts.append(
             "<p>Описание уточняется — нажмите «Откликнуться», чтобы связаться.</p>"
         )
-
-    table = _facts_table(ctx)
-    if table:
-        parts.append(table)
 
     footer = _footer_lines(ctx)
     if footer:

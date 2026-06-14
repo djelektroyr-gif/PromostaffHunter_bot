@@ -68,6 +68,8 @@ Hunter **не** копирует «100% сообщений в БД», но **с�
 
 ## 4. Ближайшие шаги (бэклог, без big bang)
 
+- [x] **P1 (2026-06):** волна 1 категорий: `booth`, `merchandiser`, `host_mc`, `dj`, `electrician`, `misc` + группы в настройках.
+- [x] **P1 (2026-06):** специалисты не reject — маршрут в `electrician`; fallback `misc` при найме+оплате без роли.
 - [ ] **P1:** multi-score в БД (`category_scores_json` или отдельная таблица) — без смены UX подписки.
 - [ ] **P1:** ingest «мягкий режим» — `staff_job` + weak category → save as `uncertain` + primary guess.
 - [ ] **P2:** Premium keywords (+ / − фразы) в `subscriber_filter_prefs`.

@@ -78,6 +78,20 @@ def test_channel_rate_helpers():
     assert extract_hourly_rate_rub(text) == 550
     assert extract_min_hours(text) == 4
     assert extract_shift_rate_rub("Ставка 4000 ₽/смена") == 4000
+    assert extract_shift_rate_rub("Оплата за проект: 5.400 руб.") == 5400
+
+
+def test_enrich_zoo_project_rate_and_shift_date():
+    text = (
+        "📍 Локация: Московский зоопарк\n"
+        "📅 Дата: 14.06.2026\n"
+        "💰 Оплата за проект: 5.400 руб.\n"
+        "⏰ Время работы: с 21:00 до 09:00"
+    )
+    enrichment = enrich_vacancy_text(text)
+    assert enrichment.rate_shift == 5400
+    assert enrichment.shift_date == "14.06.2026"
+    assert enrichment.shift_time_start == "21:00"
 
 
 def test_geo_tags_moscow_metro_and_city():

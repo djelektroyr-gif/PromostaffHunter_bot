@@ -7,6 +7,7 @@ import re
 from services.channel_rate import extract_hourly_rate_rub, extract_shift_rate_rub
 
 _NEGOTIATED_RE = re.compile(r"(?:по\s+)?договор[её]нност", re.I)
+_PROJECT_BODY_RE = re.compile(r"оплат\w*\s+за\s+проект", re.I)
 _PAYMENT_RATE_RE = re.compile(
     r"(?:"
     r"\d[\d\s.,]*\s*(?:руб\.?|₽|р\.?\/?\s*ч)|"
@@ -65,6 +66,8 @@ def format_vacancy_rate_line(
     if rate_hourly:
         return f"{rate_hourly} ₽/ч"
     if rate_shift:
+        if _PROJECT_BODY_RE.search(body or ""):
+            return f"{rate_shift} ₽ за проект"
         suffix = f" · от {min_hours} ч" if min_hours else ""
         return f"{rate_shift} ₽/смена{suffix}"
     if is_negotiated_rate_text(body):

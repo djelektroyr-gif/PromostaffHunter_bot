@@ -120,6 +120,10 @@ _TODAY_TOMORROW_RE = (
     (re.compile(r"\bсегодня\b", re.I), "today"),
     (re.compile(r"\bзавтра\b", re.I), "tomorrow"),
 )
+_EXPLICIT_DATE_RE = re.compile(
+    r"(?:📅\s*)?(?:\*\*)?(?:дата)(?:\*\*)?\s*[:\s]*(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)",
+    re.I,
+)
 
 
 @dataclass
@@ -583,6 +587,9 @@ def build_geo_tags(text: str, address_normalized: str | None = None) -> list[str
 def extract_shift_date_token(text: str) -> str | None:
     if not text:
         return None
+    explicit = _EXPLICIT_DATE_RE.search(text)
+    if explicit:
+        return explicit.group(1).replace("/", ".")
     for pattern, token in _TODAY_TOMORROW_RE:
         if pattern.search(text):
             return token

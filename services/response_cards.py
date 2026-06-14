@@ -21,7 +21,9 @@ ADMIN_DRAFT_STATUS_LABELS = {
 _CATEGORY_EMOJI = {
     "promoter": "📢", "hostess": "👩‍💼", "wardrobe": "🧥", "animator": "🎭",
     "helper": "👷", "loader": "📦", "waiter": "🍽️", "driver": "🚐",
-    "security": "🛡️", "parking": "🚗", "supervisor": "👨‍💼",
+    "security": "🛡️", "parking": "🚗", "supervisor": "👨‍💼", "handyman": "🧹",
+    "booth": "🏗️", "merchandiser": "🛒", "host_mc": "🎤", "dj": "🎧",
+    "electrician": "⚡", "misc": "📋",
 }
 
 _CATEGORY_NAMES = {
@@ -29,6 +31,10 @@ _CATEGORY_NAMES = {
     "animator": "Аниматор", "helper": "Хелпер", "loader": "Грузчик",
     "waiter": "Официант", "driver": "Водитель", "security": "Охранник",
     "parking": "Парковщик", "supervisor": "Супервайзер",
+    "handyman": "Разнорабочий / клининг",
+    "booth": "Монтаж стендов", "merchandiser": "Мерчендайзер",
+    "host_mc": "Ведущий", "dj": "DJ", "electrician": "Электромонтаж",
+    "misc": "Другая смена",
 }
 
 

@@ -36,6 +36,17 @@ def test_message_answer_injects_thread_id_in_general():
     assert message_answer_injects_thread_id(msg) is False
 
 
+def test_reply_keyboard_delivery_uses_general_topic_when_forum_enabled(monkeypatch):
+    from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
+
+    from services.user_reply_keyboard import reply_keyboard_delivery_kwargs, with_persistent_keyboard
+
+    monkeypatch.setattr("services.user_reply_keyboard.FORUM_TOPICS_ENABLED", True)
+    assert reply_keyboard_delivery_kwargs() == {"message_thread_id": 1}
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Посмотреть новые вакансии")]])
+    assert with_persistent_keyboard(kb).is_persistent is True
+
+
 def test_edit_text_must_not_get_reply_keyboard_markup():
     """Документируем ограничение API: edit_text только InlineKeyboardMarkup."""
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup

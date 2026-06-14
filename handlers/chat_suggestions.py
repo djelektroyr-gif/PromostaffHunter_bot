@@ -234,4 +234,4 @@ def get_settings_keyboard_for_user(user_id: int):
         rows.append([KeyboardButton(text=BTN_SUGGEST_CHAT)])
     rows.append([KeyboardButton(text=BTN_PREMIUM_FILTERS)])
     rows.append([KeyboardButton(text=BTN_SETTINGS_BACK)])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)

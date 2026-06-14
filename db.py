@@ -308,6 +308,11 @@ def init_db():
                 emoji TEXT
             )
         """)
+        add_column_if_missing(
+            "categories", "group_code",
+            "ALTER TABLE categories ADD COLUMN group_code TEXT DEFAULT NULL",
+            cur=cur,
+        )
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_categories (
@@ -759,8 +764,13 @@ CHANNEL_SETTING_DEFAULTS = {
 
 
 def _ensure_core_categories(cur) -> None:
-    """Добавляет категории, появившиеся после первого деплоя."""
-    extras = [
+    """Добавляет категории и group_code, появившиеся после первого деплоя."""
+    from services.category_catalog import (
+        CATEGORY_GROUP_BY_CODE,
+        NEW_CATEGORY_ROWS,
+    )
+
+    extras = list(NEW_CATEGORY_ROWS) + [
         ("handyman", "Разнорабочий / клининг", "🧹"),
     ]
     for code, name, emoji in extras:
@@ -772,6 +782,11 @@ def _ensure_core_categories(cur) -> None:
                 """
             ),
             (code, name, emoji),
+        )
+    for code, group in CATEGORY_GROUP_BY_CODE.items():
+        cur.execute(
+            q("UPDATE categories SET group_code = ? WHERE code = ? AND (group_code IS NULL OR group_code = '')"),
+            (group, code),
         )
 
 
@@ -1641,8 +1656,21 @@ def is_profile_complete(user_id: int) -> bool:
 
 # ========== КАТЕГОРИИ ==========
 def get_all_categories() -> list:
-    rows = fetchall("SELECT code, name, emoji FROM categories ORDER BY name")
-    return [{"code": r[0], "name": r[1], "emoji": r[2]} for r in rows]
+    rows = fetchall(
+        "SELECT code, name, emoji, group_code FROM categories ORDER BY name"
+    )
+    from services.category_catalog import category_group, sort_categories
+
+    out = []
+    for r in rows:
+        code = r[0]
+        out.append({
+            "code": code,
+            "name": r[1],
+            "emoji": r[2],
+            "group_code": r[3] or category_group(code),
+        })
+    return sort_categories(out)
 
 
 def get_user_categories(user_id: int) -> list:
