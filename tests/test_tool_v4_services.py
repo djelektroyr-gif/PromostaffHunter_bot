@@ -43,8 +43,7 @@ def test_channel_preview_text_structured():
     assert "Опубликовано" not in text
     assert "завтра" in text
     assert "Secret Group" not in text
-    assert "@" not in text
-    assert "boss123" not in text
+    assert "boss123" in text.lower()
     assert "·" in text
 
 

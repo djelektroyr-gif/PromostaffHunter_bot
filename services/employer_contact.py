@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from html import escape as escape_html
 
 _PHONE_APPLY_HINT = (
     "Отклик по телефону: нажмите «✅ Откликнуться», скопируйте текст отклика "
@@ -113,7 +114,55 @@ def tg_user_vacancy_notice_html(contact: str, vacancy_text: str | None = None) -
         return ""
     label = extract_tg_user_display_name(vacancy_text, uid) or "Написать заказчику"
     return (
-        f'👉 <a href="tg://user?id={uid}">{label}</a>\n'
+        f'👉 <a href="tg://user?id={uid}">{escape_html(label)}</a>\n'
+        f"ℹ️ <i>Нажмите «✅ Откликнуться» — бот пришлёт черновик и ссылку на заказчика.</i>"
+    )
+
+
+def username_vacancy_contact_html(contact: str) -> str:
+    """Публичный @username заказчика в карточке (контакт из объявления)."""
+    c = (contact or "").strip()
+    if not c.startswith("@"):
+        return ""
+    uname = c[1:]
+    if not re.fullmatch(r"[a-zA-Z0-9_]{5,32}", uname):
+        return ""
+    return (
+        f'👉 <a href="https://t.me/{escape_html(uname)}">{escape_html(c)}</a>\n'
+        f"ℹ️ <i>Нажмите «✅ Откликнуться» — бот пришлёт черновик и ссылку на заказчика.</i>"
+    )
+
+
+_ARROW_CONTACT_RE = re.compile(
+    r"👉\s+([^@\n]{3,60}?)(?:\s*$|\n)",
+    re.MULTILINE,
+)
+
+
+def extract_arrow_display_contact(vacancy_text: str | None) -> str | None:
+    """Имя/организация из строки «👉 Glavgruz Admin …» без @."""
+    if not vacancy_text:
+        return None
+    for raw_line in vacancy_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("👉"):
+            continue
+        if "@" in line or "tg://" in line.lower() or "t.me/" in line.lower():
+            continue
+        m = _ARROW_CONTACT_RE.match(line)
+        if m:
+            label = m.group(1).strip(" ·|—–-")
+            if len(label) >= 3:
+                return label
+    return None
+
+
+def display_contact_vacancy_html(label: str) -> str:
+    clean = (label or "").strip()
+    if not clean:
+        return ""
+    return (
+        f"👉 {escape_html(clean)}\n"
         f"ℹ️ <i>Нажмите «✅ Откликнуться» — бот пришлёт черновик и ссылку на заказчика.</i>"
     )
 

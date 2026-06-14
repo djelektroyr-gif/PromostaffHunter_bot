@@ -36,6 +36,10 @@ def is_negotiated_rate_text(text: str) -> bool:
         return True
     if re.search(r"ищ\w+\s+.{0,20}водител", tl) and re.search(r"на\s+сво[её]м\s+авто", tl):
         return True
+    if re.search(r"водител\w*\s*[\-–—]\s*курьер", tl) and re.search(r"личн\w*\s+авто", tl):
+        return True
+    if re.search(r"ваканси\w*\s*[:\s].*водител", tl):
+        return True
     if "официант" in tl and re.search(r"требу\w+\s+\d+\s+официант", tl):
         return True
     return False

@@ -266,6 +266,9 @@ def reject_reason_label(reason: str | None) -> str:
     if reason.startswith("soft_ingest:"):
         guessed = reason.split(":", 1)[1].strip()
         return f"мягкий ingest ({guessed} → misc)"
+    if reason.startswith("soft_accept:"):
+        guessed = reason.split(":", 1)[1].strip()
+        return f"мягкий accept ({guessed})"
     if reason == "digest_split_required":
         return "digest (разбивается на блоки)"
     return reason
@@ -1588,6 +1591,9 @@ def extract_contact_from_text(text: str) -> str:
     md_user = re.search(r"\]\(tg://user\?id=(\d+)\)", text, re.IGNORECASE)
     if md_user:
         return f"tg://user?id={md_user.group(1)}"
+    arrow_at = re.search(r"👉\s*(@[a-zA-Z0-9_]{5,32})", text)
+    if arrow_at:
+        return arrow_at.group(1)
     user_link = re.search(r"tg://user\?id=(\d+)", text, re.IGNORECASE)
     if user_link:
         return f"tg://user?id={user_link.group(1)}"
@@ -1955,9 +1961,9 @@ _BOUNDARY_KEYWORDS = frozenset({
 })
 
 _CATEGORY_TIEBREAK = (
-    "loader", "booth", "handyman", "merchandiser", "electrician",
+    "loader", "handyman", "merchandiser", "electrician",
     "promoter", "host_mc", "dj", "hostess", "waiter", "animator", "wardrobe",
-    "driver", "security", "parking", "supervisor", "helper", "misc",
+    "helper", "driver", "security", "parking", "supervisor", "booth", "misc",
 )
 
 _CATEGORY_KEYWORDS = {
@@ -2013,7 +2019,8 @@ _CATEGORY_KEYWORDS = {
         "помощник на мероприятие", "помощник организатора",
         "помощь на площадке", "помощники на площадке",
         "к мероприятию", "деловое мероприятие", "приготовить площадку",
-        "бекфотограф", "бэкстейдж", "бэкстейж",
+        "бекфотограф", "бэкфотограф", "бэкфото", "бэк-фотограф",
+        "бэкстейдж", "бэкстейж",
         "ассистент по акт", "ассистент на площадке",
         "волонтер", "волонтёр",
     ],
@@ -2124,7 +2131,23 @@ _LOADER_CORE_HINTS = (
 )
 _PROMO_HINTS = (
     "промоутер", "листовок", "визиток", "промо-акция", "раздача листовок",
-    "раздача визиток", "промо персонал", "промо", "анкетирован",
+    "раздача визиток", "раздавать листовки", "раздавать листовок",
+    "раздачу листовок", "раздача листов", "распространение листовок",
+    "промо персонал", "промо", "анкетирован",
+)
+_EXPLICIT_EVENT_STAFF_ROLE_RE = re.compile(
+    r"(?:"
+    r"требу\w*|нужн\w*|ищ\w*|ваканси\w*"
+    r")\s*[:\s🔎]*\s*(?:.{0,12})?"
+    r"(хелпер\w*|хэлпер\w*|бекфотограф\w*|бэкфотограф\w*|бэкстейдж\w*)",
+    re.I,
+)
+_GROUP_WELCOME_RE = re.compile(
+    r"добро\s+пожаловать\s+в\s+групп|"
+    r"welcome\s+to\s+the\s+group|"
+    r"присоединил\w*\s+к\s+групп|"
+    r"joined\s+the\s+group",
+    re.I,
 )
 _NON_SUPERVISOR_COORDINATOR = (
     "организатор", "координатор свад", "свадеб", "#организатора", "координатора",
@@ -2193,6 +2216,48 @@ def _has_technician_role(text_lower: str) -> bool:
     return bool(re.search(r"(?:требу|нужен|ищем)\w*\s+.{0,20}техник", text_lower))
 
 
+def _has_explicit_event_staff_role(text_lower: str) -> bool:
+    """«Требуется хэлперы / бэкфотограф» — явная роль, не монтаж стендов."""
+    if not text_lower:
+        return False
+    if _EXPLICIT_EVENT_STAFF_ROLE_RE.search(text_lower):
+        return True
+    if re.search(r"водител\w*\s*[\-–—]\s*курьер", text_lower):
+        return False
+    return False
+
+
+def _is_structured_hiring_template(text: str) -> bool:
+    """Шаблон «Предлагаю работу / Требуется …» в hiring-группах."""
+    if not text:
+        return False
+    tl = text.lower()
+    return "предлагаю работу" in tl and re.search(r"требу\w*", tl)
+
+
+def _has_explicit_driver_vacancy(text_lower: str) -> bool:
+    if re.search(r"ваканси\w*\s*[:\s].*водител", text_lower):
+        return True
+    if re.search(r"водител\w*\s*[\-–—]\s*курьер", text_lower):
+        return True
+    return False
+
+
+def is_group_welcome_spam(text: str) -> bool:
+    """Приветствие нового участника группы — не вакансия."""
+    if not text:
+        return False
+    tl = text.lower()
+    if _GROUP_WELCOME_RE.search(tl):
+        return True
+    if "добро пожаловать" in tl and "в групп" in tl:
+        return True
+    if "добро пожаловать" in tl and not has_payment_signal(text):
+        if not re.search(r"(?:требу|нужн|ищ\w*|ваканси)", tl):
+            return True
+    return False
+
+
 def _is_driver_role(text_lower: str) -> bool:
     """Водитель/курьер как основная роль — не «права в плюс» у техника."""
     norm = _normalize_hashtag_text(text_lower)
@@ -2201,6 +2266,8 @@ def _is_driver_role(text_lower: str) -> bool:
     if re.search(r"(?:требу|нужен|ищем|ищу|набор|ваканс)\w*\s+.{0,25}(?:водител|курьер|экспедитор)", text_lower):
         return True
     if re.search(r"ищ\w+\s+.{0,20}водител", text_lower):
+        return True
+    if _has_explicit_driver_vacancy(text_lower):
         return True
     if _has_technician_role(text_lower):
         if re.search(
@@ -2243,7 +2310,11 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
         return None
     if is_skilled_trade_job(text_lower):
         return "electrician"
+    if _has_explicit_event_staff_role(text_lower):
+        return "helper"
     if scores.get("booth") and scores.get("helper"):
+        if any(w in text_lower for w in ("хелпер", "хэлпер", "бекфотограф", "бэкфотограф", "бэкстейдж")):
+            return "helper"
         if any(w in text_lower for w in _BOOTH_HINTS):
             return "booth"
     if _has_explicit_helper_hiring(text_lower):
@@ -2413,11 +2484,15 @@ _SHIFT_DATE_RE = re.compile(
 
 
 def _looks_like_hourly_shift_job(text: str) -> bool:
-    """Даты смены + почасовая ставка — не считаем «постоянкой» на ingest."""
+    """Даты/время смены + почасовая ставка — не считаем «постоянкой» на ingest."""
     if not text:
         return False
     tl = text.lower()
-    return bool(_SHIFT_DATE_RE.search(tl) and _HOURLY_RATE_RE.search(tl))
+    has_time = bool(re.search(r"(?:с|до)\s*\d{1,2}[:.]\d{2}", tl))
+    return bool(
+        _HOURLY_RATE_RE.search(tl)
+        and (_SHIFT_DATE_RE.search(tl) or has_time or "смена" in tl)
+    )
 
 _PRO_CASTING_MARKERS = (
     "спектакл", "гастрол", "проф. артист", "профессиональный акт",
@@ -2606,6 +2681,8 @@ def is_chat_listing_noise(text: str) -> bool:
     if not text:
         return False
     tl = text.lower()
+    if is_group_welcome_spam(text):
+        return True
     if "бот для отправки объявлений" in tl:
         return True
     if "подписаться на max" in tl and "заявк" not in tl:
@@ -2648,6 +2725,8 @@ def _detect_category_scored(text: str) -> str | None:
     if _has_technician_role(text_lower):
         return "helper"
     if _is_driver_role(text_lower):
+        return "driver"
+    if _has_explicit_driver_vacancy(text_lower):
         return "driver"
     return _pick_category_from_scores(_score_categories_weighted(text), text_lower)
 
@@ -2717,7 +2796,13 @@ def has_payment_signal(text: str) -> bool:
         return False
     from services.vacancy_rate import has_payment_or_negotiated_rate
 
-    return has_payment_or_negotiated_rate(text)
+    if has_payment_or_negotiated_rate(text):
+        return True
+    if _is_structured_hiring_template(text) and _detect_category_scored(text):
+        return True
+    if _has_explicit_driver_vacancy(text.lower()):
+        return True
+    return False
 
 
 def has_ls_contact_phrase(text: str) -> bool:
@@ -2951,7 +3036,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
     tl = text.lower()
     if category == "misc":
         return has_hiring_signal(text) and has_payment_signal(text)
-    if category == "helper" and _has_technician_role(tl):
+    if category == "helper" and (_has_technician_role(tl) or _has_explicit_event_staff_role(tl)):
         return True
     if category == "driver" and _is_driver_role(tl):
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
@@ -2977,7 +3062,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "помощь на площадке", "помощники на площадке",
             "к мероприятию", "деловое мероприятие", "приготовить площадку",
             "расставить", "площадку к мероприятию",
-            "бекфотограф", "бэкстейдж", "бэкстейж", "ассистент по акт", "ассистент на площадке",
+            "бекфотограф", "бэкфотограф", "бэкфото", "бэкстейдж", "бэкстейж",
+            "ассистент по акт", "ассистент на площадке",
             "зоопарк", "сафари", "выставочн", "павильон",
         )
         if not any(_helper_quality_marker_hit(tl, m) for m in helper_markers):
@@ -3126,7 +3212,7 @@ def evaluate_vacancy(
     if passes_quality_gate(category, text):
         return True, category, "accepted", keywords
     if not force_category and _eligible_for_soft_ingest(category, text):
-        return True, "misc", f"soft_ingest:{category}", keywords
+        return True, category, f"soft_accept:{category}", keywords
     return False, None, f"quality_gate:{category}", keywords
 
 

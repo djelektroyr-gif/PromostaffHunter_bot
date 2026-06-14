@@ -36,6 +36,7 @@ class HandlerErrorAlertMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        bot: Bot | None = data.get("bot")
         try:
             return await handler(event, data)
         except TelegramBadRequest as e:
@@ -44,11 +45,13 @@ class HandlerErrorAlertMiddleware(BaseMiddleware):
                 return None
             if "thread" in err and "not found" in err:
                 logger.warning("Handler TelegramBadRequest (forum thread): %s", e)
-                await _reply_user_error(bot, event)
+                if bot is not None:
+                    await _reply_user_error(bot, event)
                 return None
             raise
         except Exception as e:
-            bot: Bot = data["bot"]
+            if bot is None:
+                raise
             user_id = _extract_user_id(event)
             label = _handler_label(data)
             logger.exception("Handler error %s user=%s: %s", label, user_id, e)

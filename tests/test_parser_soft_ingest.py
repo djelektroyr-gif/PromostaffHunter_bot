@@ -36,8 +36,8 @@ def test_soft_ingest_when_quality_gate_fails_with_event_context():
         assert cat in ("helper", "promoter", "misc")
         return
     assert ok is True
-    assert cat == "misc"
-    assert reason.startswith("soft_ingest:")
+    assert cat in ("helper", "promoter", "misc")
+    assert reason.startswith("soft_accept:")
 
 
 def test_zoo_site_vacancy_accepted():
@@ -51,8 +51,8 @@ def test_zoo_site_vacancy_accepted():
     ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
     assert ok is True
     assert cat in ("helper", "misc", "loader")
-    if cat == "misc":
-        assert reason.startswith("soft_ingest:")
+    if reason.startswith("soft_"):
+        assert reason.startswith("soft_accept:")
 
 
 def test_force_category_skips_soft_ingest():

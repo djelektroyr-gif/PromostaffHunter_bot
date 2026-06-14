@@ -1207,15 +1207,19 @@ async def show_vacancy_by_deeplink(message: types.Message, user_id: int, vacancy
         html_suffix=html_suffix,
     )
 
+from services.telegram_chunks import chunk_text_for_telegram
+
+
 async def send_long_message(chat_id: int, text: str, parse_mode: str = "Markdown", chunk_size: int = 3800):
     """Разбивает длинный текст на части (лимит Telegram ~4096)."""
-    if len(text) <= chunk_size:
-        await bot.send_message(chat_id, text, parse_mode=parse_mode)
-        return
-    start = 0
-    while start < len(text):
-        await bot.send_message(chat_id, text[start:start + chunk_size], parse_mode=parse_mode)
-        start += chunk_size
+    if parse_mode == "HTML":
+        parts = chunk_text_for_telegram(text, max_len=chunk_size)
+    elif len(text) <= chunk_size:
+        parts = [text]
+    else:
+        parts = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    for part in parts:
+        await bot.send_message(chat_id, part, parse_mode=parse_mode)
         await asyncio.sleep(0.2)
 
 
@@ -6934,11 +6938,22 @@ async def list_chats_cmd(message: types.Message):
     try:
         chats, parser_status = await inspect_parser_chats()
         report = format_parser_chats_report(chats, parser_status)
-        if len(report) > 4000:
-            await status_msg.edit_text(report[:4000], parse_mode="HTML")
-            await message.answer(report[4000:], parse_mode="HTML")
-        else:
-            await status_msg.edit_text(report, parse_mode="HTML")
+        chunks = chunk_text_for_telegram(report, max_len=3800)
+        try:
+            await status_msg.edit_text(chunks[0], parse_mode="HTML")
+            for chunk in chunks[1:]:
+                await message.answer(
+                    chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+        except TelegramBadRequest as html_err:
+            logger.warning("list_chats_cmd HTML failed: %s", html_err)
+            plain = re.sub(r"<[^>]*>", "", report)
+            plain_chunks = chunk_text_for_telegram(plain, max_len=3800)
+            await status_msg.edit_text(plain_chunks[0])
+            for chunk in plain_chunks[1:]:
+                await message.answer(chunk, disable_web_page_preview=True)
     except Exception as e:
         logger.exception("list_chats_cmd")
         await status_msg.edit_text(f"❌ Ошибка проверки чатов: {str(e)[:120]}")

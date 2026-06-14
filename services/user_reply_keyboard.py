@@ -9,6 +9,7 @@ from aiogram.types import Message, ReplyKeyboardMarkup
 
 from config import FORUM_TOPICS_ENABLED
 from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
+from services.forum_topics import is_forum_thread_missing_error
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -48,6 +49,9 @@ async def bot_send_user_reply_keyboard(
         err = str(e).lower()
         if "text must be non-empty" in err or "message text is empty" in err:
             return await bot.send_message(chat_id, "·", **kwargs)
+        if kwargs.get("message_thread_id") and is_forum_thread_missing_error(e):
+            kwargs.pop("message_thread_id", None)
+            return await bot.send_message(chat_id, text, **kwargs)
         raise
 
 

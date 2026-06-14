@@ -51,12 +51,27 @@ def _existing_bot_links() -> set[str]:
     return links
 
 
+def _discovery_session_path() -> Path:
+    """Сессия для discovery: отдельный аккаунт, не user_session прод-парсера."""
+    name = os.environ.get("DISCOVERY_SESSION", "discovery_session.session").strip()
+    if not name.endswith(".session"):
+        name = f"{name}.session"
+    path = HUNTER_ROOT / name
+    if path.is_file():
+        return path
+    legacy = HUNTER_ROOT / "user_session.session"
+    if legacy.is_file():
+        return legacy
+    return path
+
+
 def _setup_parser_account(api_id: int, api_hash: str) -> None:
-    src_session = HUNTER_ROOT / "user_session.session"
+    src_session = _discovery_session_path()
     if not src_session.is_file():
         raise FileNotFoundError(
             f"Нет Telethon-сессии: {src_session}. "
-            "Сначала создайте user_session.session (create_telethon_session.py)."
+            "Создайте discovery_session.session (см. docs/CHANNEL_DISCOVERY.md) "
+            "или задайте DISCOVERY_SESSION в окружении."
         )
     ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_session, SESSION_COPY)

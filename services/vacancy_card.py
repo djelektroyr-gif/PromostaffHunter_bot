@@ -10,12 +10,15 @@ from html import escape as escape_html
 
 MSK_TZ = timezone(timedelta(hours=3))
 from services.employer_contact import (
+    display_contact_vacancy_html,
+    extract_arrow_display_contact,
     format_phone_display,
     is_phone_only_employer_contact,
     is_tg_user_id_contact,
     phone_vacancy_notice_html,
     resolve_effective_employer_contact,
     tg_user_vacancy_notice_html,
+    username_vacancy_contact_html,
 )
 from services.vacancy_enrichment import enrich_vacancy_text, resolve_map_address, extract_shift_date_token
 from services.vacancy_public_text import sanitize_vacancy_public_body
@@ -43,6 +46,10 @@ _HEADCOUNT_INLINE_RE = re.compile(
 _RATE_LINE_RE = re.compile(r"\d+\s*₽|руб|р/ч|р\.?/?\s*ч", re.I)
 _ADDRESS_LINE_RE = re.compile(
     r"(?:^|\n)\s*(?:📍|🚇|м\.|метро|адрес|локация|место)\s*[:\-]?\s*([^\n]{4,80})",
+    re.I,
+)
+_JUNK_ADDRESS_RE = re.compile(
+    r"^(?:завтра|сегодня)\s*\d{1,2}(?:\s|$)|^\d{1,2}:\d{2}$",
     re.I,
 )
 
@@ -285,15 +292,50 @@ def _extract_task_hint(sanitized_lines: list[str], headline: str | None) -> str 
 
 def _location_line(inp: VacancyCardInput) -> str | None:
     if inp.address_normalized:
-        return inp.address_normalized.strip()
+        addr = inp.address_normalized.strip()
+        if not _JUNK_ADDRESS_RE.match(addr):
+            return addr
     if inp.address and inp.address.strip():
-        return inp.address.strip()[:90]
+        addr = inp.address.strip()[:90]
+        if not _JUNK_ADDRESS_RE.match(addr):
+            return addr
     if inp.geo_tags:
         return inp.geo_tags[0]
     m = _ADDRESS_LINE_RE.search(inp.body or "")
     if m:
-        return m.group(1).strip()
+        candidate = m.group(1).strip()
+        if not _JUNK_ADDRESS_RE.match(candidate):
+            return candidate
     return None
+
+
+def _extra_preview_body_lines(
+    sanitized_lines: list[str],
+    headline: str | None,
+    task: str | None,
+    *,
+    max_lines: int = 5,
+) -> list[str]:
+    """Доп. строки описания в превью — без дубля заголовка и служебных полей."""
+    skip = {(headline or "").strip().lower(), (task or "").strip().lower()}
+    extras: list[str] = []
+    for line in sanitized_lines:
+        stripped = line.strip()
+        low = stripped.lower()
+        if not stripped or low in skip:
+            continue
+        if any(low in s or s in low for s in skip if s):
+            continue
+        if _GREETING_LINE_RE.match(stripped):
+            continue
+        if _RATE_LINE_RE.search(stripped) or _ADDRESS_LINE_RE.search(stripped):
+            continue
+        if _JUNK_ADDRESS_RE.match(stripped):
+            continue
+        extras.append(stripped[:140])
+        if len(extras) >= max_lines:
+            break
+    return extras
 
 
 def _rate_line(inp: VacancyCardInput) -> str | None:
@@ -342,6 +384,11 @@ def _shift_schedule_line(inp: VacancyCardInput) -> str | None:
 
 def _append_contact_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
     contact = resolve_effective_employer_contact(inp.author_contact, inp.body)
+    if contact and contact.startswith("@") and not is_phone_only_employer_contact(contact):
+        notice = username_vacancy_contact_html(contact)
+        if notice:
+            lines_out.append(notice)
+            return
     if is_phone_only_employer_contact(contact):
         lines_out.append(f"📞 {escape_html(format_phone_display(contact or ''))}")
         lines_out.append(phone_vacancy_notice_html())
@@ -350,6 +397,10 @@ def _append_contact_apply_notice(lines_out: list[str], inp: VacancyCardInput) ->
         notice = tg_user_vacancy_notice_html(contact or "", inp.body)
         if notice:
             lines_out.append(notice)
+            return
+    arrow_label = extract_arrow_display_contact(inp.body)
+    if arrow_label:
+        lines_out.append(display_contact_vacancy_html(arrow_label))
 
 
 def _append_phone_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> None:
@@ -389,6 +440,9 @@ def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool
     task = _extract_task_hint(sanitized, headline)
     if task and task != (headline or ""):
         lines_out.append(escape_html(task))
+
+    for extra in _extra_preview_body_lines(sanitized, headline, task):
+        lines_out.append(escape_html(extra))
 
     _append_phone_apply_notice(lines_out, ctx)
 

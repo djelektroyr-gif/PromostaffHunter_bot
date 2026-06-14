@@ -1,8 +1,13 @@
 """Безопасная отправка в forum-топики (без дубля message_thread_id)."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import asyncio
+
+import pytest
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
 from services.chat_feedback import message_answer_injects_thread_id
 from services.forum_topics import is_forum_thread_missing_error, merge_send_kwargs
@@ -53,6 +58,23 @@ def test_reply_keyboard_delivery_uses_general_topic_when_forum_enabled(monkeypat
     assert reply_keyboard_delivery_kwargs() == {"message_thread_id": 1}
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🔍 Посмотреть новые вакансии")]])
     assert with_persistent_keyboard(kb).is_persistent is True
+
+
+def test_bot_send_user_reply_keyboard_thread_missing_fallback():
+    from services.user_reply_keyboard import bot_send_user_reply_keyboard
+
+    bot = AsyncMock()
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⚙️ Настройки")]])
+    bot.send_message = AsyncMock(
+        side_effect=[
+            TelegramBadRequest(method="sendMessage", message="Bad Request: message thread not found"),
+            MagicMock(message_id=1),
+        ],
+    )
+    asyncio.run(bot_send_user_reply_keyboard(bot, 123, "Настройки", kb))
+    assert bot.send_message.await_count == 2
+    second_call = bot.send_message.await_args_list[1].kwargs
+    assert "message_thread_id" not in second_call
 
 
 def test_edit_text_must_not_get_reply_keyboard_markup():

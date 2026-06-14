@@ -37,7 +37,7 @@ def test_preview_rich_has_heading_and_table():
     assert "Краснопресненская" in html
     assert "500" in html
     assert "<footer>PromoStaff Hunter</footer>" in html
-    assert "@" not in html
+    assert "boss123" in html.lower()
 
 
 def test_full_rich_shows_visible_description():
@@ -93,4 +93,4 @@ def test_zoo_vacancy_rich_card_has_rate_date_and_body():
     assert "Добрый день" not in preview.split("Описание")[0]
     assert "зоопарк" in full.lower()
     assert "демонтаж" in full.lower()
-    assert "@" not in full
+    assert "oneday_hr3" in full.lower()
