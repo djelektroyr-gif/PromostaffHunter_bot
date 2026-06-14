@@ -6,6 +6,7 @@ import asyncio
 import logging
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from db import (
@@ -68,19 +69,35 @@ async def send_closed_notice(bot: Bot, user_id: int, vacancy_id: str) -> bool:
     text, markup = build_closed_vacancy_notice(vacancy_id)
     try:
         from config import FORUM_TOPICS_ENABLED
-        from services.forum_topics import TOPIC_RESPONSES, topic_message_kwargs
+        from services.forum_topics import (
+            TOPIC_RESPONSES,
+            is_forum_thread_missing_error,
+            topic_message_kwargs,
+        )
 
         extra = {}
         if FORUM_TOPICS_ENABLED:
             extra = topic_message_kwargs(user_id, TOPIC_RESPONSES)
-        await bot.send_message(
-            user_id,
-            text,
-            parse_mode="HTML",
-            reply_markup=markup,
-            disable_web_page_preview=True,
-            **extra,
-        )
+        try:
+            await bot.send_message(
+                user_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=markup,
+                disable_web_page_preview=True,
+                **extra,
+            )
+        except TelegramBadRequest as e:
+            if extra.get("message_thread_id") and is_forum_thread_missing_error(e):
+                await bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                    disable_web_page_preview=True,
+                )
+            else:
+                raise
         return True
     except Exception as e:
         logger.error("Не удалось уведомить пользователя %s о закрытии %s: %s", user_id, vacancy_id, e)

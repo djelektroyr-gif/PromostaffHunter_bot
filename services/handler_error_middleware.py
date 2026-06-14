@@ -39,7 +39,12 @@ class HandlerErrorAlertMiddleware(BaseMiddleware):
         try:
             return await handler(event, data)
         except TelegramBadRequest as e:
-            if "not modified" in str(e).lower() or "query is too old" in str(e).lower():
+            err = str(e).lower()
+            if "not modified" in err or "query is too old" in err:
+                return None
+            if "thread" in err and "not found" in err:
+                logger.warning("Handler TelegramBadRequest (forum thread): %s", e)
+                await _reply_user_error(bot, event)
                 return None
             raise
         except Exception as e:

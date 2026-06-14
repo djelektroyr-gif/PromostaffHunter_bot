@@ -1146,7 +1146,12 @@ async def setup_forum_topics_for_user(user_id: int):
 
 async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwargs):
     """send_message в тему лички (или general без topic_key)."""
-    from services.forum_topics import merge_send_kwargs, topic_message_kwargs
+    from services.forum_topics import (
+        is_forum_thread_missing_error,
+        merge_send_kwargs,
+        recreate_user_topic,
+        topic_message_kwargs,
+    )
 
     extra: dict = {}
     if topic_key and FORUM_TOPICS_ENABLED:
@@ -1157,8 +1162,15 @@ async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwa
     try:
         return await send_message_with_retry(user_id, **payload)
     except TelegramBadRequest as e:
-        err = str(e).lower()
-        if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
+        if topic_key and is_forum_thread_missing_error(e):
+            new_thread = await recreate_user_topic(bot, user_id, topic_key)
+            if new_thread:
+                payload["message_thread_id"] = new_thread
+                try:
+                    return await send_message_with_retry(user_id, **payload)
+                except TelegramBadRequest as e2:
+                    if not is_forum_thread_missing_error(e2):
+                        raise
             logger.warning(
                 "send_user_message: тема недоступна user=%s key=%s, fallback в общий чат",
                 user_id,
@@ -4063,19 +4075,16 @@ async def _load_feed_snapshot_async(user_id: int, *, force_refresh: bool = False
 
 
 async def _send_feed_loading_notice(message: types.Message, user_id: int) -> types.Message:
-    from services.chat_feedback import (
-        message_answer_injects_thread_id,
-        thread_id_from_message,
-        topic_thread_id,
-    )
+    from services.chat_feedback import message_answer_injects_thread_id
     from services.forum_topics import TOPIC_VACANCIES
 
-    thread_id = topic_thread_id(user_id, TOPIC_VACANCIES) or thread_id_from_message(message)
     if message_answer_injects_thread_id(message):
         return await message.answer("⏳ Собираю ленту…")
-    if thread_id is not None:
-        return await bot.send_message(message.chat.id, "⏳ Собираю ленту…", message_thread_id=thread_id)
-    return await message.answer("⏳ Собираю ленту…")
+    return await send_user_message(
+        user_id,
+        topic_key=TOPIC_VACANCIES,
+        text="⏳ Собираю ленту…",
+    )
 
 
 async def _delete_feed_loading_notice(notice: types.Message | None) -> None:
@@ -5164,13 +5173,14 @@ async def process_support_question(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username
     req_id = add_support_request(user_id, message.text, username)
+    from services.admin_inbox_alerts import notify_admin_support_request
+    from services.inbox_ack_messages import support_request_ack_text
+
     await send_user_message(
         user_id,
         topic_key="support",
-        text="✅ Ваш вопрос отправлен администратору. Ответ придёт в эту тему.",
+        text=support_request_ack_text(req_id),
     )
-    from services.admin_inbox_alerts import notify_admin_support_request
-
     await notify_admin_support_request(bot, req_id, user_id, username, message.text or "")
     await state.clear()
 
@@ -5627,10 +5637,15 @@ async def _submit_complaint_and_notify(
     vacancy_id: str,
     reason: str,
     complaint_text: str | None = None,
-) -> None:
+    *,
+    ack_message: types.Message | None = None,
+) -> int:
     from services.admin_inbox_alerts import notify_admin_complaint
+    from services.inbox_ack_messages import complaint_ack_text
 
     cid = add_complaint(user_id, vacancy_id, reason, complaint_text)
+    if ack_message is not None:
+        await ack_message.answer(complaint_ack_text(cid))
     await notify_admin_complaint(
         bot,
         cid,
@@ -5639,6 +5654,7 @@ async def _submit_complaint_and_notify(
         reason,
         complaint_text,
     )
+    return cid
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("complain_"))
@@ -5679,8 +5695,9 @@ async def complaint_reason(callback: types.CallbackQuery, state: FSMContext):
         data = await state.get_data()
         vacancy_id = data.get("vacancy_id")
         user_id = callback.from_user.id
-        await _submit_complaint_and_notify(user_id, vacancy_id, reason)
-        await callback.message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
+        await _submit_complaint_and_notify(
+            user_id, vacancy_id, reason, ack_message=callback.message,
+        )
         await state.clear()
         await safe_callback_answer(callback, "Жалоба принята")
 
@@ -5690,8 +5707,9 @@ async def complaint_text(message: types.Message, state: FSMContext):
     vacancy_id = data.get("vacancy_id")
     reason = data.get("reason")
     user_id = message.from_user.id
-    await _submit_complaint_and_notify(user_id, vacancy_id, reason, message.text)
-    await message.answer("✅ Жалоба отправлена администратору. Спасибо, что помогаете улучшить сервис!")
+    await _submit_complaint_and_notify(
+        user_id, vacancy_id, reason, message.text, ack_message=message,
+    )
     await state.clear()
 
 

@@ -2,8 +2,16 @@
 
 from types import SimpleNamespace
 
+from aiogram.exceptions import TelegramBadRequest
+
 from services.chat_feedback import message_answer_injects_thread_id
-from services.forum_topics import merge_send_kwargs
+from services.forum_topics import is_forum_thread_missing_error, merge_send_kwargs
+
+
+def test_is_forum_thread_missing_error_detects_bad_request():
+    exc = TelegramBadRequest(method="sendMessage", message="Bad Request: message thread not found")
+    assert is_forum_thread_missing_error(exc) is True
+    assert is_forum_thread_missing_error(ValueError("x")) is False
 
 
 def test_merge_send_kwargs_topic_wins_over_caller():

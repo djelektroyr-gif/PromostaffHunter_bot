@@ -2099,6 +2099,13 @@ def save_user_topic_thread(user_id: int, topic_key: str, thread_id: int):
     )
 
 
+def delete_user_topic_thread(user_id: int, topic_key: str) -> None:
+    execute(
+        "DELETE FROM user_forum_topics WHERE user_id = ? AND topic_key = ?",
+        (user_id, topic_key),
+    )
+
+
 def get_general_vacancy_pin(user_id: int) -> dict | None:
     row = fetchone(
         q("""

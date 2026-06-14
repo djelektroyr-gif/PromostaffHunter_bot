@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from db import get_user_topic_thread_id, save_user_topic_thread
+from aiogram.exceptions import TelegramBadRequest
+
+from db import delete_user_topic_thread, get_user_topic_thread_id, save_user_topic_thread
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -21,6 +23,31 @@ TOPIC_DEFINITIONS: tuple[tuple[str, str], ...] = (
     (TOPIC_RESPONSES, "📨 Отклики"),
     (TOPIC_SUPPORT, "❓ Поддержка"),
 )
+
+_TOPIC_TITLES = dict(TOPIC_DEFINITIONS)
+
+
+def is_forum_thread_missing_error(exc: BaseException) -> bool:
+    """Telegram: «message thread not found» — тема удалена или устарел thread_id в БД."""
+    if not isinstance(exc, TelegramBadRequest):
+        return False
+    err = str(exc).lower()
+    return "thread" in err and "not found" in err
+
+
+async def recreate_user_topic(bot: Bot, user_id: int, topic_key: str) -> int | None:
+    """Сбрасывает устаревший thread_id и создаёт тему заново."""
+    title = _TOPIC_TITLES.get(topic_key, topic_key)
+    delete_user_topic_thread(user_id, topic_key)
+    try:
+        topic = await bot.create_forum_topic(chat_id=user_id, name=title)
+        thread_id = int(topic.message_thread_id)
+        save_user_topic_thread(user_id, topic_key, thread_id)
+        logger.info("forum topic recreated user=%s key=%s thread=%s", user_id, topic_key, thread_id)
+        return thread_id
+    except Exception as e:
+        logger.warning("recreate_user_topic failed user=%s key=%s: %s", user_id, topic_key, e)
+        return None
 
 
 async def ensure_user_forum_topics(bot: Bot, user_id: int) -> dict[str, int]:

@@ -14,6 +14,11 @@ from services.admin_inbox_alerts import (
     format_complaint_admin_html,
     format_support_admin_html,
 )
+from services.inbox_ack_messages import (
+    INBOX_SLA_HOURS,
+    complaint_ack_text,
+    support_request_ack_text,
+)
 from services.onboarding_deeplink import apply_vacancy_deeplink_category_preselect
 
 
@@ -73,6 +78,20 @@ def test_format_complaint_admin_html():
     )
     assert "#9" in text
     assert "vac_x" in text
+
+
+def test_support_request_ack_text_includes_id_and_sla():
+    text = support_request_ack_text(42)
+    assert "№42" in text
+    assert str(INBOX_SLA_HOURS) in text
+    assert "специалисту" in text
+
+
+def test_complaint_ack_text_includes_id_and_sla():
+    text = complaint_ack_text(9)
+    assert "№9" in text
+    assert str(INBOX_SLA_HOURS) in text
+    assert "рассмотрении" in text
 
 
 def test_vac_deeplink_preselects_category(tmp_db):

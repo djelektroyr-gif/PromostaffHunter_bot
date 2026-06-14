@@ -123,6 +123,12 @@ async def refresh_monitored_chat_ids(client) -> set:
             await asyncio.sleep(0.4)
         except asyncio.TimeoutError:
             logger.warning("Таймаут резолва чата %s (%ss)", link, ENTITY_RESOLVE_TIMEOUT_SEC)
+        except TypeNotFoundError:
+            logger.error(
+                "%s: TypeNotFoundError при резолве чатов — переподключение Telethon",
+                PARSER_LABEL,
+            )
+            raise
         except Exception as e:
             logger.warning(f"Не удалось резолвить чат {link}: {e}")
     _monitored_chat_ids = ids
@@ -1018,6 +1024,19 @@ async def _periodic_scan_loop(bot_callback, closed_callback=None):
                 stats.get("chats_total"),
             )
             _mark_stats_finished(stats, error="timeout")
+        except TypeNotFoundError:
+            logger.error(
+                "%s: TypeNotFoundError при скане — принудительное переподключение "
+                "(не используйте один user_session в двух процессах)",
+                PARSER_LABEL,
+            )
+            _mark_stats_finished(stats, error="type_not_found")
+            if _realtime_client and _realtime_client.is_connected():
+                try:
+                    await _realtime_client.disconnect()
+                except Exception:
+                    pass
+            break
         except Exception as e:
             logger.error(f"Ошибка плановой проверки: {e}", exc_info=True)
             _mark_stats_finished(stats, error=str(e))
@@ -3172,6 +3191,14 @@ async def safe_get_entity(client, chat_link: str):
     except errors.rpcerrorlist.UsernameNotOccupiedError:
         logger.warning(f"⚠️ Канал не найден: {chat_link}")
         return None
+    except TypeNotFoundError as e:
+        logger.warning(
+            "⚠️ TypeNotFoundError для %s — сессия Telethon повреждена "
+            "(часто из‑за второго процесса на том же .session): %s",
+            chat_link,
+            e,
+        )
+        raise
     except Exception as e:
         logger.warning(f"⚠️ Ошибка доступа к {chat_link}: {type(e).__name__}")
         return None
