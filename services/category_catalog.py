@@ -39,7 +39,7 @@ CATEGORY_GROUP_BY_CODE: dict[str, str] = {
 
 # Новые категории (добавляются в БД через _ensure_core_categories)
 NEW_CATEGORY_ROWS: tuple[tuple[str, str, str], ...] = (
-    ("booth", "Монтаж стендов", "🏗️"),
+    ("booth", "Монтажник", "🏗️"),
     ("merchandiser", "Мерчендайзер", "🛒"),
     ("host_mc", "Ведущий", "🎤"),
     ("dj", "DJ", "🎧"),
@@ -60,7 +60,7 @@ CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
     "parking": ("Парковщик", "🚗"),
     "supervisor": ("Супервайзер", "👨‍💼"),
     "handyman": ("Разнорабочий / клининг", "🧹"),
-    "booth": ("Монтаж стендов", "🏗️"),
+    "booth": ("Монтажник", "🏗️"),
     "merchandiser": ("Мерчендайзер", "🛒"),
     "host_mc": ("Ведущий", "🎤"),
     "dj": ("DJ", "🎧"),

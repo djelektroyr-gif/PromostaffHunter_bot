@@ -111,3 +111,35 @@ def test_group_welcome_rejected():
 
 def test_promo_quality_gate_with_leaflet_verb():
     assert passes_quality_gate("promoter", PROMO_LEAFLETS) is True
+
+
+THIN_LOADER_SPAM = (
+    "Смена на склад 10.000р.\n"
+    "@contact"
+)
+
+GOOD_LOADER_STAKHANOVSKAYA = (
+    "На завтра к 9:00 нужно еще 2, будет 10 грузчиков\n"
+    "Опалечитать и грузить фуру (возможно не одну) с велосипедами, в основном в коробках, "
+    "вес 1 коробки 17кг\n"
+    "В 1 фуру влезет 198шт 33пал по 6шт, работа на целый день. "
+    "ТОЛЬКО ТЕ, КТО УМЕЕТ КРУТИТЬ СТРЕЙЧЕМ ПАЛЕТИТЫ!!!\n"
+    "500/4\n\n"
+    "Метро стахановская\n"
+    "Улица Стахановская 18ст2\n"
+    "@loader_boss"
+)
+
+
+def test_thin_loader_warehouse_line_rejected():
+    ok, cat, reason, _ = evaluate_vacancy(THIN_LOADER_SPAM, _POSTER)
+    assert ok is False
+    assert reason.startswith("quality_gate:") or reason == "no_payment"
+    assert passes_quality_gate("loader", THIN_LOADER_SPAM) is False
+
+
+def test_good_loader_dual_rate_and_address_accepted():
+    ok, cat, reason, _ = evaluate_vacancy(GOOD_LOADER_STAKHANOVSKAYA, _POSTER)
+    assert ok is True
+    assert cat == "loader"
+    assert reason == "accepted"

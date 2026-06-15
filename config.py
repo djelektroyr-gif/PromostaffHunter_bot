@@ -78,6 +78,13 @@ CHANNEL_LIVE_PHOTO_ENABLED = os.getenv("CHANNEL_LIVE_PHOTO_ENABLED", "0").strip(
     "true",
     "yes",
 )
+# Живое фото только для promo-*.png (MP4 рядом с PNG), вакансии — статичные.
+# Автозум из PNG (ffmpeg) не используем — нужны ручные/AI ролики с действием героя.
+CHANNEL_LIVE_PHOTO_PROMO_ONLY = os.getenv("CHANNEL_LIVE_PHOTO_PROMO_ONLY", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Rich Messages для карточек вакансий (sendRichMessage, Bot API 10.1)
 RICH_VACANCY_CARDS_ENABLED = os.getenv("RICH_VACANCY_CARDS_ENABLED", "1").strip().lower() in (

@@ -83,6 +83,31 @@ VACANCY_IMAGES_BY_CATEGORY: dict[str, list[str]] = {
         "vacancy-security-2.png",
         "vacancy-security-3.png",
     ],
+    "booth": [
+        "vacancy-booth-1.png",
+        "vacancy-booth-2.png",
+        "vacancy-booth-3.png",
+    ],
+    "merchandiser": [
+        "vacancy-merchandiser-1.png",
+        "vacancy-merchandiser-2.png",
+        "vacancy-merchandiser-3.png",
+    ],
+    "host_mc": [
+        "vacancy-host_mc-1.png",
+        "vacancy-host_mc-2.png",
+        "vacancy-host_mc-3.png",
+    ],
+    "dj": [
+        "vacancy-dj-1.png",
+        "vacancy-dj-2.png",
+        "vacancy-dj-3.png",
+    ],
+    "electrician": [
+        "vacancy-electrician-1.png",
+        "vacancy-electrician-2.png",
+        "vacancy-electrician-3.png",
+    ],
 }
 
 DEFAULT_VACANCY_IMAGES = [
@@ -137,6 +162,17 @@ def resolve_live_video_path(photo_path: Path | None) -> Path | None:
     if video_path.is_file():
         return video_path
     return None
+
+
+def live_photo_allowed_for(photo_path: Path | None) -> bool:
+    """Живое фото: все посты или только promo-*.png (см. CHANNEL_LIVE_PHOTO_*)."""
+    from config import CHANNEL_LIVE_PHOTO_ENABLED, CHANNEL_LIVE_PHOTO_PROMO_ONLY
+
+    if not photo_path:
+        return False
+    if photo_path.name.startswith("promo-"):
+        return CHANNEL_LIVE_PHOTO_PROMO_ONLY or CHANNEL_LIVE_PHOTO_ENABLED
+    return CHANNEL_LIVE_PHOTO_ENABLED
 
 
 def _variant_index(seed: str | None, count: int) -> int:
@@ -240,13 +276,12 @@ async def send_channel_post(
     photo_path: Path | None = None,
 ) -> Message:
     """Фото / живое фото + caption или текст, если файла нет."""
-    from config import CHANNEL_LIVE_PHOTO_ENABLED
     from services.telegram_api_capabilities import supports_live_photo
 
     if photo_path and photo_path.is_file():
         video_path = (
             resolve_live_video_path(photo_path)
-            if CHANNEL_LIVE_PHOTO_ENABLED
+            if live_photo_allowed_for(photo_path)
             else None
         )
         if video_path and supports_live_photo(bot):

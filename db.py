@@ -767,6 +767,7 @@ CHANNEL_SETTING_DEFAULTS = {
 def _ensure_core_categories(cur) -> None:
     """Добавляет категории и group_code, появившиеся после первого деплоя."""
     from services.category_catalog import (
+        CATEGORY_DISPLAY,
         CATEGORY_GROUP_BY_CODE,
         NEW_CATEGORY_ROWS,
     )
@@ -788,6 +789,11 @@ def _ensure_core_categories(cur) -> None:
         cur.execute(
             q("UPDATE categories SET group_code = ? WHERE code = ? AND (group_code IS NULL OR group_code = '')"),
             (group, code),
+        )
+    for code, (name, emoji) in CATEGORY_DISPLAY.items():
+        cur.execute(
+            q("UPDATE categories SET name = ?, emoji = ? WHERE code = ?"),
+            (name, emoji, code),
         )
 
 

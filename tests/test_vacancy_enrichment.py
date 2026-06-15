@@ -251,3 +251,27 @@ def test_channel_rate_triple_format():
     assert extract_hourly_rate_rub(text) == 500
     assert extract_min_hours(text) == 4
     assert extract_shift_rate_rub(text) == 2000
+
+
+def test_channel_rate_dual_hourly_min_hours():
+    text = "10 грузчиков\n500/4\nметро стахановская"
+    assert extract_hourly_rate_rub(text) == 500
+    assert extract_min_hours(text) == 4
+    assert extract_shift_rate_rub(text) is None
+
+
+def test_garbage_shift_on_warehouse_not_address():
+    assert not is_plausible_map_address("Смена на склад 10")
+    assert extract_address_normalized("Смена на склад 10.000р.") is None
+
+
+def test_address_strips_trailing_telegram_mention():
+    text = (
+        "Метро стахановская\n"
+        "Улица Стахановская 18ст2\n"
+        "@loader_boss"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "стахановская" in addr.lower()
+    assert "@" not in addr

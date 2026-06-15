@@ -2056,6 +2056,9 @@ _CATEGORY_KEYWORDS = {
         "клинер", "cleaning",
     ],
     "booth": [
+        "монтажник", "монтажники", "постановщик", "постановщиц", "декоратор",
+        "декоратор мероприят", "декоратор выстав", "оформител", "монтаж декор",
+        "монтаж оформ", "монтаж сцен", "монтаж конструкц",
         "монтаж стенд", "монтаж стендов", "монтаж выставоч", "застройка стенд",
         "застройщик", "стендов", "выставочн", "баннер", "натяжк баннер",
         "октанорм", "octanorm", "павильон", "конструкц", "забор стенд",
@@ -2132,8 +2135,9 @@ def is_skilled_trade_spam(text: str) -> bool:
 
 
 _BOOTH_HINTS = (
+    "монтажник", "постановщик", "декоратор", "оформител",
     "стенд", "выставочн", "баннер", "застройк", "октанорм", "octanorm",
-    "павильон", "конструкц",
+    "павильон", "конструкц", "монтаж декор", "монтаж оформ",
 )
 _LABOR_HINTS = (
     "грузчик", "упаковщик", "фасовщик", "комплектовщик", "разгруз", "погруз", "выгруз",
@@ -2153,6 +2157,22 @@ _LOADER_CORE_HINTS = (
     "подсобник", "упаковщик", "фасовщик", "50 кг", "тележк",
     "помощь мастерам", "на лесах", "лесах", "конвейер", "фасовоч",
 )
+_LOADER_STRONG_HINTS = tuple(
+    hint for hint in _LOADER_CORE_HINTS if hint != "склад"
+)
+_LOADER_WAREHOUSE_COMBO_RE = re.compile(
+    r"грузчик|разгруз|погруз|выгруз|фура|паллет|кладовщ|комплектовщ",
+    re.I,
+)
+
+
+def _loader_role_confirmed(tl: str) -> bool:
+    """Грузчик: явная роль или склад вместе с погрузкой/разгрузкой — не одно слово «склад»."""
+    if any(w in tl for w in _LOADER_STRONG_HINTS):
+        return True
+    if "склад" in tl and _LOADER_WAREHOUSE_COMBO_RE.search(tl):
+        return True
+    return False
 _PROMO_HINTS = (
     "промоутер", "листовок", "визиток", "промо-акция", "раздача листовок",
     "раздача визиток", "раздавать листовки", "раздавать листовок",
@@ -3109,7 +3129,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
                 return False
         if any(w in tl for w in _HANDYMAN_LOADER_REJECT) and not any(w in tl for w in _LOADER_CORE_HINTS):
             return False
-        if any(w in tl for w in _LOADER_CORE_HINTS):
+        if _loader_role_confirmed(tl):
             return True
         if (
             "уборка" in tl
@@ -3218,6 +3238,8 @@ def _eligible_for_soft_ingest(category: str, text: str) -> bool:
     if category == "loader" and any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
         if not (has_event_ctx or has_shift_ctx):
             return False
+    if category == "loader" and not _loader_role_confirmed(tl):
+        return False
     return True
 
 

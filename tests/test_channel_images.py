@@ -33,6 +33,11 @@ from services.channel_images import (
         ("parking", "vacancy-parking-1.png"),
         ("hostess", "vacancy-hostess-1.png"),
         ("driver", "vacancy-driver-1.png"),
+        ("booth", "vacancy-booth-1.png"),
+        ("merchandiser", "vacancy-merchandiser-1.png"),
+        ("host_mc", "vacancy-host_mc-1.png"),
+        ("dj", "vacancy-dj-1.png"),
+        ("electrician", "vacancy-electrician-1.png"),
         ("unknown_cat", "vacancy-default-1.png"),
     ],
 )
@@ -154,16 +159,32 @@ def test_resolve_live_video_path_pairs_png(tmp_path):
     assert resolve_live_video_path(photo) == video
 
 
+def test_live_photo_promo_off_by_default(monkeypatch):
+    monkeypatch.delenv("CHANNEL_LIVE_PHOTO_PROMO_ONLY", raising=False)
+    monkeypatch.delenv("CHANNEL_LIVE_PHOTO_ENABLED", raising=False)
+    import importlib
+    import config
+
+    importlib.reload(config)
+    from pathlib import Path
+
+    from services.channel_images import live_photo_allowed_for
+
+    assert live_photo_allowed_for(Path("promo-categories.png")) is False
+    assert live_photo_allowed_for(Path("vacancy-loader-1.png")) is False
+
+
 def test_send_channel_post_live_photo(monkeypatch, tmp_path):
-    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "1")
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "0")
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_PROMO_ONLY", "1")
     import importlib
     import config
 
     importlib.reload(config)
 
-    photo = tmp_path / "vacancy-promoter-1.png"
+    photo = tmp_path / "promo-categories.png"
     photo.write_bytes(b"\x89PNG\r\n\x1a\n")
-    video = tmp_path / "vacancy-promoter-1.mp4"
+    video = tmp_path / "promo-categories.mp4"
     video.write_bytes(b"fake-mp4")
 
     bot = MagicMock()
@@ -183,15 +204,16 @@ def test_send_channel_post_live_photo(monkeypatch, tmp_path):
 
 
 def test_send_channel_post_live_photo_fallback_on_error(monkeypatch, tmp_path):
-    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "1")
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_ENABLED", "0")
+    monkeypatch.setenv("CHANNEL_LIVE_PHOTO_PROMO_ONLY", "1")
     import importlib
     import config
 
     importlib.reload(config)
 
-    photo = tmp_path / "vacancy-promoter-1.png"
+    photo = tmp_path / "promo-categories.png"
     photo.write_bytes(b"\x89PNG\r\n\x1a\n")
-    video = tmp_path / "vacancy-promoter-1.mp4"
+    video = tmp_path / "promo-categories.mp4"
     video.write_bytes(b"fake-mp4")
 
     bot = MagicMock()

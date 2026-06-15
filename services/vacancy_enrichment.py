@@ -36,9 +36,11 @@ _LANDMARK_RE = re.compile(
 _GARBAGE_ADDR_RE = re.compile(
     r"кандидат|рассмотрим|опыт\s+работ|активн\w*\s+промо|старше\s+\d|"
     r"только\s+(?:актив|промо|опыт)|отклик|анкет|whatsapp|telegram|"
-    r"начинается|работа\s+нач|начало\s*:?\s*\d",
+    r"начинается|работа\s+нач|начало\s*:?\s*\d|"
+    r"смена\s+на\s+склад",
     re.IGNORECASE,
 )
+_TELEGRAM_MENTION_RE = re.compile(r"@\w+", re.I)
 _MAP_WORTHY_RE = re.compile(
     r"вднх|vdnh|выставочн|метро|м\.|ул\.|улица|проспект|пр-т|наб\.|шоссе|"
     r"бульвар|проезд|тц|трц|москва|област|район|"
@@ -287,6 +289,20 @@ def _is_label_only(value: str) -> bool:
     return cleaned in _LABEL_ONLY_WORDS or cleaned in ("место работы",)
 
 
+def _sanitize_address_fragment(value: str) -> str:
+    """Убираем @username и хвостовую пунктуацию — не часть адреса."""
+    if not value:
+        return value
+    return _TELEGRAM_MENTION_RE.sub("", value).strip(" .,—-")
+
+
+def _finalize_address(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = _sanitize_address_fragment(value.strip())
+    return cleaned or None
+
+
 def is_plausible_map_address(text: str | None) -> bool:
     """Отсекаем мусор вроде «кандидатов старше 18»; пропускаем ВДНХ, улицы, метро."""
     if not text:
@@ -356,8 +372,10 @@ def _extract_bare_line_address(text: str) -> str | None:
     if not text:
         return None
     for match in _BARE_LINE_ADDRESS_RE.finditer(text):
-        candidate = match.group(1).strip(" .,-—")
+        candidate = _sanitize_address_fragment(match.group(1).strip(" .,-—"))
         if len(candidate) < 8:
+            continue
+        if _GARBAGE_ADDR_RE.search(candidate):
             continue
         if re.search(r"\d{3,4}\s*/\s*\d", candidate):
             continue
@@ -451,21 +469,29 @@ def _extract_freeform_address(text: str) -> str | None:
 
 def extract_address_normalized(text: str, legacy_address: str | None = None) -> str | None:
     if not text:
-        return legacy_address.strip() if legacy_address else None
+        leg = _finalize_address(legacy_address)
+        return leg if leg and is_plausible_map_address(leg) else None
+
+    def _ok(candidate: str | None) -> str | None:
+        cleaned = _finalize_address(candidate)
+        if cleaned and is_plausible_map_address(cleaned):
+            return cleaned
+        return None
+
     block = _extract_location_block(text)
     if block:
-        return block
+        return _ok(block)
     pin_line = _extract_pin_inline_address(text)
-    if pin_line and is_plausible_map_address(pin_line):
-        return pin_line
+    if pin_line:
+        return _ok(pin_line)
     explicit = _EXPLICIT_ADDR_RE.search(text)
     if explicit:
-        return explicit.group(1).strip(" .,")
+        return _ok(explicit.group(1).strip(" .,"))
     city_street = _CITY_STREET_RE.search(text)
     if city_street:
         city = city_street.group(1).strip()
         street = city_street.group(2).strip(" .,")
-        return f"{city}, {street}"
+        return _ok(f"{city}, {street}")
     venue = _VENUE_RE.search(text)
     if venue:
         venue_text = venue.group(1).strip()
@@ -478,35 +504,33 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
             return f"{_city_display_name(city_match, names)}, {venue_text}"
         return venue_text
     landmark = _extract_landmark_address(text)
-    if landmark and is_plausible_map_address(landmark):
-        return landmark
+    if landmark:
+        return _ok(landmark)
     mo_region = _extract_mo_region_address(text)
     if mo_region:
-        return mo_region
+        return _ok(mo_region)
     bare = _extract_bare_line_address(text)
     if bare:
-        return bare
+        return _ok(bare)
     freeform = _extract_freeform_address(text)
     if freeform:
-        return freeform
+        return _ok(freeform)
     metro = _METRO_ADDR_RE.search(text)
     if metro:
         station = metro.group(1).strip(" .,")
         if re.search(r"\bмосква\b", text, re.I):
-            return f"Москва, метро {station}"
-        return f"метро {station}"
+            return _ok(f"Москва, метро {station}")
+        return _ok(f"метро {station}")
     boulevard = _BOULEVARD_ONLY_RE.search(text)
     if boulevard:
-        return f"Москва, {boulevard.group(1).strip()}"
+        return _ok(f"Москва, {boulevard.group(1).strip()}")
     if legacy_address and legacy_address.strip():
-        leg = legacy_address.strip()
-        if is_plausible_map_address(leg):
-            return leg
+        return _ok(legacy_address.strip())
     city_only = _match_city_slug(text)
     if city_only:
         for slug, names in _load_city_catalog():
             if slug == city_only:
-                return _city_display_name(slug, names)
+                return _ok(_city_display_name(slug, names))
     return None
 
 

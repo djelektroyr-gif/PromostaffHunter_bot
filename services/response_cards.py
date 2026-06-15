@@ -32,7 +32,7 @@ _CATEGORY_NAMES = {
     "waiter": "Официант", "driver": "Водитель", "security": "Охранник",
     "parking": "Парковщик", "supervisor": "Супервайзер",
     "handyman": "Разнорабочий / клининг",
-    "booth": "Монтаж стендов", "merchandiser": "Мерчендайзер",
+    "booth": "Монтажник", "merchandiser": "Мерчендайзер",
     "host_mc": "Ведущий", "dj": "DJ", "electrician": "Электромонтаж",
     "misc": "Другая смена",
 }

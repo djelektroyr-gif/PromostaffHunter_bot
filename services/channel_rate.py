@@ -15,6 +15,11 @@ _TRIPLE_RATE_RE = re.compile(
     r"(\d{3,4})\s*/\s*(\d{1,2})\s*/\s*(\d{3,5})",
     re.I,
 )
+# 500/4 — ₽/ч и минимум часов без суммы смены (частый формат в чатах грузчиков).
+_DUAL_RATE_RE = re.compile(
+    r"(\d{3,4})\s*/\s*(\d{1,2})(?!\s*/\s*\d)",
+    re.I,
+)
 
 _HOURLY_PATTERNS = (
     re.compile(r"(\d{3,4})\s*[₽р]\s*/\s*ч(?:ас)?", re.I),
@@ -85,6 +90,13 @@ def extract_hourly_rate_rub(text: str) -> int | None:
                 found.append(hourly)
         except (ValueError, IndexError):
             pass
+    for match in _DUAL_RATE_RE.finditer(text):
+        try:
+            hourly = int(match.group(1))
+        except (ValueError, IndexError):
+            continue
+        if 200 <= hourly <= 5000:
+            found.append(hourly)
     for pattern in _HOURLY_PATTERNS:
         for match in pattern.finditer(text):
             try:
@@ -133,6 +145,14 @@ def extract_min_hours(text: str) -> int | None:
     if triple:
         try:
             hours = int(triple.group(2))
+            if 1 <= hours <= 16:
+                return hours
+        except (ValueError, IndexError):
+            pass
+    dual = _DUAL_RATE_RE.search(text)
+    if dual:
+        try:
+            hours = int(dual.group(2))
             if 1 <= hours <= 16:
                 return hours
         except (ValueError, IndexError):
