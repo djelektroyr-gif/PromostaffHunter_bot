@@ -6,6 +6,7 @@ from html import escape as escape_html
 
 from services.vacancy_card import (
     VacancyCardInput,
+    _CHANNEL_NO_CONTACT_CTA,
     _append_phone_apply_notice,
     _extract_headline,
     _extract_task_hint,
@@ -44,7 +45,9 @@ def _facts_table(inp: VacancyCardInput) -> str | None:
     return "<table>" + "".join(rows) + "</table>"
 
 
-def _footer_lines(inp: VacancyCardInput) -> list[str]:
+def _footer_lines(inp: VacancyCardInput, *, show_employer_contact: bool = True) -> list[str]:
+    if not show_employer_contact:
+        return [_CHANNEL_NO_CONTACT_CTA]
     lines_out: list[str] = []
     _append_phone_apply_notice(lines_out, inp)
     return lines_out
@@ -54,6 +57,7 @@ def build_vacancy_preview_rich_html(
     inp: VacancyCardInput,
     *,
     show_published_at: bool = True,
+    show_employer_contact: bool = True,
 ) -> str:
     """Компактная rich-карточка: заголовок, таблица фактов, подсказка."""
     ctx = _merge_enrichment(inp)
@@ -77,7 +81,7 @@ def build_vacancy_preview_rich_html(
     if task and task != (headline or ""):
         parts.append(f"<p>{escape_html(task)}</p>")
 
-    footer = _footer_lines(ctx)
+    footer = _footer_lines(ctx, show_employer_contact=show_employer_contact)
     if footer:
         parts.extend(footer)
     elif len(parts) == 1:
@@ -97,7 +101,11 @@ def _format_public_body_rich_html(description: str) -> str:
     return "\n".join(parts)
 
 
-def build_vacancy_full_rich_html(inp: VacancyCardInput) -> str:
+def build_vacancy_full_rich_html(
+    inp: VacancyCardInput,
+    *,
+    show_employer_contact: bool = True,
+) -> str:
     """Полная rich-карточка: факты + видимый текст (без details — Telegram Rich их не раскрывает)."""
     ctx = _merge_enrichment(inp)
     parts: list[str] = [
@@ -120,7 +128,7 @@ def build_vacancy_full_rich_html(inp: VacancyCardInput) -> str:
             "<p>Описание уточняется — нажмите «Откликнуться», чтобы связаться.</p>"
         )
 
-    footer = _footer_lines(ctx)
+    footer = _footer_lines(ctx, show_employer_contact=show_employer_contact)
     if footer:
         parts.extend(footer)
 
@@ -128,13 +136,29 @@ def build_vacancy_full_rich_html(inp: VacancyCardInput) -> str:
     return "\n".join(parts)
 
 
-def build_vacancy_card_html_fallback(inp: VacancyCardInput, *, expanded: bool) -> str:
+def build_vacancy_card_html_fallback(
+    inp: VacancyCardInput,
+    *,
+    expanded: bool,
+    show_employer_contact: bool = True,
+) -> str:
     if expanded:
         return build_vacancy_full_html(inp)
-    return build_vacancy_preview_html(inp)
+    return build_vacancy_preview_html(
+        inp,
+        show_employer_contact=show_employer_contact,
+    )
 
 
-def build_vacancy_card_rich_html(inp: VacancyCardInput, *, expanded: bool) -> str:
+def build_vacancy_card_rich_html(
+    inp: VacancyCardInput,
+    *,
+    expanded: bool,
+    show_employer_contact: bool = True,
+) -> str:
     if expanded:
-        return build_vacancy_full_rich_html(inp)
-    return build_vacancy_preview_rich_html(inp)
+        return build_vacancy_full_rich_html(inp, show_employer_contact=show_employer_contact)
+    return build_vacancy_preview_rich_html(
+        inp,
+        show_employer_contact=show_employer_contact,
+    )

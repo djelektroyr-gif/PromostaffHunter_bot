@@ -23,6 +23,9 @@ from services.employer_contact import (
 from services.vacancy_enrichment import enrich_vacancy_text, resolve_map_address, extract_shift_date_token
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
+_CHANNEL_NO_CONTACT_CTA = (
+    "ℹ️ <i>Контакт заказчика — в боте по кнопке «📋 Открыть в боте».</i>"
+)
 _HEADLINE_RE = re.compile(
     r"(?:^|\n)\s*((?:нужн\w*|требу\w*|ищ\w*)\s+\d+\s+[^\n]{3,60})",
     re.I | re.MULTILINE,
@@ -407,11 +410,16 @@ def _append_phone_apply_notice(lines_out: list[str], inp: VacancyCardInput) -> N
     _append_contact_apply_notice(lines_out, inp)
 
 
-def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool = True) -> str:
+def build_vacancy_preview_html(
+    inp: VacancyCardInput,
+    *,
+    show_published_at: bool = True,
+    show_employer_contact: bool = True,
+) -> str:
     """Компактная карточка — канал, push, лента.
 
-    Канал: роль · свежесть → заголовок → адрес → смена → ставка → задача.
-    Бот: то же + строка «Опубликовано: …» сразу под шапкой.
+    Канал: без контакта заказчика (`show_employer_contact=False`).
+    Бот/push: с контактом для отклика.
     """
     ctx = _merge_enrichment(inp)
     lines_out: list[str] = [
@@ -444,7 +452,10 @@ def build_vacancy_preview_html(inp: VacancyCardInput, *, show_published_at: bool
     for extra in _extra_preview_body_lines(sanitized, headline, task):
         lines_out.append(escape_html(extra))
 
-    _append_phone_apply_notice(lines_out, ctx)
+    if show_employer_contact:
+        _append_phone_apply_notice(lines_out, ctx)
+    else:
+        lines_out.append(_CHANNEL_NO_CONTACT_CTA)
 
     if len(lines_out) == 1:
         lines_out.append("Подробности — по кнопке «Открыть вакансию».")

@@ -2683,6 +2683,10 @@ async def send_vacancy_to_subscribers(order: dict):
         location_lon=order.get("location_lon") or (mod_row[15] if mod_row else None),
         category_scores_json=order.get("category_scores_json"),
     )
+    from services.vacancy_card import build_vacancy_preview_html
+
+    push_preview_html = build_vacancy_preview_html(card_inp, show_published_at=True)
+
     for subscriber in subscribers:
         if not is_user_premium(subscriber['user_id']):
             skipped_free += 1
@@ -2731,7 +2735,7 @@ async def send_vacancy_to_subscribers(order: dict):
                     bot,
                     uid,
                     vacancy_id,
-                    text,
+                    push_preview_html,
                     keyboard,
                     rebuild_keyboard=_rebuild_kb,
                     ensure_topics=setup_forum_topics_for_user,

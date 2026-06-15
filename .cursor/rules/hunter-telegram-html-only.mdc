@@ -1,0 +1,37 @@
+---
+description: Hunter bot — только HTML/Rich для сообщений, Markdown запрещён в новом коде
+globs: "**/*.py"
+alwaysApply: true
+---
+
+# Hunter — разметка сообщений Telegram
+
+## Обязательно
+
+- **Новый** пользовательский и админский текст в боте — только **`parse_mode="HTML"`** или **`sendRichMessage`** (Rich HTML, Bot API 10.1).
+- Пользовательские данные в тексте — **`html.escape`** / `escape_html` из `services.vacancy_card` / `parser.escape_html`.
+- Длинные отчёты — **`chunk_text_for_telegram`** (`services/telegram_chunks.py`), не резать строку посередине тега.
+
+## Запрещено в новом коде
+
+- `parse_mode="Markdown"` и `parse_mode="MarkdownV2"` для **новых** хендлеров и сервисов.
+- Сырые `*жирный*` / `_курсив_` в прод-текстах без HTML-экранирования.
+
+## Исключения (legacy, трогать только при миграции)
+
+- Существующие экраны в `main.py` на Markdown — переводить на HTML при правке, не расширять Markdown.
+- `parse_mode=None` — для коротких ответов без разметки («Введите телефон»).
+
+## Карточки вакансий
+
+| Аудитория | Контакт заказчика |
+|-----------|-------------------|
+| **Канал** (`services/channel_post.py`) | **Нет** — `show_employer_contact=False` |
+| **Push / лента / бот** | **Да** — `show_employer_contact=True` (по умолчанию) |
+
+Канал: кнопка «📋 Открыть в боте»; контакт только после входа в бота.
+
+## Rich vs HTML
+
+- Карточки вакансий: `services/vacancy_card_rich.py` + fallback `vacancy_card.py`.
+- Простые справки/отчёты: достаточно HTML; Rich — где нужны таблицы и единый footer.

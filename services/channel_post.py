@@ -62,7 +62,7 @@ def build_channel_preview_text(
         shift_date=shift_date,
         shift_time_start=shift_time_start,
     )
-    return build_vacancy_preview_html(inp, show_published_at=False)
+    return build_vacancy_preview_html(inp, show_published_at=False, show_employer_contact=False)
 
 
 def build_channel_preview_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
@@ -144,7 +144,11 @@ async def post_vacancy_preview_to_channel(
             category_emoji=category_emoji,
             category_code=category_code,
         )
-        text = build_vacancy_preview_html(inp, show_published_at=False)
+        text = build_vacancy_preview_html(
+            inp,
+            show_published_at=False,
+            show_employer_contact=False,
+        )
     else:
         text = build_channel_preview_text(
             category_name=category_name,

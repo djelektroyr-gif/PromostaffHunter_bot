@@ -1,7 +1,27 @@
 # -*- coding: utf-8 -*-
 """Контакт заказчика в превью карточки."""
 
+from services.channel_post import build_channel_preview_text
 from services.vacancy_card import VacancyCardInput, build_vacancy_preview_html
+
+
+def test_channel_preview_hides_employer_contact():
+    body = (
+        "Завтра 9:30\n"
+        "💰 450 ₽/ч\n"
+        "👉 @DispIvan"
+    )
+    text = build_channel_preview_text(
+        category_name="Грузчик",
+        category_emoji="📦",
+        category_code="loader",
+        body=body,
+        source="Secret",
+        freshness="🟢 Свежая",
+    )
+    assert "DispIvan" not in text
+    assert "t.me/DispIvan" not in text
+    assert "в боте" in text.lower()
 
 
 def test_preview_shows_username_contact():
