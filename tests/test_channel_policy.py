@@ -38,3 +38,28 @@ def test_loader_rate_gate(monkeypatch):
     )
     assert not bad
     assert reason == "loader_rate"
+
+
+def test_misc_not_crossposted_to_channel(monkeypatch):
+    monkeypatch.setattr("services.channel_policy.is_channel_crosspost_enabled", lambda: True)
+    monkeypatch.setattr("services.channel_policy.count_channel_vacancy_posts_in_msk_hour", lambda cat=None: 0)
+    monkeypatch.setattr("services.channel_policy.get_channel_hourly_limit_total", lambda: 6)
+    monkeypatch.setattr("services.channel_policy.get_channel_quiet_hours", lambda: (9, 22))
+
+    noon = datetime(2026, 6, 3, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+    ok, reason = evaluate_channel_crosspost(
+        "misc",
+        "Нужны 3 человека на объект, оплата 3000",
+        now=noon,
+    )
+    assert not ok
+    assert reason == "misc_category"
+
+    forced, forced_reason = evaluate_channel_crosspost(
+        "misc",
+        "Нужны 3 человека на объект, оплата 3000",
+        force=True,
+        now=noon,
+    )
+    assert forced
+    assert forced_reason == "admin_force"

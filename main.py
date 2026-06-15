@@ -2687,11 +2687,25 @@ async def send_vacancy_to_subscribers(order: dict):
 
     push_preview_html = build_vacancy_preview_html(card_inp, show_published_at=True)
 
+    from parser import find_cluster_vacancy_ids
+
+    author_contact = order.get("author_contact") or ""
+    cluster_ids = find_cluster_vacancy_ids(
+        msg_text,
+        author_contact,
+        category_code,
+        exclude_id=vacancy_id,
+    )
+
     for subscriber in subscribers:
         if not is_user_premium(subscriber['user_id']):
             skipped_free += 1
             continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
+            continue
+        if cluster_ids and any(
+            has_user_received_vacancy(subscriber['user_id'], cid) for cid in cluster_ids
+        ):
             continue
         prefs = get_subscriber_filter_prefs_effective(subscriber['user_id'])
         ok, filter_reason = vacancy_matches_subscriber(

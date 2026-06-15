@@ -3063,13 +3063,14 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
         if vac_row and vac_row[0]:
             try:
                 from parser import find_cluster_vacancy_ids
+                from config import VACANCY_DEDUPE_DAYS
 
                 extra = find_cluster_vacancy_ids(
                     vac_row[0],
                     vac_row[2],
                     vac_row[1],
                     exclude_id=vacancy_id,
-                    max_age_days=3,
+                    max_age_days=VACANCY_DEDUPE_DAYS,
                 )
                 cluster_ids.extend(extra)
             except Exception:

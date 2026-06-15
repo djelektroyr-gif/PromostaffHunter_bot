@@ -53,6 +53,69 @@ def test_cross_channel_headline_duplicate(monkeypatch):
     assert dup in ("headline", "campaign", "fuzzy")
 
 
+def test_daily_repost_same_dedupe_key():
+    import parser as p
+
+    day1 = (
+        "Завтра 14.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38\n"
+        "офисный переезд\n"
+        "450/4/1800"
+    )
+    day2 = (
+        "Завтра 15.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38\n"
+        "офисный переезд\n"
+        "450/4/1800"
+    )
+    assert p.build_vacancy_dedupe_key(day1, "@boss") == p.build_vacancy_dedupe_key(day2, "@boss")
+
+
+def test_daily_repost_detected_as_duplicate(monkeypatch):
+    import parser as p
+
+    stored = (
+        "Завтра 14.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38\n"
+        "офисный переезд\n"
+        "450/4/1800\n"
+        "@evgeniy_boss"
+    )
+    repost = (
+        "Завтра 15.06 к 11:45\n"
+        "Нужен 1 Грузчик РФ, 18+\n"
+        "г. Москва, ул. Муравская, д. 38\n"
+        "офисный переезд\n"
+        "450/4/1800\n"
+        "@evgeniy_boss"
+    )
+
+    def fake_recent(*_a, **_k):
+        return [{
+            "id": "v_old",
+            "message_text": stored,
+            "author_contact": "@evgeniy_boss",
+            "dedupe_key": "old_key",
+            "source_chat_title": "Channel A",
+            "category_code": "loader",
+        }]
+
+    monkeypatch.setattr(p, "has_recent_duplicate_vacancy", lambda *_a, **_k: False)
+    monkeypatch.setattr(p, "get_recent_open_vacancies_for_dedupe", fake_recent)
+
+    dup = p.detect_duplicate_type(
+        repost,
+        "@evgeniy_boss",
+        p.build_vacancy_dedupe_key(repost, "@evgeniy_boss"),
+        "loader",
+        "Channel B",
+    )
+    assert dup in ("exact", "fuzzy", "campaign")
+
+
 def test_find_cluster_vacancy_ids_cross_channel(monkeypatch):
     import parser as p
 

@@ -13,6 +13,7 @@ from config import (
     API_ID, API_HASH, get_telegram_session_name, describe_session_search,
     HELPER_KEYWORDS, EXCLUDE_CATEGORIES, STOP_PHRASES,
     HIRING_VERBS, ONE_TIME_JOB_KEYWORDS, PAYMENT_INDICATORS, VACANCY_MAX_AGE_HOURS,
+    VACANCY_DEDUPE_DAYS,
 )
 from db import (
     get_target_chats, is_message_processed, mark_vacancy_closed,
@@ -1682,17 +1683,35 @@ def _normalize_for_dedupe(text: str) -> str:
 
 
 def _normalize_for_fuzzy_dedupe(text: str) -> str:
-    """Убирает дату/адрес — ловит повторы одной кампании с разными локациями."""
-    normalized = _normalize_for_dedupe(text)
-    normalized = re.sub(
+    """Убирает дату/время/адрес — ловит повторы одной кампании с разными датами."""
+    raw = text or ""
+    raw = re.sub(
         r"\b\d{1,2}[\.\-/]\d{1,2}(?:[\.\-/]\d{2,4})?\b",
+        " ",
+        raw,
+        flags=re.I,
+    )
+    raw = re.sub(
+        r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|"
+        r"сентября|октября|ноября|декабря)(?:\s+\d{4})?\b",
+        " ",
+        raw,
+        flags=re.I,
+    )
+    raw = re.sub(r"\b\d{1,2}[:.]\d{2}(?:\s*[-–]\s*\d{1,2}[:.]\d{2})?\b", " ", raw)
+    normalized = _normalize_for_dedupe(raw)
+    normalized = re.sub(
+        r"\b\d{1,2}\s+\d{1,2}(?:\s+\d{2,4})?\b",
         " ",
         normalized,
     )
+    normalized = re.sub(r"\b\d{1,2}\s+\d{2}\b", " ", normalized)
     normalized = re.sub(
-        r"\b(завтра|сегодня|послезавтра|метро|м\.|ул\.|улица|проспект|пр\.)\b",
+        r"\b(завтра|сегодня|послезавтра|на завтра|к \d{1,2}|с \d{1,2}|"
+        r"метро|м\.|ул\.|улица|проспект|пр\.|пн|вт|ср|чт|пт|сб|вс)\b",
         " ",
         normalized,
+        flags=re.I,
     )
     normalized = re.sub(
         r"\b(москва|мо|подмосков|лобня|немчиновка|калужская|русаковская|победы)\b",
@@ -1703,7 +1722,7 @@ def _normalize_for_fuzzy_dedupe(text: str) -> str:
 
 
 def build_vacancy_dedupe_key(text: str, author_contact: str) -> str:
-    normalized_text = _normalize_for_dedupe(text)[:280]
+    normalized_text = _normalize_for_fuzzy_dedupe(text)[:280]
     normalized_contact = (author_contact or "").strip().lower()
     payload = f"{normalized_contact}|{normalized_text}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:24]
@@ -1737,12 +1756,13 @@ def find_cluster_vacancy_ids(
     category_code: str | None,
     *,
     exclude_id: str | None = None,
-    max_age_days: int = 3,
+    max_age_days: int | None = None,
 ) -> list[str]:
     """Открытые вакансии того же кластера (cross-channel headline/campaign/fuzzy)."""
     from services.vacancy_dedupe import find_cluster_vacancy_ids as _find_ids
 
-    recent = get_recent_open_vacancies_for_dedupe(max_age_days=max_age_days, limit=400)
+    days = max_age_days if max_age_days is not None else VACANCY_DEDUPE_DAYS
+    recent = get_recent_open_vacancies_for_dedupe(max_age_days=days, limit=500)
     return _find_ids(
         text,
         author_contact,
@@ -1763,8 +1783,10 @@ def detect_duplicate_type(
     dedupe_key: str,
     category_code: str | None = None,
     source_chat_title: str | None = None,
+    *,
+    exclude_id: str | None = None,
 ) -> str | None:
-    if has_recent_duplicate_vacancy(dedupe_key, max_age_days=1):
+    if has_recent_duplicate_vacancy(dedupe_key, max_age_days=VACANCY_DEDUPE_DAYS):
         return "exact"
     normalized_text = _normalize_for_dedupe(text)
     fuzzy_text = _normalize_for_fuzzy_dedupe(text)
@@ -1777,8 +1799,10 @@ def detect_duplicate_type(
     usernames = _extract_telegram_usernames(text, author_contact)
     campaign_fp = extract_campaign_fingerprint(text)
     headline_fp = _extract_headline_fingerprint(text)
-    recent = get_recent_open_vacancies_for_dedupe(max_age_days=1, limit=250)
+    recent = get_recent_open_vacancies_for_dedupe(max_age_days=VACANCY_DEDUPE_DAYS, limit=500)
     for row in recent:
+        if exclude_id and row.get("id") == exclude_id:
+            continue
         reason = cluster_duplicate_reason(
             text,
             author_contact,

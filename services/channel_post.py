@@ -95,6 +95,29 @@ async def post_vacancy_preview_to_channel(
 ) -> bool:
     if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
         return False
+    from db import get_vacancy_push_row
+    from parser import build_vacancy_dedupe_key, detect_duplicate_type
+
+    row = get_vacancy_push_row(vacancy_id)
+    author_contact = (row[3] if row else None) or ""
+    if not force:
+        dup_key = build_vacancy_dedupe_key(body or "", author_contact)
+        dup_type = detect_duplicate_type(
+            body or "",
+            author_contact,
+            dup_key,
+            category_code,
+            None,
+            exclude_id=vacancy_id,
+        )
+        if dup_type:
+            logger.info(
+                "Channel skip vacancy_id=%s cat=%s content_duplicate=%s",
+                vacancy_id,
+                category_code,
+                dup_type,
+            )
+            return False
     already = is_vacancy_channel_posted(vacancy_id)
     allowed, reason = evaluate_channel_crosspost(
         category_code,
@@ -133,9 +156,6 @@ async def post_vacancy_preview_to_channel(
             )
             release_vacancy_channel_post(vacancy_id)
             return False
-    from db import get_vacancy_push_row
-
-    row = get_vacancy_push_row(vacancy_id)
     if row:
         inp = card_input_from_push_row(
             row,

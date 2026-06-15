@@ -24,6 +24,7 @@ SKIP_LABELS = {
     "loader_quota": "квота грузчик 1/ч",
     "loader_rate": "грузчик: ставка ниже минимума или не указана ₽/ч",
     "already_posted": "уже опубликовано",
+    "misc_category": "Другая смена — только в боте",
 }
 
 
@@ -50,6 +51,8 @@ def evaluate_channel_crosspost(
         return True, "admin_force"
     if already_posted:
         return False, "already_posted"
+    if category_code == "misc":
+        return False, "misc_category"
     if not is_channel_crosspost_enabled():
         return False, "disabled"
     now = now or msk_now()

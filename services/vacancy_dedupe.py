@@ -108,9 +108,6 @@ def cluster_duplicate_reason(
     cand_text = candidate.get("message_text", "")
     if order_numbers and order_numbers & extract_order_numbers(cand_text):
         return "order_number"
-    cand_cat = candidate.get("category_code")
-    if category_code and cand_cat and category_code != cand_cat:
-        return None
 
     cand_campaign = extract_campaign_fingerprint(cand_text)
     if campaign_fp and cand_campaign:

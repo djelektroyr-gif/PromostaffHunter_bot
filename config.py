@@ -20,6 +20,8 @@ SUBSCRIPTION_CARD_HINT = os.getenv("SUBSCRIPTION_CARD_HINT", "").strip()
 
 # Окно свежести вакансий (часы) — при парсинге
 VACANCY_MAX_AGE_HOURS = int(os.getenv("VACANCY_MAX_AGE_HOURS", "36"))
+# Окно дедупа: одна и та же кампания с новой датой/репостом не сохраняется повторно
+VACANCY_DEDUPE_DAYS = int(os.getenv("VACANCY_DEDUPE_DAYS", "7"))
 
 # Лента «Посмотреть новые»: свежие (ч) и архив (макс. возраст, ч)
 FEED_FRESH_HOURS = int(os.getenv("FEED_FRESH_HOURS", "24"))
