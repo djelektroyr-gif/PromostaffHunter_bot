@@ -97,3 +97,32 @@ def test_preview_fallback_when_sparse_body():
     text = build_vacancy_preview_html(inp)
     assert "Промоутер" in text
     assert "spam_only" in text.lower()
+
+
+def test_format_published_at_bad_timestamp_empty():
+    from services.vacancy_card import format_vacancy_published_at
+
+    assert format_vacancy_published_at("not-a-real-date") == ""
+    assert format_vacancy_published_at(None) == ""
+
+
+def test_push_row_min_hours_on_card():
+    from services.vacancy_card import card_input_from_push_row
+    from services.vacancy_rate import format_vacancy_rate_line
+
+    row = [None] * 23
+    row[0] = "Грузчики, разгрузка"
+    row[5] = "loader"
+    row[18] = 2000
+    row[19] = 4
+    inp = card_input_from_push_row(
+        tuple(row),
+        freshness="🟢 Свежая",
+        category_name="Грузчик",
+        category_emoji="📦",
+        category_code="loader",
+    )
+    rate = format_vacancy_rate_line(body=row[0], rate_shift=inp.rate_shift, min_hours=inp.min_hours)
+    assert rate is not None
+    assert "от 4 ч" in rate
+

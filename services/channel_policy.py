@@ -19,7 +19,7 @@ MSK = ZoneInfo("Europe/Moscow")
 
 SKIP_LABELS = {
     "disabled": "автопост выключен в настройках",
-    "quiet_hours": "тихие часы (09:00–22:00 МСК)",
+    "quiet_hours": "вне окна публикации",
     "hourly_limit": "лимит вакансий в час",
     "loader_quota": "квота грузчик 1/ч",
     "loader_rate": "грузчик: ставка ниже минимума или не указана ₽/ч",
@@ -72,4 +72,7 @@ def evaluate_channel_crosspost(
 
 
 def format_skip_reason(code: str) -> str:
+    if code == "quiet_hours":
+        start_h, end_h = get_channel_quiet_hours()
+        return f"вне окна публикации ({start_h:02d}:00–{end_h:02d}:00 МСК)"
     return SKIP_LABELS.get(code, code)

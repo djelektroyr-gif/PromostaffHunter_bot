@@ -1,7 +1,11 @@
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from services.channel_policy import evaluate_channel_crosspost, is_within_channel_posting_hours
+from services.channel_policy import (
+    evaluate_channel_crosspost,
+    format_skip_reason,
+    is_within_channel_posting_hours,
+)
 from services.channel_rate import extract_hourly_rate_rub
 
 
@@ -18,6 +22,13 @@ def test_quiet_hours(monkeypatch):
     assert is_within_channel_posting_hours(datetime(2026, 6, 3, 10, 0, tzinfo=tz))
     assert not is_within_channel_posting_hours(datetime(2026, 6, 3, 8, 30, tzinfo=tz))
     assert not is_within_channel_posting_hours(datetime(2026, 6, 3, 22, 0, tzinfo=tz))
+
+
+def test_quiet_hours_skip_label_uses_posting_window(monkeypatch):
+    monkeypatch.setattr("services.channel_policy.get_channel_quiet_hours", lambda: (9, 22))
+    label = format_skip_reason("quiet_hours")
+    assert "09:00–22:00" in label
+    assert "вне окна" in label
 
 
 def test_loader_rate_gate(monkeypatch):

@@ -128,7 +128,7 @@ def format_vacancy_published_at(raw_dt) -> str:
     """Время поста → «дд.мм.гггг чч:мм МСК» для превью."""
     dt = _coerce_db_datetime(raw_dt)
     if dt is None:
-        return "сейчас" if raw_dt else ""
+        return ""
     return dt.astimezone(MSK_TZ).strftime("%d.%m.%Y %H:%M МСК")
 
 
@@ -177,8 +177,9 @@ def card_input_from_push_row(
         geo_tags=_parse_geo_tags(geo_raw),
         rate_hourly=row[17] if row and len(row) > 17 else None,
         rate_shift=row[18] if row and len(row) > 18 else None,
-        shift_date=row[20] if row and len(row) > 20 else None,
-        shift_time_start=row[21] if row and len(row) > 21 else None,
+        min_hours=row[19] if row and len(row) > 19 else None,
+        shift_date=row[21] if row and len(row) > 21 else None,
+        shift_time_start=row[22] if row and len(row) > 22 else None,
         author_contact=row[3] if row else None,
     )
     return _merge_enrichment(base)

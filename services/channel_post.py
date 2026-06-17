@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 
 from aiogram.types import InlineKeyboardMarkup
 
-from config import BOT_USERNAME, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID
+from config import BOT_USERNAME, HUNTER_CHANNEL_ID
+from services.channel_gate import is_vacancy_channel_autopost_enabled
 from db import (
     is_vacancy_channel_posted,
     mark_vacancy_channel_posted,
@@ -93,7 +94,7 @@ async def post_vacancy_preview_to_channel(
     freshness: str,
     force: bool = False,
 ) -> bool:
-    if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
+    if not is_vacancy_channel_autopost_enabled():
         return False
     from db import get_vacancy_push_row
     from parser import build_vacancy_dedupe_key, detect_duplicate_type

@@ -154,6 +154,21 @@ def test_release_vacancy_channel_post_on_failure(tmp_db):
     assert try_reserve_vacancy_channel_post("vac_ch2", "helper") is True
 
 
+def test_stale_channel_reserve_reclaimed(tmp_db):
+    from datetime import datetime, timedelta, timezone
+
+    from db import execute, q
+
+    assert try_reserve_vacancy_channel_post("vac_stale", "loader") is True
+    assert try_reserve_vacancy_channel_post("vac_stale", "loader") is False
+    old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    execute(
+        q("UPDATE vacancy_channel_posts SET posted_at = ? WHERE vacancy_id = ?"),
+        (old, "vac_stale"),
+    )
+    assert try_reserve_vacancy_channel_post("vac_stale", "loader") is True
+
+
 def test_count_published_channel_vacancy_posts(tmp_db):
     assert count_published_channel_vacancy_posts("loader") == 0
     mark_vacancy_channel_posted("v1", category_code="loader", message_id=1)

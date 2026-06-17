@@ -1973,7 +1973,7 @@ def get_vacancy_push_row(vacancy_id: str):
                   category_code, source_chat, dedupe_key, published_at, poster_user_id,
                   poster_username, moderation_status, posted_by_bot_user_id,
                   address_normalized, location_lat, location_lon,
-                  geo_tags, rate_hourly, rate_shift, rate_effective_hourly,
+                  geo_tags, rate_hourly, rate_shift, min_hours, rate_effective_hourly,
                   shift_date, shift_time_start
            FROM vacancies WHERE id = ?""",
         (vacancy_id,),
@@ -2157,10 +2157,50 @@ def is_vacancy_channel_posted(vacancy_id: str) -> bool:
     return bool(row)
 
 
+CHANNEL_POST_RESERVE_STALE_MINUTES = 15
+
+
+def _parse_channel_posted_at(raw) -> datetime | None:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    text = str(raw).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(text[:26], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _channel_post_reserve_is_stale(posted_at_raw, *, stale_minutes: int = CHANNEL_POST_RESERVE_STALE_MINUTES) -> bool:
+    posted_at = _parse_channel_posted_at(posted_at_raw)
+    if posted_at is None:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+    return posted_at < cutoff
+
+
 def try_reserve_vacancy_channel_post(vacancy_id: str, category_code: str | None = None) -> bool:
     """Резервирует слот в канале до send_message (message_id пока NULL)."""
     if is_vacancy_channel_posted(vacancy_id):
         return False
+    pending = fetchone(
+        "SELECT message_id, posted_at FROM vacancy_channel_posts WHERE vacancy_id = ?",
+        (vacancy_id,),
+    )
+    if pending:
+        if pending[0] is not None:
+            return False
+        if not _channel_post_reserve_is_stale(pending[1]):
+            return False
+        release_vacancy_channel_post(vacancy_id)
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(

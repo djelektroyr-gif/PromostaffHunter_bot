@@ -301,7 +301,7 @@ RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
 GIFT_PRESET_DAYS = (7, 14, 30, 90)
 _processing_finish: set[int] = set()
-_processing_respond: set[int] = set()
+_processing_respond: set[tuple[int, str]] = set()
 _broadcast_lock = asyncio.Lock()
 
 
@@ -650,6 +650,48 @@ async def _mark_vacancy_card_responded(
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
             logger.debug("mark_vacancy_card_responded: %s", e)
+
+
+async def _notify_response_user(
+    text: str,
+    *,
+    callback: types.CallbackQuery | None = None,
+    message: types.Message | None = None,
+    show_alert: bool = False,
+) -> None:
+    if callback:
+        await callback.answer(text, show_alert=show_alert)
+    elif message:
+        await message.answer(text)
+
+
+def build_admin_response_notify_html(
+    profile: dict,
+    *,
+    source_chat: str,
+    vacancy_link: str,
+) -> str:
+    """HTML для алерта админу — без MarkdownV2 и с экранированием полей."""
+    uid = int(profile["user_id"])
+    name = escape_html(profile.get("full_name") or "—")
+    age = escape_html(str(profile.get("age") or "—"))
+    phone = escape_html(profile.get("phone") or "—")
+    username = profile.get("username")
+    username_line = f"@{escape_html(username)}" if username else "нет"
+    source = escape_html(source_chat or "—")
+    link = escape_html(vacancy_link or "—")
+    return (
+        "🔔 <b>НОВЫЙ ОТКЛИК НА ВАКАНСИЮ!</b>\n\n"
+        f"📢 Источник: {source}\n"
+        f"🔗 Ссылка: <a href=\"{link}\">{link}</a>\n\n"
+        "👤 <b>Кандидат:</b>\n"
+        f"• ФИО: {name}\n"
+        f"• Возраст: {age} лет\n"
+        f"• Телефон: {phone}\n"
+        f"• Username: {username_line}\n\n"
+        f"📞 Свяжитесь с кандидатом: <a href=\"tg://user?id={uid}\">{name}</a>\n\n"
+        "⚠️ <b>Контакт заказчика не найден!</b> Перешлите анкету вручную."
+    )
 
 
 async def _offer_feed_session_restart(message: types.Message) -> None:
@@ -2782,7 +2824,8 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
-    if CHANNEL_CROSSPOST_ENABLED and HUNTER_CHANNEL_ID:
+    from services.channel_gate import is_vacancy_channel_autopost_enabled
+    if sent_count > 0 and is_vacancy_channel_autopost_enabled():
         from services.channel_post import post_vacancy_preview_to_channel
         spawn_background_task(post_vacancy_preview_to_channel(
             bot,
@@ -2968,10 +3011,12 @@ def get_admin_channel_keyboard() -> ReplyKeyboardMarkup:
 
 
 def _channel_env_ok() -> bool:
-    return bool(CHANNEL_CROSSPOST_ENABLED and HUNTER_CHANNEL_ID)
+    from services.channel_gate import is_channel_env_configured
+    return is_channel_env_configured()
 
 
 def build_channel_admin_status_html() -> str:
+    from services.channel_gate import is_channel_env_configured, is_vacancy_channel_autopost_enabled
     from services.channel_policy import is_within_channel_posting_hours, msk_now
 
     total_hour = count_channel_vacancy_posts_in_msk_hour()
@@ -2979,22 +3024,28 @@ def build_channel_admin_status_html() -> str:
     lim_total = get_channel_hourly_limit_total()
     lim_loader = get_channel_hourly_limit_loader()
     min_rate = get_channel_loader_min_rate()
-    xpost = is_channel_crosspost_enabled()
+    xpost_db = is_channel_crosspost_enabled()
+    autopost_live = is_vacancy_channel_autopost_enabled()
     promo = is_channel_promo_enabled()
     promo_times = ", ".join(get_channel_promo_times())
     qstart, qend = get_channel_quiet_hours()
     posting_ok = is_within_channel_posting_hours()
-    env_line = "✅ Канал подключён" if _channel_env_ok() else "❌ Нет HUNTER_CHANNEL_ID / env"
+    env_line = "✅ Канал подключён" if is_channel_env_configured() else "❌ Нет HUNTER_CHANNEL_ID / env"
     now_msk = msk_now().strftime("%H:%M")
+    autopost_line = "🟢 вкл" if autopost_live else "🔴 выкл"
+    if is_channel_env_configured() and not xpost_db:
+        autopost_line += " (выкл в настройках бота)"
+    elif not is_channel_env_configured():
+        autopost_line += " (нет env CHANNEL_CROSSPOST_ENABLED)"
     return (
         f"<b>📺 Канал @promostaff_agency_job</b>\n"
         f"{env_line} · сейчас {escape_html(now_msk)} МСК\n\n"
-        f"<b>Автопост вакансий:</b> {'🟢 вкл' if xpost else '🔴 выкл'}\n"
+        f"<b>Автопост вакансий:</b> {autopost_line}\n"
         f"<b>Промо ({escape_html(promo_times)}):</b> {'🟢 вкл' if promo else '🔴 выкл'}\n\n"
         f"В этом часе: <b>{total_hour}/{lim_total}</b> вакансий"
         f" (грузчик: {loader_hour}/{lim_loader}, от {min_rate} ₽/ч)\n"
         f"Окно публикаций: {qstart:02d}:00–{qend:02d}:00 МСК — "
-        f"{'✅ можно постить' if posting_ok else '⏸ тихие часы'}\n\n"
+        f"{'✅ можно постить' if posting_ok else '⏸ вне окна'}\n\n"
         f"<i>Ручная публикация по ID — без лимитов. "
         f"Кнопки ниже меняют настройки без Bothost.</i>"
     )
@@ -5789,14 +5840,20 @@ async def _execute_response_flow(
     user_id: int,
     vacancy_id: str,
     state: FSMContext,
+    *,
+    origin_message: types.Message | None = None,
 ) -> None:
     profile = get_subscriber_profile(user_id)
     if not profile:
         return
     vacancy_row = get_vacancy_row(vacancy_id)
     if not vacancy_row:
-        if callback:
-            await callback.answer("❌ Вакансия не найдена", show_alert=True)
+        await _notify_response_user(
+            "❌ Вакансия не найдена",
+            callback=callback,
+            message=origin_message,
+            show_alert=True,
+        )
         return
     vacancy_text, vacancy_link, source_chat, saved_contact, address = unpack_vacancy_row_basic(vacancy_row)
     vac_snippet = vacancy_text[:200] if vacancy_text else None
@@ -5819,16 +5876,24 @@ async def _execute_response_flow(
             source_chat_title=source_chat,
             draft_status="admin_forward",
         ):
-            if callback:
-                await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+            await _notify_response_user(
+                "❌ Вы уже откликались на эту вакансию!",
+                callback=callback,
+                message=origin_message,
+                show_alert=True,
+            )
             return
         from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
         record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id, "via": "admin_forward"})
         if callback:
             await _mark_vacancy_card_responded(callback, vacancy_id, address)
-            await send_to_admin(
-                callback, profile, vacancy_row, build_candidate_profile_text(profile), profile.get("photo_file_id"),
-            )
+        await send_to_admin(
+            profile,
+            vacancy_row,
+            photo_file_id=profile.get("photo_file_id"),
+            callback=callback,
+            message=origin_message,
+        )
         await _apply_response_slot_charge(user_id, vacancy_id)
         return
     if not add_response(
@@ -5841,19 +5906,25 @@ async def _execute_response_flow(
         source_chat_title=source_chat,
         draft_status="pending",
     ):
-        if callback:
-            await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
+        await _notify_response_user(
+            "❌ Вы уже откликались на эту вакансию!",
+            callback=callback,
+            message=origin_message,
+            show_alert=True,
+        )
         return
     from services.bot_events import EVENT_RESPONSE_SENT, record_bot_event
     record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id})
-    await _apply_response_slot_charge(user_id, vacancy_id)
     if callback:
         await _mark_vacancy_card_responded(callback, vacancy_id, address)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
-    if callback:
-        await callback.answer("Готовлю черновик…")
+    await _notify_response_user(
+        "Готовлю черновик…",
+        callback=callback,
+        message=origin_message,
+    )
     from services.forum_topics import TOPIC_RESPONSES
     from services.chat_feedback import thread_id_from_message, topic_thread_id, typing_keepalive
     resp_thread = None
@@ -5861,6 +5932,9 @@ async def _execute_response_flow(
     if callback and callback.message:
         resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(callback.message)
         chat_id = callback.message.chat.id
+    elif origin_message:
+        resp_thread = topic_thread_id(user_id, TOPIC_RESPONSES) or thread_id_from_message(origin_message)
+        chat_id = origin_message.chat.id
     draft_status = "failed"
     try:
         async with typing_keepalive(bot, chat_id, message_thread_id=resp_thread):
@@ -5882,6 +5956,7 @@ async def _execute_response_flow(
                 employer_contact=employer_contact,
                 source_chat_title=source_chat,
             )
+        await _apply_response_slot_charge(user_id, vacancy_id)
     except Exception as e:
         logger.exception("_execute_response_flow user=%s vac=%s: %s", user_id, vacancy_id, e)
         try:
@@ -5912,6 +5987,7 @@ async def _execute_response_flow(
                 topic_key=TOPIC_RESPONSES,
                 text="📨 Отклик сохранён — «📨 Мои отклики». Отправьте сообщение заказчику вручную.",
             )
+            await _apply_response_slot_charge(user_id, vacancy_id)
         except Exception as e2:
             logger.exception("_execute_response_flow fallback failed: %s", e2)
             await notify_admin_response_issue(
@@ -5955,7 +6031,7 @@ async def continue_response_after_registration(
             reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
         )
         return
-    await _execute_response_flow(None, user_id, vacancy_id, state)
+    await _execute_response_flow(None, user_id, vacancy_id, state, origin_message=message)
 
 
 @dp.callback_query(
@@ -5971,7 +6047,8 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
     if is_already_responded(user_id, vacancy_id):
         await callback.answer("❌ Вы уже откликались на эту вакансию!", show_alert=True)
         return
-    if user_id in _processing_respond:
+    respond_key = (user_id, vacancy_id)
+    if respond_key in _processing_respond:
         await callback.answer("⏳ Уже отправляем отклик…")
         return
     profile = get_subscriber_profile(user_id)
@@ -5998,11 +6075,11 @@ async def handle_response(callback: types.CallbackQuery, state: FSMContext):
             reply_markup=build_response_paywall_keyboard(vacancy_id, user_id),
         )
         return
-    _processing_respond.add(user_id)
+    _processing_respond.add(respond_key)
     try:
         await _execute_response_flow(callback, user_id, vacancy_id, state)
     finally:
-        _processing_respond.discard(user_id)
+        _processing_respond.discard(respond_key)
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("respond_llm_"))
 async def respond_llm_enhance(callback: types.CallbackQuery, state: FSMContext):
@@ -6333,7 +6410,7 @@ async def successful_payment_handler(message: types.Message, state: FSMContext):
             await message.answer("✅ Оплата принята. Вы уже откликались на эту вакансию.")
             return
         await message.answer("✅ Оплата принята! Отправляю отклик…")
-        await _execute_response_flow(None, user_id, vacancy_id, state)
+        await _execute_response_flow(None, user_id, vacancy_id, state, origin_message=message)
         return
     if not payload.startswith("ext_resp:"):
         return
@@ -6543,33 +6620,56 @@ async def send_application(target, user_id: int, vacancy_id: str, photo_file_id:
             await bot.send_message(YOUR_USER_ID, f"✅ *Анкета отправлена заказчику!*\n\n👤 Кандидат: {profile['full_name']}\n📢 Вакансия: {source_chat}\n👨‍💼 Контакт: {employer_contact}", parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Не удалось отправить заказчику {employer_contact}: {e}")
-            await send_to_admin(target, profile, vacancy_row, candidate_questionnaire, photo_file_id)
+            await send_to_admin(
+                profile,
+                vacancy_row,
+                photo_file_id=photo_file_id,
+                callback=target if isinstance(target, types.CallbackQuery) else None,
+                message=target if isinstance(target, types.Message) else None,
+            )
     else:
-        await send_to_admin(target, profile, vacancy_row, candidate_questionnaire, photo_file_id)
+        await send_to_admin(
+            profile,
+            vacancy_row,
+            photo_file_id=photo_file_id,
+            callback=target if isinstance(target, types.CallbackQuery) else None,
+            message=target if isinstance(target, types.Message) else None,
+        )
 
-async def send_to_admin(target, profile: dict, vacancy_row: tuple, candidate_questionnaire: str, photo_file_id: str = None):
-    vacancy_text, vacancy_link, source_chat, _, address = unpack_vacancy_row_basic(vacancy_row)
-    user_link = f"[{profile['full_name']}](tg://user?id={profile['user_id']})"
-    admin_message = (
-        f"🔔 *НОВЫЙ ОТКЛИК НА ВАКАНСИЮ!*\n\n"
-        f"📢 Источник: {source_chat}\n"
-        f"🔗 Ссылка: {vacancy_link}\n\n"
-        f"👤 *Кандидат:*\n"
-        f"• ФИО: {profile['full_name']}\n"
-        f"• Возраст: {profile['age']} лет\n"
-        f"• Телефон: {profile['phone']}\n"
-        f"• Username: @{profile['username'] if profile['username'] else 'нет'}\n\n"
-        f"📞 Свяжитесь с кандидатом: {user_link}\n\n"
-        f"⚠️ *Контакт заказчика не найден!* Перешлите анкету вручную."
+
+async def send_to_admin(
+    profile: dict,
+    vacancy_row: tuple,
+    *,
+    photo_file_id: str | None = None,
+    callback: types.CallbackQuery | None = None,
+    message: types.Message | None = None,
+    candidate_questionnaire: str | None = None,
+):
+    vacancy_text, vacancy_link, source_chat, _, _address = unpack_vacancy_row_basic(vacancy_row)
+    admin_message = build_admin_response_notify_html(
+        profile,
+        source_chat=source_chat or "",
+        vacancy_link=vacancy_link or "",
     )
     if photo_file_id or profile.get("photo_storage_path"):
         await send_profile_photo(
             bot, YOUR_USER_ID, profile,
-            caption=admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True,
+            caption=admin_message, parse_mode="HTML", disable_web_page_preview=True,
         )
     else:
-        await bot.send_message(YOUR_USER_ID, admin_message, parse_mode="MarkdownV2", disable_web_page_preview=True)
-    await target.answer("✅ Отклик отправлен администратору! Он свяжется с вами.", show_alert=True)
+        await bot.send_message(
+            YOUR_USER_ID,
+            admin_message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    await _notify_response_user(
+        "✅ Отклик отправлен администратору! Он свяжется с вами.",
+        callback=callback,
+        message=message,
+        show_alert=True,
+    )
 
 @dp.callback_query(lambda c: c.data == "already_responded")
 async def already_responded(callback: types.CallbackQuery):
