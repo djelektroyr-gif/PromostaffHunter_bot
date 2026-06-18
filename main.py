@@ -212,7 +212,9 @@ async def notify_admin_moderation(vacancy_id: str, category_code: str, preview: 
 
 async def channel_post_for_vacancy(vacancy_id: str, *, force: bool = False) -> str:
     """Кросс-пост превью в @promostaff_agency_job. Возвращает текст для админа."""
-    if not CHANNEL_CROSSPOST_ENABLED or not HUNTER_CHANNEL_ID:
+    from services.channel_gate import is_channel_env_configured
+
+    if not is_channel_env_configured():
         return (
             "❌ Канал не настроен. Задайте `CHANNEL_CROSSPOST_ENABLED=1` "
             "и `HUNTER_CHANNEL_ID` на Bothost."
@@ -2660,9 +2662,34 @@ async def send_vacancy_to_subscribers(order: dict):
         order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
     )
     mod_row = get_vacancy_push_row(vacancy_id)
-    if mod_row and mod_row[11] not in (None, "approved"):
-        logger.info(f"Push skip {vacancy_id}: moderation_status={mod_row[11]}")
+    from services.vacancy_push_row import (
+        PUSH_IDX_MODERATION,
+        push_field,
+    )
+
+    if mod_row and push_field(mod_row, PUSH_IDX_MODERATION) not in (None, "approved"):
+        logger.info(f"Push skip {vacancy_id}: moderation_status={push_field(mod_row, PUSH_IDX_MODERATION)}")
         return
+
+    published_raw = order.get("published_at")
+    published_at = format_publication_time(published_raw)
+    freshness = get_freshness_label(published_raw)
+    cat_name = get_category_name(category_code)
+
+    from services.vacancy_channel_dispatch import schedule_vacancy_channel_crosspost
+
+    schedule_vacancy_channel_crosspost(
+        spawn_background_task,
+        bot,
+        order=order,
+        vacancy_id=vacancy_id,
+        category_code=category_code,
+        category_name=cat_name,
+        category_emoji=get_category_emoji(category_code),
+        body=msg_text,
+        freshness=freshness,
+    )
+
     subscribers = get_subscribers_for_vacancy(
         category_code,
         order.get("category_scores_json"),
@@ -2671,10 +2698,6 @@ async def send_vacancy_to_subscribers(order: dict):
         logger.info(f"Нет подписчиков на категорию {category_code}")
         return
 
-    published_raw = order.get("published_at")
-    published_at = format_publication_time(published_raw)
-    freshness = get_freshness_label(published_raw)
-    cat_name = get_category_name(category_code)
     from services.vacancy_card import card_input_from_order
 
     card_inp = card_input_from_order(
@@ -2706,23 +2729,34 @@ async def send_vacancy_to_subscribers(order: dict):
     from services.vacancy_category_match import vacancy_matching_user_categories
     from db import add_push_digest_pending
 
+    from services.vacancy_push_row import (
+        PUSH_IDX_ADDRESS_NORM,
+        PUSH_IDX_GEO_TAGS,
+        PUSH_IDX_LAT,
+        PUSH_IDX_LON,
+        PUSH_IDX_RATE_EFFECTIVE,
+        PUSH_IDX_RATE_HOURLY,
+        PUSH_IDX_RATE_SHIFT,
+        PUSH_IDX_SHIFT_DATE,
+        PUSH_IDX_SHIFT_TIME_START,
+        push_field,
+    )
+
     vac_match = build_vacancy_match_dict(
         message_text=msg_text,
         address=address,
-        address_normalized=order.get("address_normalized") or (mod_row[13] if mod_row else None),
+        address_normalized=order.get("address_normalized") or push_field(mod_row, PUSH_IDX_ADDRESS_NORM),
         category_code=category_code,
-        geo_tags=order.get("geo_tags") or (mod_row[16] if mod_row and len(mod_row) > 16 else None),
-        rate_hourly=order.get("rate_hourly") or (mod_row[17] if mod_row and len(mod_row) > 17 else None),
-        rate_shift=order.get("rate_shift") or (mod_row[18] if mod_row and len(mod_row) > 18 else None),
-        rate_effective_hourly=order.get("rate_effective_hourly") or (
-            mod_row[19] if mod_row and len(mod_row) > 19 else None
+        geo_tags=order.get("geo_tags") or push_field(mod_row, PUSH_IDX_GEO_TAGS),
+        rate_hourly=order.get("rate_hourly") or push_field(mod_row, PUSH_IDX_RATE_HOURLY),
+        rate_shift=order.get("rate_shift") or push_field(mod_row, PUSH_IDX_RATE_SHIFT),
+        rate_effective_hourly=order.get("rate_effective_hourly") or push_field(
+            mod_row, PUSH_IDX_RATE_EFFECTIVE
         ),
-        shift_date=order.get("shift_date") or (mod_row[20] if mod_row and len(mod_row) > 20 else None),
-        shift_time_start=order.get("shift_time_start") or (
-            mod_row[21] if mod_row and len(mod_row) > 21 else None
-        ),
-        location_lat=order.get("location_lat") or (mod_row[14] if mod_row else None),
-        location_lon=order.get("location_lon") or (mod_row[15] if mod_row else None),
+        shift_date=order.get("shift_date") or push_field(mod_row, PUSH_IDX_SHIFT_DATE),
+        shift_time_start=order.get("shift_time_start") or push_field(mod_row, PUSH_IDX_SHIFT_TIME_START),
+        location_lat=order.get("location_lat") or push_field(mod_row, PUSH_IDX_LAT),
+        location_lon=order.get("location_lon") or push_field(mod_row, PUSH_IDX_LON),
         category_scores_json=order.get("category_scores_json"),
     )
     from services.vacancy_card import build_vacancy_preview_html
@@ -2824,19 +2858,6 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)
-    from services.channel_gate import is_vacancy_channel_autopost_enabled
-    if sent_count > 0 and is_vacancy_channel_autopost_enabled():
-        from services.channel_post import post_vacancy_preview_to_channel
-        spawn_background_task(post_vacancy_preview_to_channel(
-            bot,
-            vacancy_id=vacancy_id,
-            category_code=category_code,
-            category_name=cat_name,
-            category_emoji=get_category_emoji(category_code),
-            body=msg_text,
-            source=order.get("chat_title") or "—",
-            freshness=freshness,
-        ))
 
 # ========== УВЕДОМЛЕНИЕ О ЗАКРЫТИИ ВАКАНСИЙ ==========
 
