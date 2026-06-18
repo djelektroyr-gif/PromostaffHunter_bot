@@ -1,7 +1,8 @@
-"""Одна актуальная вакансия в General — предыдущие уходят в топик «Вакансии»."""
+"""Одна актуальная вакансия в General — история в топике «Вакансии»."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -22,6 +23,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_user_pin_locks: dict[int, asyncio.Lock] = {}
+
+
+def _user_pin_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_pin_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_pin_locks[user_id] = lock
+    return lock
+
+
+def _delivery_kwargs(user_id: int, topic_key: str | None) -> dict:
+    """General в forum-личке = message_thread_id 1 (как reply-меню), иначе delete не совпадает."""
+    from config import FORUM_TOPICS_ENABLED
+    from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
+
+    if topic_key:
+        return topic_message_kwargs(user_id, topic_key)
+    if FORUM_TOPICS_ENABLED:
+        return {"message_thread_id": GENERAL_TOPIC_THREAD_ID}
+    return {}
+
 
 async def _send_html_card(
     bot: Bot,
@@ -31,7 +54,7 @@ async def _send_html_card(
     *,
     topic_key: str | None,
 ) -> int | None:
-    extra = topic_message_kwargs(user_id, topic_key) if topic_key else {}
+    extra = _delivery_kwargs(user_id, topic_key)
     try:
         msg = await bot.send_message(
             user_id,
@@ -46,12 +69,14 @@ async def _send_html_card(
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
             logger.warning("forum_vacancy_pin: topic miss user=%s key=%s", user_id, topic_key)
+            fallback = {} if topic_key else {}
             msg = await bot.send_message(
                 user_id,
                 text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
+                **fallback,
             )
             return msg.message_id
         if "parse" in err:
@@ -67,37 +92,55 @@ async def _send_html_card(
         raise
 
 
+async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> None:
+    """Убирает предыдущую push-карточку из General (история уже в «Вакансии»)."""
+    pin = get_general_vacancy_pin(user_id)
+    if not pin:
+        return
+    message_id = pin["message_id"]
+    try:
+        await bot.delete_message(chat_id=user_id, message_id=message_id)
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if "message to delete not found" not in err:
+            logger.warning(
+                "delete general vacancy pin user=%s msg=%s: %s",
+                user_id,
+                message_id,
+                e,
+            )
+    clear_general_vacancy_pin(user_id)
+
+
+async def _append_vacancy_history(
+    bot: Bot,
+    user_id: int,
+    vacancy_id: str,
+    card_text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> None:
+    if not get_user_topic_thread_id(user_id, TOPIC_VACANCIES):
+        return
+    try:
+        await _send_html_card(
+            bot,
+            user_id,
+            card_text,
+            reply_markup,
+            topic_key=TOPIC_VACANCIES,
+        )
+    except Exception as e:
+        logger.warning("vacancy history topic user=%s vac=%s: %s", user_id, vacancy_id, e)
+
+
 async def archive_general_vacancy_to_topic(
     bot: Bot,
     user_id: int,
     *,
     rebuild_keyboard,
 ) -> None:
-    """Переносит закреплённую в General карточку в топик «Вакансии» и удаляет из General."""
-    pin = get_general_vacancy_pin(user_id)
-    if not pin:
-        return
-    message_id = pin["message_id"]
-    vacancy_id = pin["vacancy_id"]
-    card_text = pin["card_text"]
-    if get_user_topic_thread_id(user_id, TOPIC_VACANCIES):
-        try:
-            keyboard = rebuild_keyboard(vacancy_id)
-            await _send_html_card(
-                bot,
-                user_id,
-                card_text,
-                keyboard,
-                topic_key=TOPIC_VACANCIES,
-            )
-        except Exception as e:
-            logger.warning("archive vacancy to topic user=%s vac=%s: %s", user_id, vacancy_id, e)
-    try:
-        await bot.delete_message(chat_id=user_id, message_id=message_id)
-    except TelegramBadRequest as e:
-        if "message to delete not found" not in str(e).lower():
-            logger.debug("delete general vacancy pin user=%s msg=%s: %s", user_id, message_id, e)
-    clear_general_vacancy_pin(user_id)
+    """Обратная совместимость: только очистка General."""
+    await _clear_general_vacancy_display(bot, user_id)
 
 
 async def send_vacancy_push_pinned_general(
@@ -110,11 +153,14 @@ async def send_vacancy_push_pinned_general(
     rebuild_keyboard,
     ensure_topics,
 ) -> bool:
-    """Push: одна карточка в General; предыдущая → топик «Вакансии»."""
-    await ensure_topics(user_id)
-    await archive_general_vacancy_to_topic(bot, user_id, rebuild_keyboard=rebuild_keyboard)
-    msg_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
-    if msg_id is None:
-        return False
-    set_general_vacancy_pin(user_id, msg_id, vacancy_id, text)
+    """Push: одна карточка в General; копия сразу в «Вакансии»."""
+    del rebuild_keyboard  # история сохраняется при push, не при archive
+    async with _user_pin_lock(user_id):
+        await ensure_topics(user_id)
+        await _clear_general_vacancy_display(bot, user_id)
+        msg_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
+        if msg_id is None:
+            return False
+        set_general_vacancy_pin(user_id, msg_id, vacancy_id, text)
+        await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
     return True

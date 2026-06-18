@@ -89,13 +89,25 @@ async def send_closed_notice(bot: Bot, user_id: int, vacancy_id: str) -> bool:
             )
         except TelegramBadRequest as e:
             if extra.get("message_thread_id") and is_forum_thread_missing_error(e):
-                await bot.send_message(
-                    user_id,
-                    text,
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                    disable_web_page_preview=True,
-                )
+                from services.forum_topics import recreate_user_topic
+
+                new_thread = await recreate_user_topic(bot, user_id, TOPIC_RESPONSES)
+                if new_thread:
+                    await bot.send_message(
+                        user_id,
+                        text,
+                        parse_mode="HTML",
+                        reply_markup=markup,
+                        disable_web_page_preview=True,
+                        message_thread_id=new_thread,
+                    )
+                else:
+                    logger.warning(
+                        "closed notice: no responses topic user=%s vac=%s, skip general fallback",
+                        user_id,
+                        vacancy_id,
+                    )
+                    return False
             else:
                 raise
         return True
