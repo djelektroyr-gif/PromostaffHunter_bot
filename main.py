@@ -27,6 +27,9 @@ from parser import (
     format_reject_samples_report, format_channel_coverage_report, run_parser_audit,
     get_stats_for_filter_reports,
     PARSER_SCAN_TIMEOUT_SEC,
+    AUDIT_SCAN_LIMIT,
+    PARSER_AUDIT_HOURS,
+    PARSER_AUDIT_MAX_PER_CHAT,
 )
 from admin_exports import (
     build_subscribers_xlsx, build_vacancies_xlsx, build_employers_xlsx,
@@ -2643,24 +2646,11 @@ def schedule_vacancy_push(order: dict):
 
 async def send_vacancy_to_subscribers(order: dict):
     msg_text = order.get('message_text') or ''
-    poster = poster_from_order(order)
-    force_cat = order.get('category') if order.get('from_bot_employer') else None
-    accepted, category_code, gate_reason, _ = evaluate_vacancy(
-        msg_text, poster, force_category=force_cat,
-    )
-    if not accepted or not category_code:
-        vacancy_id = order.get("vacancy_id") or make_vacancy_id(
-            order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
-        )
-        logger.info(
-            f"Push skip {vacancy_id}: quality re-check ({gate_reason}), "
-            f"stored={order.get('category')}"
-        )
-        return
     dedupe_key = order.get("dedupe_key")
     vacancy_id = order.get("vacancy_id") or make_vacancy_id(
         order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
     )
+    stored_cat = order.get("category") or order.get("category_code")
     mod_row = get_vacancy_push_row(vacancy_id)
     from services.vacancy_push_row import (
         PUSH_IDX_MODERATION,
@@ -2674,21 +2664,35 @@ async def send_vacancy_to_subscribers(order: dict):
     published_raw = order.get("published_at")
     published_at = format_publication_time(published_raw)
     freshness = get_freshness_label(published_raw)
-    cat_name = get_category_name(category_code)
 
-    from services.vacancy_channel_dispatch import schedule_vacancy_channel_crosspost
+    if stored_cat:
+        from services.vacancy_channel_dispatch import schedule_vacancy_channel_crosspost
 
-    schedule_vacancy_channel_crosspost(
-        spawn_background_task,
-        bot,
-        order=order,
-        vacancy_id=vacancy_id,
-        category_code=category_code,
-        category_name=cat_name,
-        category_emoji=get_category_emoji(category_code),
-        body=msg_text,
-        freshness=freshness,
+        schedule_vacancy_channel_crosspost(
+            spawn_background_task,
+            bot,
+            order=order,
+            vacancy_id=vacancy_id,
+            category_code=stored_cat,
+            category_name=get_category_name(stored_cat),
+            category_emoji=get_category_emoji(stored_cat),
+            body=msg_text,
+            freshness=freshness,
+        )
+
+    poster = poster_from_order(order)
+    force_cat = order.get('category') if order.get('from_bot_employer') else None
+    accepted, category_code, gate_reason, _ = evaluate_vacancy(
+        msg_text, poster, force_category=force_cat,
     )
+    if not accepted or not category_code:
+        logger.info(
+            f"Push skip {vacancy_id}: quality re-check ({gate_reason}), "
+            f"stored={order.get('category')}"
+        )
+        return
+
+    cat_name = get_category_name(category_code)
 
     subscribers = get_subscribers_for_vacancy(
         category_code,
@@ -3052,6 +3056,10 @@ def build_channel_admin_status_html() -> str:
     qstart, qend = get_channel_quiet_hours()
     posting_ok = is_within_channel_posting_hours()
     env_line = "✅ Канал подключён" if is_channel_env_configured() else "❌ Нет HUNTER_CHANNEL_ID / env"
+    channel_id_line = (
+        f"ID в env: <code>{HUNTER_CHANNEL_ID}</code> (username не важен для API)\n"
+        if HUNTER_CHANNEL_ID else ""
+    )
     now_msk = msk_now().strftime("%H:%M")
     autopost_line = "🟢 вкл" if autopost_live else "🔴 выкл"
     if is_channel_env_configured() and not xpost_db:
@@ -3059,8 +3067,9 @@ def build_channel_admin_status_html() -> str:
     elif not is_channel_env_configured():
         autopost_line += " (нет env CHANNEL_CROSSPOST_ENABLED)"
     return (
-        f"<b>📺 Канал @promostaff_agency_job</b>\n"
-        f"{env_line} · сейчас {escape_html(now_msk)} МСК\n\n"
+        f"<b>📺 Канал вакансий</b> (@promostaff_hunter_job)\n"
+        f"{env_line} · сейчас {escape_html(now_msk)} МСК\n"
+        f"{channel_id_line}\n"
         f"<b>Автопост вакансий:</b> {autopost_line}\n"
         f"<b>Промо ({escape_html(promo_times)}):</b> {'🟢 вкл' if promo else '🔴 выкл'}\n\n"
         f"В этом часе: <b>{total_hour}/{lim_total}</b> вакансий"
@@ -6815,13 +6824,28 @@ async def audit_filter_cmd(message: types.Message):
                 pass
     try:
         await status_msg.edit_text(
-            "🔬 Аудит: последние посты из каждого чата через фильтр (без сохранения)…"
+            f"🔬 Аудит: посты за последние {PARSER_AUDIT_HOURS} ч из каждого чата "
+            f"(макс. {PARSER_AUDIT_MAX_PER_CHAT}/чат, без сохранения)…"
         )
         stats = await run_parser_audit()
+        tg_msgs = stats.get("telegram_messages") or 0
+        eval_blocks = stats.get("messages_scanned") or 0
+        chats_ok = stats.get("chats_ok") or 0
+        capped = stats.get("audit_capped_chats") or 0
+        digest_extra = max(0, eval_blocks - tg_msgs)
         summary = (
             f"🔬 *Аудит завершён*\n\n"
-            f"Просмотрено: {stats.get('messages_scanned', 0)} постов\n"
-            f"Прошли фильтр: {stats.get('matched', 0)} | отсеяно: {stats.get('non_relevant', 0)}\n\n"
+            f"Окно: *{PARSER_AUDIT_HOURS} ч* · чатов: {chats_ok} · "
+            f"макс. {PARSER_AUDIT_MAX_PER_CHAT} сообщ./чат\n"
+            f"Сообщений Telegram: {tg_msgs}\n"
+            f"Проверок фильтром: {eval_blocks}"
+            + (f" (+{digest_extra} из digest-постов)" if digest_extra else "")
+            + "\n"
+            f"Прошли фильтр: {stats.get('matched', 0)} | отсеяно: {stats.get('non_relevant', 0)}"
+            + (f"\n⚠️ У {capped} чатов сработал лимит — не весь суточный поток." if capped else "")
+            + "\n\n"
+            "_Сутки в активном канале могут быть 200–300+ постов — это норма. "
+            "Глубже: `PARSER_AUDIT_HOURS=48`, `PARSER_AUDIT_MAX_PER_CHAT=800`._\n\n"
             "Смотрите «📋 Примеры отсева», «📡 Покрытие каналов», «📊 Шум по чатам»."
         )
         await status_msg.edit_text(summary, parse_mode="Markdown")

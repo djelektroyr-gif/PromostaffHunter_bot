@@ -23,6 +23,8 @@ _PAYMENT_RATE_RE = re.compile(
     r"(?:заработок|доход)\s*(?:от\s*)?\d[\d\s–—\-]*(?:до|–|-|—)\s*\d+\s*(?:тыс|тысяч)|"
     r"\d[\d\s.,]*\s*(?:тыс|тысяч)\w*\s*(?:руб|₽)?\s*/\s*день|"
     r"оплат\w*[^\n]{0,40}?\d[\d\s.,]*\s*к\b|"
+    r"бюджет\w*\s+от\s*\d+.*?(?:тыс|тысяч)|"
+    r"бюджет\w*\s+\d+.*?(?:тыс|тысяч)|"
     r"(?:по\s+)?договор[её]нност"
     r")",
     re.I,
@@ -55,7 +57,7 @@ def has_payment_or_negotiated_rate(text: str) -> bool:
     if extract_hourly_rate_rub(text) or extract_shift_rate_rub(text):
         return True
     tl = text.lower()
-    for token in ("ставка", "минималка", "гонорар", "зарплат", "з/п", "оплата", "заработок"):
+    for token in ("ставка", "минималка", "гонорар", "зарплат", "з/п", "оплата", "заработок", "бюджет"):
         if token in tl:
             return True
     return is_negotiated_rate_text(text)

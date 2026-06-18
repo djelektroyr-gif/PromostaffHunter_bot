@@ -39,7 +39,9 @@ PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
 PARSER_INCREMENTAL_LOOKBACK = max(0, int(os.getenv("PARSER_INCREMENTAL_LOOKBACK", "30")))
 PARSER_WIDE_INGEST = os.getenv("PARSER_WIDE_INGEST", "1").strip().lower() in ("1", "true", "yes", "on")
-AUDIT_SCAN_LIMIT = 20
+AUDIT_SCAN_LIMIT = max(5, int(os.getenv("PARSER_AUDIT_SCAN_LIMIT", "30")))  # legacy fallback
+PARSER_AUDIT_HOURS = max(1, int(os.getenv("PARSER_AUDIT_HOURS", "24")))
+PARSER_AUDIT_MAX_PER_CHAT = max(50, int(os.getenv("PARSER_AUDIT_MAX_PER_CHAT", "500")))
 REJECT_SAMPLES_MAX = 12
 PARSER_SCAN_TIMEOUT_SEC = 1200
 ENTITY_RESOLVE_TIMEOUT_SEC = 45
@@ -898,14 +900,18 @@ def _audit_record_eval(stats: dict | None, chat_title: str, block_text: str, pos
         _record_reject_sample(stats, chat_title, reason, block_text, category=category)
 
 
-async def _audit_evaluate_message(message, chat_title: str, stats: dict | None):
+async def _audit_evaluate_message(
+    message, chat_title: str, stats: dict | None, *, fetch_poster: bool = False,
+):
     """Прогон текста через фильтр без записи в БД — для админ-аудита."""
+    if stats is not None:
+        stats["telegram_messages"] = stats.get("telegram_messages", 0) + 1
     if not message.text:
         if stats is not None:
             stats["no_text"] += 1
         _bump_chat_stat(stats, chat_title, "no_text")
         return
-    poster = await extract_poster_info(message)
+    poster = await extract_poster_info(message) if fetch_poster else None
     if should_split_digest(message.text):
         if stats is not None:
             stats["digest_posts"] = stats.get("digest_posts", 0) + 1
@@ -914,6 +920,24 @@ async def _audit_evaluate_message(message, chat_title: str, stats: dict | None):
             _audit_record_eval(stats, chat_title, enriched, poster)
         return
     _audit_record_eval(stats, chat_title, message.text, poster)
+
+
+def _message_utc(message) -> datetime:
+    d = message.date
+    if d.tzinfo is None:
+        return d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+def _audit_window_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(hours=PARSER_AUDIT_HOURS)
+
+
+def message_in_audit_window(message, cutoff: datetime | None = None) -> bool:
+    """Сообщение попадает в окно аудита (по умолчанию последние PARSER_AUDIT_HOURS ч)."""
+    if cutoff is None:
+        cutoff = _audit_window_cutoff()
+    return _message_utc(message) >= cutoff
 
 
 async def _scan_all_chats(
@@ -947,6 +971,7 @@ async def _scan_all_chats(
             stats["chats_ok"] += 1
 
         iter_kwargs = {"limit": limit_per_chat}
+        audit_cutoff = _audit_window_cutoff() if audit_only else None
         if incremental and not audit_only:
             last_id = await run_db(get_last_processed_id, chat_id)
             if last_id:
@@ -958,22 +983,38 @@ async def _scan_all_chats(
         else:
             run_kind = "scan"
         logger.info(
-            "📡 %s: чат %s/%s «%s» (incremental=%s, audit=%s)",
+            "📡 %s: чат %s/%s «%s» (incremental=%s, audit=%s%s)",
             run_kind,
             i,
             len(target_chats),
             chat_title,
             incremental and not audit_only,
             audit_only,
+            f", окно {PARSER_AUDIT_HOURS}ч" if audit_only else "",
         )
 
-        async for message in client.iter_messages(entity, **iter_kwargs):
-            if not audit_only:
-                if stats is not None:
-                    stats["messages_scanned"] += 1
-                    _bump_chat_stat(stats, chat_title, "scanned")
-                    if stats["messages_scanned"] % 25 == 0:
-                        await asyncio.sleep(0)
+        chat_audit_count = 0
+        async for message in client.iter_messages(
+            entity, **({} if audit_only else iter_kwargs),
+        ):
+            if audit_only:
+                if not message_in_audit_window(message, audit_cutoff):
+                    break
+                chat_audit_count += 1
+                if chat_audit_count > PARSER_AUDIT_MAX_PER_CHAT:
+                    if stats is not None:
+                        stats["audit_capped_chats"] = stats.get("audit_capped_chats", 0) + 1
+                    logger.warning(
+                        "🔬 Аудит: лимит %s сообщ./чат для «%s»",
+                        PARSER_AUDIT_MAX_PER_CHAT,
+                        chat_title,
+                    )
+                    break
+            elif stats is not None:
+                stats["messages_scanned"] += 1
+                _bump_chat_stat(stats, chat_title, "scanned")
+                if stats["messages_scanned"] % 25 == 0:
+                    await asyncio.sleep(0)
             try:
                 if audit_only:
                     await _audit_evaluate_message(message, chat_title, stats)
@@ -3225,15 +3266,26 @@ def _has_deferred_payment_context(text: str) -> bool:
     has_shift = any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS)
     has_people = bool(re.search(r"\d+\s*(?:чел|человек|чел\b)", tl))
     has_date = bool(re.search(r"\d{1,2}[./]\d{1,2}", tl))
-    has_pay_hint = any(w in tl for w in ("оплат", "ставк", "₽", "руб", "гонорар", "зарплат", "доход"))
-    return (has_shift or has_date) and (has_people or has_pay_hint)
+    if not has_date and re.search(
+        r"\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)",
+        tl,
+    ):
+        has_date = True
+    has_hours = bool(re.search(r"\d+\s*\+\s*\d+|\d+\s*час", tl))
+    has_pay_hint = any(w in tl for w in (
+        "оплат", "ставк", "₽", "руб", "гонорар", "зарплат", "доход", "бюджет", "тысяч", "тыс",
+    ))
+    return (has_shift or has_date or has_hours) and (has_people or has_pay_hint)
 
 
 def _has_implicit_contact_intent(text: str) -> bool:
     if not text:
         return False
     tl = text.lower()
-    return bool(re.search(r"\b(?:отклик\w*|написать|пишите|пиши|в\s+лс|личк\w*|whatsapp|ватсап)\b", tl))
+    return bool(re.search(
+        r"(?:отклик\w*|напиш\w*|пиш\w+|в\s+лс|личк\w*|whatsapp|ватсап)",
+        tl,
+    ))
 
 
 def _eligible_for_soft_ingest(category: str, text: str) -> bool:
@@ -3396,16 +3448,19 @@ async def safe_get_entity(client, chat_link: str):
         return None
 
 async def run_parser_audit() -> dict:
-    """Админ: последние посты из каждого чата через фильтр, без сохранения."""
+    """Админ: посты за последние PARSER_AUDIT_HOURS ч из каждого чата, без сохранения."""
     stats = _new_stats("audit")
     stats["reject_samples"] = []
+    stats["audit_hours"] = PARSER_AUDIT_HOURS
+    stats["audit_max_per_chat"] = PARSER_AUDIT_MAX_PER_CHAT
     try:
         async with _parser_lock:
             _publish_debug_stats(stats)
             if _realtime_client and _realtime_client.is_connected():
                 logger.info(
-                    "🔬 Аудит фильтра: последние %s постов из каждого чата (без сохранения)",
-                    AUDIT_SCAN_LIMIT,
+                    "🔬 Аудит фильтра: посты за %s ч (макс. %s/чат, без сохранения)",
+                    PARSER_AUDIT_HOURS,
+                    PARSER_AUDIT_MAX_PER_CHAT,
                 )
                 await asyncio.wait_for(
                     _scan_all_chats(

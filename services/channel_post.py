@@ -15,7 +15,6 @@ from db import (
     release_vacancy_channel_post,
     try_reserve_vacancy_channel_post,
 )
-from parser import evaluate_vacancy
 from services.channel_images import (
     next_vacancy_image_variant_index,
     resolve_vacancy_image_path,
@@ -137,26 +136,6 @@ async def post_vacancy_preview_to_channel(
     if not force and not try_reserve_vacancy_channel_post(vacancy_id, category_code):
         logger.info("Channel skip vacancy_id=%s — slot reserved or already posted", vacancy_id)
         return False
-    if not force:
-        accepted, detected_cat, gate_reason, _ = evaluate_vacancy(body or "")
-        if not accepted:
-            logger.info(
-                "Channel skip vacancy_id=%s cat=%s revalidate=%s",
-                vacancy_id,
-                category_code,
-                gate_reason,
-            )
-            release_vacancy_channel_post(vacancy_id)
-            return False
-        if detected_cat and detected_cat != category_code:
-            logger.info(
-                "Channel skip vacancy_id=%s stored_cat=%s detected=%s",
-                vacancy_id,
-                category_code,
-                detected_cat,
-            )
-            release_vacancy_channel_post(vacancy_id)
-            return False
     if row:
         inp = card_input_from_push_row(
             row,
