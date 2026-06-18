@@ -72,6 +72,7 @@ Hunter **не** копирует «100% сообщений в БД», но **с�
 - [x] **P1 (2026-06):** специалисты не reject — маршрут в `electrician`; fallback `misc` при найме+оплате без роли.
 - [x] **P1 (2026-06):** multi-score в БД (`category_scores_json`) — ingest, backfill, лента/push по secondary.
 - [x] **P1 (2026-06):** ingest «мягкий режим» — staff gate OK + слабая роль → `misc` + guess в scores.
+- [x] **P1 (2026-06):** **широкий ingest** (`PARSER_WIDE_INGEST=1`) — quality fail → `wide_accept` при смене/событии; отложенная оплата и «пишите в лс» на staff gate.
 - [x] **P2 (2026-06):** Premium keywords (+ / − фразы) в `subscriber_filter_prefs` + UI.
 - [x] **P2 (2026-06):** push/feed match по тегам, не только `category_code`.
 - [x] **P1 (2026-06):** дашборд «отсеяно vs сохранено» — кнопка «📊 Ingest 7 дн» в админ-статистике.

@@ -38,6 +38,7 @@ PARSER_RECONNECT_DELAY_SEC = 30
 PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
 PARSER_INCREMENTAL_LOOKBACK = max(0, int(os.getenv("PARSER_INCREMENTAL_LOOKBACK", "30")))
+PARSER_WIDE_INGEST = os.getenv("PARSER_WIDE_INGEST", "1").strip().lower() in ("1", "true", "yes", "on")
 AUDIT_SCAN_LIMIT = 20
 REJECT_SAMPLES_MAX = 12
 PARSER_SCAN_TIMEOUT_SEC = 1200
@@ -270,6 +271,9 @@ def reject_reason_label(reason: str | None) -> str:
     if reason.startswith("soft_accept:"):
         guessed = reason.split(":", 1)[1].strip()
         return f"мягкий accept ({guessed})"
+    if reason.startswith("wide_accept:"):
+        guessed = reason.split(":", 1)[1].strip()
+        return f"широкий ingest ({guessed})"
     if reason == "digest_split_required":
         return "digest (разбивается на блоки)"
     return reason
@@ -3061,9 +3065,11 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
     if not has_hiring_signal(text):
         return False, "no_hiring", []
     if not has_payment_signal(text):
-        return False, "no_payment", []
+        if not (PARSER_WIDE_INGEST and _has_deferred_payment_context(text)):
+            return False, "no_payment", []
     if not has_contact_signal(text, poster):
-        return False, "no_contact", []
+        if not (PARSER_WIDE_INGEST and _has_implicit_contact_intent(text)):
+            return False, "no_contact", []
     keywords = []
     cat = detect_category(text)
     if cat:
@@ -3202,12 +3208,32 @@ def passes_quality_gate(category: str, text: str) -> bool:
 
 
 SOFT_INGEST_MIN_SCORE = 4
+WIDE_INGEST_MIN_SCORE = 2
 
 _SOFT_EVENT_CONTEXT_MARKERS = (
     "мероприят", "смен", "съемк", "съёмк", "ивент", "event", "промо", "выставк",
     "фестив", "концерт", "площадк", "зоопарк", "сафари", "павильон", "стенд",
     "форум", "конференц", "экспо", "шоу", "турнир", "регистрац",
 )
+
+
+def _has_deferred_payment_context(text: str) -> bool:
+    """Широкий ingest: смена/дата/люди без явной цифры ставки."""
+    if not text or not has_hiring_signal(text):
+        return False
+    tl = text.lower()
+    has_shift = any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS)
+    has_people = bool(re.search(r"\d+\s*(?:чел|человек|чел\b)", tl))
+    has_date = bool(re.search(r"\d{1,2}[./]\d{1,2}", tl))
+    has_pay_hint = any(w in tl for w in ("оплат", "ставк", "₽", "руб", "гонорар", "зарплат", "доход"))
+    return (has_shift or has_date) and (has_people or has_pay_hint)
+
+
+def _has_implicit_contact_intent(text: str) -> bool:
+    if not text:
+        return False
+    tl = text.lower()
+    return bool(re.search(r"\b(?:отклик\w*|написать|пишите|пиши|в\s+лс|личк\w*|whatsapp|ватсап)\b", tl))
 
 
 def _eligible_for_soft_ingest(category: str, text: str) -> bool:
@@ -3243,6 +3269,38 @@ def _eligible_for_soft_ingest(category: str, text: str) -> bool:
     return True
 
 
+def _eligible_for_wide_ingest(category: str, text: str) -> bool:
+    """
+    Широкий ingest: staff gate пройден, quality/soft — нет.
+    Сохраняем спорные вакансии; явный мусор и «склад без роли» — по-прежнему нет.
+    """
+    if not PARSER_WIDE_INGEST or not text or not category:
+        return False
+    if is_unpaid_vacancy(text):
+        return False
+    if is_academic_writing_spam(text) or is_digital_work_spam(text):
+        return False
+    if category in ("loader", "handyman") and is_non_event_labor_spam(text):
+        return False
+    tl = text.lower()
+    if category == "loader":
+        if not _loader_role_confirmed(tl):
+            return False
+        if any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
+            if not any(m in tl for m in _SOFT_EVENT_CONTEXT_MARKERS + _SHORT_TERM_SHIFT_MARKERS):
+                return False
+    scores = _score_categories_weighted(text)
+    cat_score = scores.get(category, 0)
+    has_event_ctx = any(m in tl for m in _SOFT_EVENT_CONTEXT_MARKERS)
+    has_shift_ctx = any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS)
+    if cat_score >= WIDE_INGEST_MIN_SCORE:
+        return True
+    if has_event_ctx or has_shift_ctx:
+        return True
+    picked = _pick_category_from_scores(scores, tl)
+    return picked == category and cat_score > 0
+
+
 def evaluate_vacancy(
     text: str, poster: dict | None = None, *, force_category: str | None = None,
 ) -> tuple[bool, str | None, str, list]:
@@ -3259,6 +3317,8 @@ def evaluate_vacancy(
         return True, category, "accepted", keywords
     if not force_category and _eligible_for_soft_ingest(category, text):
         return True, category, f"soft_accept:{category}", keywords
+    if not force_category and _eligible_for_wide_ingest(category, text):
+        return True, category, f"wide_accept:{category}", keywords
     return False, None, f"quality_gate:{category}", keywords
 
 
