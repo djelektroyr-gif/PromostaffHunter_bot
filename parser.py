@@ -644,7 +644,12 @@ async def _save_parsed_vacancy_block(
     cleaned_text = clean_message_text(eval_text)
     message_link = get_message_link(chat.id, message.id)
     author_contact, contact_source = resolve_vacancy_contact(eval_text, poster)
-    if not author_contact and message.text and message.text != eval_text:
+    if (
+        not author_contact
+        and block_index is None
+        and message.text
+        and message.text != eval_text
+    ):
         author_contact, contact_source = resolve_vacancy_contact(message.text, poster)
     address = extract_address_from_text(eval_text) or extract_address_from_text(message.text or "")
     full_text = "\n".join(part for part in (eval_text, message.text or "") if part)
@@ -662,7 +667,8 @@ async def _save_parsed_vacancy_block(
     enrich_kwargs = enrichment.to_db_kwargs()
     from services.category_scores import compute_category_scores, scores_to_json
 
-    category_scores_json = scores_to_json(compute_category_scores(full_text or eval_text))
+    score_text = eval_text if block_index is not None else (full_text or eval_text)
+    category_scores_json = scores_to_json(compute_category_scores(score_text))
 
     dedupe_key = build_vacancy_dedupe_key(cleaned_text, author_contact)
 
@@ -1664,6 +1670,16 @@ def extract_contact_from_text(text: str) -> str:
     ls_match = re.search(r'[вВ] [лЛ][сС] @?([a-zA-Z0-9_]+)', text)
     if ls_match:
         return f"@{ls_match.group(1)}"
+    vk_match = re.search(
+        r"(?:https?://)?(?:www\.)?vk\.(?:com|ru)/[a-zA-Z0-9_./-]+",
+        text,
+        re.IGNORECASE,
+    )
+    if vk_match:
+        url = vk_match.group(0).rstrip(".,;)")
+        if not url.lower().startswith("http"):
+            url = "https://" + url
+        return url
     return None
 
 def _extract_message_geo(message) -> tuple[float | None, float | None]:
@@ -2056,6 +2072,7 @@ _CATEGORY_KEYWORDS = {
         "опрос людей", "опрос на улице",
         "привлекать внимание", "приглашать клиентов", "распространение листовок",
         "промо на", "промо в", "позиция: промо", "позиция промо",
+        "дегустац",
     ],
     "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
     "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
@@ -2076,6 +2093,7 @@ _CATEGORY_KEYWORDS = {
         "хелпер", "хэлпер", "хелперы", "хэлперы",
         "требуются хелпер", "требуются хэлпер",
         "хелперский функционал", "хелперские задачи",
+        "промо-хелпер", "промохелпер", "промо хелпер",
         "помощь на монтаже", "на монтаже",
         "парни хелпер", "парня хелпер", "парней хелпер",
         "#техник", "техник прокат", "техник оборудован", "техник концерт",
@@ -2119,6 +2137,7 @@ _CATEGORY_KEYWORDS = {
     ],
     "dj": [
         "dj", "диджей", "дидже", "#dj", "ди-джей",
+        "кавер", "кавергрупп", "музыкант", "вокалист", "саксофон", "клавишн",
     ],
     "electrician": [
         "электромонтаж", "электрик", "электромонтер",
@@ -2246,23 +2265,35 @@ _NON_SUPERVISOR_COORDINATOR = (
 
 MAX_DIGEST_BLOCKS = 12
 
+# Пункты списка 1–20: «3. ТРЕБУЕТСЯ», «2.20 июня», «**1. …»; не режем «12.500» и тире «—» в описании.
+_DIGEST_NUMBERED_ITEM_RE = (
+    r"(?:\*{0,4}\s*)?"
+    r"(?:[1-9]|1[0-9]|20)[\.\)](?:\s+|\d{2}(?:[\./]\d{1,2}|\s))"
+)
+
+_DIGEST_LIST_SPLIT_RE = re.compile(
+    rf"(?:(?<=\n)|(?<=^))\s*{_DIGEST_NUMBERED_ITEM_RE}",
+)
+
+_DIGEST_LIST_ITEM_RE = re.compile(
+    rf"(?:^|\n)\s*{_DIGEST_NUMBERED_ITEM_RE}",
+    re.MULTILINE,
+)
+
+_STAFF_ROLE_HASHTAG_RE = re.compile(
+    r"#\s*(?:диджей|dj|аниматор|музыкант|вокалист|кавер|ведущ)",
+    re.I,
+)
+
 
 def split_vacancy_blocks(text: str) -> list:
-    """Digest «1. … 2. …» / буллеты — отдельные блоки."""
+    """Digest «1. … 2. …» / «2.20 июня» / буллеты — отдельные блоки."""
     if not text:
         return []
-    parts = re.split(
-        r"(?:(?<=\n)|(?<=^))\s*(?:\d+[\.\)]|[•▪–—\-])\s+",
-        text,
-    )
+    parts = _DIGEST_LIST_SPLIT_RE.split(text)
     blocks = [p.strip() for p in parts if p.strip()]
     if len(blocks) > 1:
         return blocks
-    # «**1. текст» без переноса перед номером
-    parts2 = re.split(r"\s*\d+[\.\)]\s+", text, maxsplit=0)
-    blocks2 = [p.strip() for p in parts2 if p.strip()]
-    if len(blocks2) > 1:
-        return blocks2
     return [text]
 
 
@@ -2285,13 +2316,7 @@ def enrich_digest_block(block_text: str, full_text: str) -> str:
 def _numbered_vacancy_count(text: str) -> int:
     if not text:
         return 0
-    if re.search(r"(?:^|\n)\s*2[\.\)]\s", text):
-        markers = re.findall(
-            r"(?:^|\n|\*{1,4})\s*(\d+)[\.\)]\s+(?!\d{1,2}[\./]\d)",
-            text,
-        )
-        return max(len(markers), 2)
-    return len(re.findall(r"(?:^|\n)\s*3[\.\)]\s", text))
+    return len(_DIGEST_LIST_ITEM_RE.findall(text))
 
 
 def _normalize_hashtag_text(text: str) -> str:
@@ -2422,6 +2447,12 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
         if any(w in text_lower for w in _LABOR_HINTS):
             return "loader"
     if scores.get("promoter") and scores.get("helper") and any(w in text_lower for w in _PROMO_HINTS):
+        if re.search(r"промо[\s\-]*хелпер", text_lower):
+            if scores.get("helper", 0) >= scores.get("promoter", 0):
+                return "helper"
+        else:
+            return "promoter"
+    if scores.get("merchandiser") and scores.get("promoter") and "дегустац" in text_lower:
         return "promoter"
     if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
@@ -2477,6 +2508,7 @@ _PAYMENT_RATE_RE = re.compile(
     r"ставка\s*[:\s]?\s*\d|минималка|"
     r"оплат\w*\s*[:\s].*\d|\d[\d\s.,]*\s*(?:₽|руб)|"
     r"\d{2,5}\s*/\s*\d+\s*/\s*\d{2,5}|"
+    r"\d{3,4}\s*[/:]\s*\d{1,2}(?!\s*/\s*\d)|"
     r"\d{3,5}\s*-\s*\d{3,5}\s*(?:₽|руб|р\b|$)|"
     r"(?:заработок|доход)\s*(?:от\s*)?\d[\d\s–—\-]*(?:до|–|-|—)\s*\d+\s*(?:тыс|тысяч)|"
     r"\d[\d\s.,]*\s*(?:тыс|тысяч)\w*\s*(?:руб|₽)?\s*/\s*день|"
@@ -3102,6 +3134,12 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
     for category in EXCLUDE_CATEGORIES:
         if category.lower() in tl:
             if not any(hw in tl for hw in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "нужны", "требу")):
+                if (
+                    _STAFF_ROLE_HASHTAG_RE.search(text)
+                    and has_payment_signal(text)
+                    and has_contact_signal(text, poster)
+                ):
+                    continue
                 return False, f"excluded_category: {category}", []
     if not has_hiring_signal(text):
         return False, "no_hiring", []
@@ -3283,7 +3321,8 @@ def _has_implicit_contact_intent(text: str) -> bool:
         return False
     tl = text.lower()
     return bool(re.search(
-        r"(?:отклик\w*|напиш\w*|пиш\w+|в\s+лс|личк\w*|whatsapp|ватсап)",
+        r"(?:отклик\w*|напиш\w*|пиш\w+|высылай\w*|в\s+лс|личк\w*|whatsapp|ватсап|"
+        r"контакт\s+для\s+связи|ссылк\w*\s+в\s+вк)",
         tl,
     ))
 

@@ -145,7 +145,8 @@ def enrich_block_with_header_context(
     parts = prefix + [block]
 
     if not extract_contact(block) and not has_ls_contact(block):
-        contact = extract_contact(full_text)
+        header = extract_shared_header(full_text)
+        contact = extract_contact(header) if header else None
         if contact:
             parts.append(contact)
 
