@@ -2078,7 +2078,7 @@ _CATEGORY_KEYWORDS = {
     "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
     "animator": [
         "аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун",
-        "ростовые куклы",
+        "ростовые куклы", "ресторанный аниматор", "аниматор в ресторан", "аниматор-бейбиситтер",
     ],
     "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
     "driver": ["водитель", "водители", "курьер", "экспедитор"],
@@ -2265,10 +2265,11 @@ _NON_SUPERVISOR_COORDINATOR = (
 
 MAX_DIGEST_BLOCKS = 12
 
-# Пункты списка 1–20: «3. ТРЕБУЕТСЯ», «2.20 июня», «**1. …»; не режем «12.500» и тире «—» в описании.
+# Пункты списка 1–20: «3. ТРЕБУЕТСЯ», «2.20 июня», «**1. …», «2.Лоукост».
 _DIGEST_NUMBERED_ITEM_RE = (
     r"(?:\*{0,4}\s*)?"
-    r"(?:[1-9]|1[0-9]|20)[\.\)](?:\s+|\d{2}(?:[\./]\d{1,2}|\s))"
+    r"(?:[1-9]|1[0-9]|20)[\.\)]"
+    r"(?:\s+|\d{2}(?:[\./]\d{1,2}|\s)|(?=[А-Яа-яA-Z#]))"
 )
 
 _DIGEST_LIST_SPLIT_RE = re.compile(
@@ -2454,6 +2455,11 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
             return "promoter"
     if scores.get("merchandiser") and scores.get("promoter") and "дегустац" in text_lower:
         return "promoter"
+    if scores.get("animator") and scores.get("waiter"):
+        if re.search(r"аниматор", text_lower) and not re.search(
+            r"официант|официантк|бармен|обслуживание гостей|хостес", text_lower
+        ):
+            return "animator"
     if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
     if scores.get("driver") and scores.get("loader") and "грузчик" in text_lower:

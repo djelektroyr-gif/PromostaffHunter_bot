@@ -69,14 +69,14 @@ async def _send_html_card(
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
             logger.warning("forum_vacancy_pin: topic miss user=%s key=%s", user_id, topic_key)
-            fallback = {} if topic_key else {}
+            if not topic_key:
+                return None
             msg = await bot.send_message(
                 user_id,
                 text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
-                **fallback,
             )
             return msg.message_id
         if "parse" in err:
@@ -92,23 +92,82 @@ async def _send_html_card(
         raise
 
 
+async def _try_edit_general_card(
+    bot: Bot,
+    user_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> bool:
+    """Обновляет одну карточку в General — чистый экран без delete+send."""
+    try:
+        await bot.edit_message_text(
+            text,
+            chat_id=user_id,
+            message_id=message_id,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        return True
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if "not modified" in err:
+            return True
+        if "message to edit not found" in err or "message can't be edited" in err:
+            return False
+        if "parse" in err:
+            plain = re.sub(r"<[^>]*>", "", text)
+            try:
+                await bot.edit_message_text(
+                    plain,
+                    chat_id=user_id,
+                    message_id=message_id,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                return True
+            except TelegramBadRequest:
+                return False
+        logger.warning(
+            "edit general vacancy pin user=%s msg=%s: %s",
+            user_id,
+            message_id,
+            e,
+        )
+        return False
+
+
 async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> None:
     """Убирает предыдущую push-карточку из General (история уже в «Вакансии»)."""
     pin = get_general_vacancy_pin(user_id)
     if not pin:
         return
     message_id = pin["message_id"]
+    extra = _delivery_kwargs(user_id, None)
     try:
-        await bot.delete_message(chat_id=user_id, message_id=message_id)
+        await bot.delete_message(chat_id=user_id, message_id=message_id, **extra)
     except TelegramBadRequest as e:
         err = str(e).lower()
         if "message to delete not found" not in err:
-            logger.warning(
-                "delete general vacancy pin user=%s msg=%s: %s",
-                user_id,
-                message_id,
-                e,
-            )
+            if extra.get("message_thread_id"):
+                try:
+                    await bot.delete_message(chat_id=user_id, message_id=message_id)
+                except TelegramBadRequest as e2:
+                    if "message to delete not found" not in str(e2).lower():
+                        logger.warning(
+                            "delete general vacancy pin user=%s msg=%s: %s",
+                            user_id,
+                            message_id,
+                            e2,
+                        )
+            else:
+                logger.warning(
+                    "delete general vacancy pin user=%s msg=%s: %s",
+                    user_id,
+                    message_id,
+                    e,
+                )
     clear_general_vacancy_pin(user_id)
 
 
@@ -157,6 +216,13 @@ async def send_vacancy_push_pinned_general(
     del rebuild_keyboard  # история сохраняется при push, не при archive
     async with _user_pin_lock(user_id):
         await ensure_topics(user_id)
+        pin = get_general_vacancy_pin(user_id)
+        if pin and await _try_edit_general_card(
+            bot, user_id, pin["message_id"], text, reply_markup
+        ):
+            set_general_vacancy_pin(user_id, pin["message_id"], vacancy_id, text)
+            await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
+            return True
         await _clear_general_vacancy_display(bot, user_id)
         msg_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
         if msg_id is None:

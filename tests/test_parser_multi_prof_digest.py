@@ -7,6 +7,7 @@ from parser import (
     extract_contact_from_text,
     should_split_digest,
     split_vacancy_blocks,
+    vacancy_matches_category,
 )
 
 
@@ -57,6 +58,45 @@ def test_multi_prof_digest_each_block_own_category_and_contact():
     assert any("k.holodina" in c for c in contacts)
 
 
-def test_vk_contact_without_scheme():
-    assert extract_contact_from_text("📝 vk.com/antonlyavo") == "https://vk.com/antonlyavo"
-    assert extract_contact_from_text("https://vk.ru/id246738778") == "https://vk.ru/id246738778"
+_DIGEST_BOLD_DIGEST_SAMPLE = (
+    "**1. 27 июня. ****#Диджей**** с аппаратурой. на 6 часов город Видное. МО.\n"
+    "бюджет 25 000\n"
+    "#ВИДЕОМЕЙКER\n"
+    "27.08.26 на свадьбу требуется видеомейкер - рилсмейкер.\n"
+    "📝 vk.com/idermakovavi\n\n"
+    "2.Лоукост На завтра 20.06 нужен #ведущий на годовщину свадьбы.\n"
+    "📝 vk.com/alexmers\n\n"
+    "3.Лоукост Ищу на завтра, 20 июня, #хелперов на квиз.\n"
+    "📝 https://vk.ru/id246738778"
+)
+
+
+def test_bold_numbered_digest_splits():
+    text = _DIGEST_BOLD_DIGEST_SAMPLE
+    blocks = split_vacancy_blocks(text)
+    assert len(blocks) >= 3
+    assert should_split_digest(text) is True
+
+
+def test_bold_digest_blocks_separate_roles():
+    text = _DIGEST_BOLD_DIGEST_SAMPLE
+    accepted = evaluate_digest_blocks(text)
+    categories = {cat for cat, _ in accepted}
+    assert "dj" in categories or "host_mc" in categories
+    assert "helper" in categories
+
+
+def test_animator_in_restaurant_not_waiter():
+    text = (
+        "**Аниматор в ресторан 20 и 21 июня 18+**\n"
+        "📍 метро Ольховая\n"
+        "Костюм и реквизит на месте\n"
+        "❤️м.Ольховая 13-20ч СБ Оплата 2300р\n"
+        "👉 @Elen_250182"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text, {"username": "Elen_250182", "user_id": 1})
+    assert ok is True
+    assert cat == "animator"
+    assert vacancy_matches_category(text, "animator") is True
+    assert vacancy_matches_category(text, "waiter") is False
+

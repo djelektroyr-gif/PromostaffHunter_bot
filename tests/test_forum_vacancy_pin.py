@@ -5,6 +5,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
 
 from db import (
     clear_general_vacancy_pin,
@@ -43,6 +44,38 @@ def test_general_vacancy_pin_roundtrip():
     assert get_general_vacancy_pin(42) is None
 
 
+def test_push_edits_general_when_pin_exists(monkeypatch):
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 778
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+    set_general_vacancy_pin(user_id, 10, "vac_old", "old")
+
+    bot = AsyncMock()
+    bot.edit_message_text = AsyncMock()
+    bot.send_message = AsyncMock()
+    bot.delete_message = AsyncMock()
+
+    async def _ensure(_uid):
+        return None
+
+    ok = asyncio.run(
+        send_vacancy_push_pinned_general(
+            bot,
+            user_id,
+            "vac_new",
+            "<b>new</b>",
+            None,
+            rebuild_keyboard=lambda _vid: None,
+            ensure_topics=_ensure,
+        )
+    )
+    assert ok is True
+    bot.edit_message_text.assert_awaited_once()
+    bot.delete_message.assert_not_awaited()
+    assert get_general_vacancy_pin(user_id)["message_id"] == 10
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
+
+
 def test_push_replaces_general_and_appends_history(monkeypatch):
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 777
@@ -61,6 +94,11 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
     bot.send_message = _send
     bot.delete_message = AsyncMock()
 
+    async def _edit_fail(*_a, **_k):
+        raise TelegramBadRequest(method="editMessageText", message="message to edit not found")
+
+    bot.edit_message_text = _edit_fail
+
     async def _ensure(_uid):
         return None
 
@@ -76,7 +114,11 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
         )
     )
     assert ok is True
-    bot.delete_message.assert_awaited_once_with(chat_id=user_id, message_id=10)
+    bot.delete_message.assert_awaited_once_with(
+        chat_id=user_id,
+        message_id=10,
+        message_thread_id=GENERAL_TOPIC_THREAD_ID,
+    )
     assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
     general = [s for s in sent if s["thread"] == GENERAL_TOPIC_THREAD_ID]
     history = [s for s in sent if s["thread"] == 55]
