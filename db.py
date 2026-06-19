@@ -2575,20 +2575,27 @@ def migrate_legacy_vacancy_ids() -> int:
     return migrated
 
 
-def has_recent_duplicate_vacancy(dedupe_key: str, max_age_days: int = 1) -> bool:
+def has_recent_duplicate_vacancy(
+    dedupe_key: str,
+    max_age_days: int = 1,
+    *,
+    exclude_id: str | None = None,
+) -> bool:
     if not dedupe_key:
         return False
-    return fetchone(
-        f"""
+    sql = f"""
         SELECT 1
         FROM vacancies
         WHERE dedupe_key = ?
           AND is_closed = {bool_false()}
           AND found_at >= {now_minus_days(max_age_days)}
-        LIMIT 1
-        """,
-        (dedupe_key,),
-    ) is not None
+    """
+    params: list = [dedupe_key]
+    if exclude_id:
+        sql += " AND id != ?"
+        params.append(exclude_id)
+    sql += " LIMIT 1"
+    return fetchone(sql, tuple(params)) is not None
 
 
 def get_recent_open_vacancies_for_dedupe(max_age_days: int = 1, limit: int = 200) -> list:

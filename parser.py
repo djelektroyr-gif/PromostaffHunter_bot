@@ -241,6 +241,9 @@ REJECT_REASON_LABELS = {
     "unpaid": "без оплаты",
     "service_request": "услуга, не найм",
     "casting": "кастинг/модель",
+    "roleplay_acting": "ролевая съёмка",
+    "delivery_courier": "курьер доставки",
+    "camp_educator": "вожатый/лагерь",
     "no_hiring": "нет признаков найма",
     "no_payment": "нет оплаты в тексте",
     "no_contact": "нет контакта",
@@ -1847,7 +1850,11 @@ def detect_duplicate_type(
     *,
     exclude_id: str | None = None,
 ) -> str | None:
-    if has_recent_duplicate_vacancy(dedupe_key, max_age_days=VACANCY_DEDUPE_DAYS):
+    if has_recent_duplicate_vacancy(
+        dedupe_key,
+        max_age_days=VACANCY_DEDUPE_DAYS,
+        exclude_id=exclude_id,
+    ):
         return "exact"
     normalized_text = _normalize_for_dedupe(text)
     fuzzy_text = _normalize_for_fuzzy_dedupe(text)
@@ -2060,6 +2067,7 @@ _CATEGORY_KEYWORDS = {
         "помощь мастерам", "работа на лесах",
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
+        "на упаковку", "упаковк",
         "складской работник", "на склад", "рохл", "паллет", "складирован",
         "фасовоч", "кладовщик",
         "уборка",
@@ -2079,8 +2087,10 @@ _CATEGORY_KEYWORDS = {
     "animator": [
         "аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун",
         "ростовые куклы", "ресторанный аниматор", "аниматор в ресторан", "аниматор-бейбиситтер",
+        "бейбиситтер", "babysitter", "детскую комнату", "игры с детьми", "присмотр за детьми",
+        "творческий мастер", "мастер-класс", "поделки с детьми",
     ],
-    "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей", "ресторан", "кафе", "банкет"],
+    "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей"],
     "driver": ["водитель", "водители", "курьер", "экспедитор"],
     "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
     "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
@@ -2232,6 +2242,8 @@ _LOADER_WAREHOUSE_COMBO_RE = re.compile(
 
 def _loader_role_confirmed(tl: str) -> bool:
     """Грузчик: явная роль или склад вместе с погрузкой/разгрузкой — не одно слово «склад»."""
+    if re.search(r"упаковк", tl):
+        return True
     if any(w in tl for w in _LOADER_STRONG_HINTS):
         return True
     if "склад" in tl and _LOADER_WAREHOUSE_COMBO_RE.search(tl):
@@ -2373,8 +2385,37 @@ def is_group_welcome_spam(text: str) -> bool:
     return False
 
 
+def _has_explicit_animator_role(text_lower: str) -> bool:
+    if not text_lower:
+        return False
+    if not re.search(
+        r"аниматор|бейбиситтер|babysitter|ресторанн\w*\s+аниматор", text_lower,
+    ):
+        return False
+    return not re.search(
+        r"официант|официантк|бармен|обслуживание гостей", text_lower,
+    )
+
+
+def _waiter_role_confirmed(text_lower: str) -> bool:
+    return bool(re.search(r"официант|бармен|обслуживание гостей", text_lower))
+
+
+def _security_role_confirmed(text_lower: str) -> bool:
+    if is_roleplay_acting_job(text_lower):
+        return False
+    return any(
+        w in text_lower
+        for w in ("охранник", "охрана", "контрол", "секьюрити", "пропускной")
+    )
+
+
 def _is_driver_role(text_lower: str) -> bool:
     """Водитель/курьер как основная роль — не «права в плюс» у техника."""
+    if re.search(
+        r"ваканси\w*\s+(?:курьер|курьер\w*)", text_lower,
+    ) and not re.search(r"водител|авто|категор", text_lower):
+        return False
     norm = _normalize_hashtag_text(text_lower)
     if "#водител" in norm or "#курьер" in norm or "#экспедитор" in norm:
         return True
@@ -2456,10 +2497,14 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if scores.get("merchandiser") and scores.get("promoter") and "дегустац" in text_lower:
         return "promoter"
     if scores.get("animator") and scores.get("waiter"):
-        if re.search(r"аниматор", text_lower) and not re.search(
-            r"официант|официантк|бармен|обслуживание гостей|хостес", text_lower
-        ):
-            return "animator"
+        if re.search(r"аниматор|бейбиситтер|babysitter|ресторанн\w*\s+аниматор", text_lower):
+            if not re.search(
+                r"официант|официантк|бармен|обслуживание гостей|хостес", text_lower
+            ):
+                return "animator"
+    if re.search(r"упаковк", text_lower) and scores.get("loader"):
+        if not re.search(r"промоутер|раздача листовок|дегустац|промо[\s\-]*акци", text_lower):
+            return "loader"
     if scores.get("loader") and scores.get("parking") and any(w in text_lower for w in _LABOR_HINTS):
         return "loader"
     if scores.get("driver") and scores.get("loader") and "грузчик" in text_lower:
@@ -2849,6 +2894,12 @@ def _detect_category_scored(text: str) -> str | None:
     text_lower = text.lower()
     if is_skilled_trade_job(text_lower):
         return "electrician"
+    if _has_explicit_animator_role(text_lower):
+        return "animator"
+    if re.search(r"упаковк", text_lower) and not re.search(
+        r"промоутер|раздача листовок|дегустац|промо[\s\-]*акци", text_lower,
+    ):
+        return "loader"
     if _has_technician_role(text_lower):
         return "helper"
     if _is_driver_role(text_lower):
@@ -2873,6 +2924,47 @@ def detect_category(text: str) -> str | None:
     if has_hiring_signal(text) and has_payment_signal(text):
         return "misc"
     return None
+
+
+def is_roleplay_acting_job(text: str) -> bool:
+    """Ролевая съёмка / массовка под видом «охранник, игровые девушки»."""
+    if not text:
+        return False
+    tl = text.lower()
+    acting_markers = (
+        "по сценарию", "видеовизитк", "игровые", "визжат",
+        "съемк", "съёмк", "массовк", "статист", "эпизодник",
+    )
+    if not any(m in tl for m in acting_markers):
+        return False
+    if "охранник" in tl and any(m in tl for m in ("игровые", "по сценарию", "девушк")):
+        return True
+    if "девушк" in tl and any(m in tl for m in ("по сценарию", "видеовизитк", "игровые")):
+        return True
+    return False
+
+
+def is_delivery_courier_job(text: str) -> bool:
+    """Курьер доставки еды/посылок — не event-staff водитель."""
+    if not text:
+        return False
+    tl = text.lower()
+    if "курьер" not in tl:
+        return False
+    if re.search(r"водител|личн\w+\s+авто|категор\w*\s+прав|экспедитор", tl):
+        return False
+    return bool(
+        re.search(r"ваканси\w*\s+курьер", tl)
+        or re.search(r"курьер\w*\s+с\s+ежедневн", tl)
+        or ("доставк" in tl and "курьер" in tl)
+    )
+
+
+def is_camp_educator_job(text: str) -> bool:
+    """Вожатый / лагерь — вне профиля event-staff."""
+    if not text:
+        return False
+    return bool(re.search(r"вожат", text.lower()))
 
 
 def is_casting_call(text: str) -> bool:
@@ -3122,6 +3214,12 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "remote_office_job", []
     if is_professional_casting_spam(text):
         return False, "professional_casting", []
+    if is_roleplay_acting_job(text):
+        return False, "roleplay_acting", []
+    if is_delivery_courier_job(text):
+        return False, "delivery_courier", []
+    if is_camp_educator_job(text):
+        return False, "camp_educator", []
     for phrase in STOP_PHRASES:
         if phrase.lower() in tl:
             return False, f"stop_phrase: {phrase}", []
@@ -3251,7 +3349,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if not any(w in tl for w in ("гардероб", "гардеробщ", "раздевалка", "номерков")):
             return False
     elif category == "waiter":
-        if not any(w in tl for w in ("официант", "бармен", "обслуживание гостей")):
+        if not _waiter_role_confirmed(tl):
             return False
     elif category == "driver":
         if "грузчик" in tl and re.search(r"водител\w*\s+забер", tl):
@@ -3261,11 +3359,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if "грузчик" in tl and not re.search(r"\b(?:водител|курьер|экспедитор)\w*\b", tl):
             return False
     elif category == "security":
-        if any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити", "контроль доступа")):
-            return True
-        if "пропускной" in tl and any(w in tl for w in ("охранник", "охрана", "контрол", "секьюрити")):
-            return True
-        return False
+        if not _security_role_confirmed(tl):
+            return False
     elif category == "parking":
         if not any(w in tl for w in ("парковщик", "паркинг", "парковоч")):
             return False
@@ -3282,6 +3377,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if not any(w in tl for w in ("мерчендайз", "мерчанд", "выкладк", "дегустац", "трейд")):
             return False
     elif category == "host_mc":
+        if re.search(r"вожат", tl):
+            return False
         if not any(w in tl for w in ("ведущ", "тамада", " mc", "mc ", "эмси")):
             return False
     elif category == "dj":
@@ -3363,6 +3460,12 @@ def _eligible_for_soft_ingest(category: str, text: str) -> bool:
             return False
     if category == "loader" and not _loader_role_confirmed(tl):
         return False
+    if category == "waiter" and not _waiter_role_confirmed(tl):
+        return False
+    if category == "security" and not _security_role_confirmed(tl):
+        return False
+    if category == "host_mc" and re.search(r"вожат", tl):
+        return False
     return True
 
 
@@ -3386,6 +3489,12 @@ def _eligible_for_wide_ingest(category: str, text: str) -> bool:
         if any(m in tl for m in _NON_EVENT_LABOR_MARKERS):
             if not any(m in tl for m in _SOFT_EVENT_CONTEXT_MARKERS + _SHORT_TERM_SHIFT_MARKERS):
                 return False
+    if category == "waiter" and not _waiter_role_confirmed(tl):
+        return False
+    if category == "security" and not _security_role_confirmed(tl):
+        return False
+    if category == "host_mc" and re.search(r"вожат", tl):
+        return False
     scores = _score_categories_weighted(text)
     cat_score = scores.get(category, 0)
     has_event_ctx = any(m in tl for m in _SOFT_EVENT_CONTEXT_MARKERS)

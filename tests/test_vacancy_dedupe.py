@@ -116,6 +116,37 @@ def test_daily_repost_detected_as_duplicate(monkeypatch):
     assert dup in ("exact", "fuzzy", "campaign")
 
 
+def test_detect_duplicate_excludes_self_for_channel_crosspost(tmp_db):
+    """Кросс-пост в канал: вакансия не должна считаться дублем самой себя."""
+    from db import save_vacancy
+    import parser as p
+
+    body = "Нужен промоутер на выставку, 900 ₽/ч, Москва"
+    dedupe_key = p.build_vacancy_dedupe_key(body, "@boss")
+    save_vacancy(
+        "vac_self",
+        "c1",
+        "Chat",
+        "promoter",
+        body,
+        "https://t.me/x/1",
+        "@boss",
+        None,
+        False,
+        dedupe_key,
+        "2026-06-19 10:00:00",
+    )
+    dup = p.detect_duplicate_type(
+        body,
+        "@boss",
+        dedupe_key,
+        "promoter",
+        "Chat",
+        exclude_id="vac_self",
+    )
+    assert dup is None
+
+
 def test_find_cluster_vacancy_ids_cross_channel(monkeypatch):
     import parser as p
 

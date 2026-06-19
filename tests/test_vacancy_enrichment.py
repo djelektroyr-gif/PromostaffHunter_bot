@@ -234,6 +234,27 @@ def test_extract_address_korolev_not_mo_only():
     assert addr != "Мо"
 
 
+def test_extract_address_lipovaya_alleja_not_booking_form():
+    """📍 с реальным адресом важнее строки «Адрес откуда такси» в блоке брони."""
+    text = (
+        "**Заявка на Завтра к 6:45 ‼️ **\n"
+        "**20 июля**\n"
+        "1 человек\n"
+        "📍 Липовая аллея, д 6. Деревня переделки.\n"
+        "**ТАКСИ ОТ ДОМА ЗАКАЖЕМ**\n"
+        "Функционал: помощь штатным сотрудникам\n"
+        "Бронь вакансии:\n"
+        "ФИО\n"
+        "Возраст\n"
+        "Адрес откуда такси\n"
+        "@ggggbbbb15"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "Липовая аллея" in addr
+    assert "откуда такси" not in addr.lower()
+
+
 def test_extract_address_yandex_whatshere_point():
     text = (
         "https://yandex.ru/maps?whatshere%5Bpoint%5D=37.59939273397594%2C55.731794895917375\n"

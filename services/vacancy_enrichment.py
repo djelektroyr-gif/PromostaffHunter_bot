@@ -37,7 +37,9 @@ _GARBAGE_ADDR_RE = re.compile(
     r"кандидат|рассмотрим|опыт\s+работ|активн\w*\s+промо|старше\s+\d|"
     r"только\s+(?:актив|промо|опыт)|отклик|анкет|whatsapp|telegram|"
     r"начинается|работа\s+нач|начало\s*:?\s*\d|"
-    r"смена\s+на\s+склад",
+    r"смена\s+на\s+склад|"
+    r"откуда\s+такси|ваш\s+адрес|свой\s+адрес|адрес\s+откуда|"
+    r"^фио$|^возраст$|бронь\s+ваканс",
     re.IGNORECASE,
 )
 _TELEGRAM_MENTION_RE = re.compile(r"@\w+", re.I)
@@ -263,9 +265,11 @@ def _extract_location_block(text: str) -> str | None:
         if not m:
             continue
         inline = m.group(1).strip().strip("*")
+        if _is_form_address_placeholder(inline):
+            continue
         parts = _collect_lines_after_header(lines, i, inline)
         composed = _compose_location_address(parts)
-        if composed:
+        if composed and not _is_form_address_placeholder(composed):
             if re.match(
                 r"^(?:[📍🗺]\s*)?(?:\*\*)?(?:м\.|метро)(?:\*\*)?",
                 line.strip(),
@@ -276,6 +280,15 @@ def _extract_location_block(text: str) -> str | None:
     return None
 
 
+_FORM_ADDRESS_INLINE_RE = re.compile(
+    r"^(?:откуда\s+)?такси$|"
+    r"^(?:ваш|свой)\s+адрес$|"
+    r"^адрес\s+откуда|"
+    r"^фио$|^возраст$|"
+    r"^укажите\s+адрес",
+    re.IGNORECASE,
+)
+
 _LABEL_ONLY_WORDS = frozenset(
     {
         "локация", "адрес", "место", "где", "точка", "район", "объект",
@@ -284,9 +297,19 @@ _LABEL_ONLY_WORDS = frozenset(
 )
 
 
-def _is_label_only(value: str) -> bool:
+def _is_form_address_placeholder(value: str) -> bool:
     cleaned = value.strip().strip("*").lower().rstrip(":.-")
-    return cleaned in _LABEL_ONLY_WORDS or cleaned in ("место работы",)
+    if not cleaned:
+        return False
+    if _FORM_ADDRESS_INLINE_RE.search(cleaned):
+        return True
+    if cleaned in _LABEL_ONLY_WORDS or cleaned in ("место работы",):
+        return True
+    return False
+
+
+def _is_label_only(value: str) -> bool:
+    return _is_form_address_placeholder(value)
 
 
 def _sanitize_address_fragment(value: str) -> str:
@@ -478,12 +501,14 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
             return cleaned
         return None
 
+    pin_line = _extract_pin_inline_address(text)
+    if pin_line:
+        ok_pin = _ok(pin_line)
+        if ok_pin:
+            return ok_pin
     block = _extract_location_block(text)
     if block:
         return _ok(block)
-    pin_line = _extract_pin_inline_address(text)
-    if pin_line:
-        return _ok(pin_line)
     explicit = _EXPLICIT_ADDR_RE.search(text)
     if explicit:
         return _ok(explicit.group(1).strip(" .,"))
