@@ -61,6 +61,22 @@ def test_camp_counselor_rejected():
     assert reason == "camp_educator"
 
 
+def test_welcome_model_hostess_accepted():
+    text = (
+        "АКТРИСА/МОДЕЛЬ НА РОЛЬ WELCOME\n"
+        "Бренд на мероприятии, встреча гостей\n"
+        "Оплата 3500 за смену\n"
+        "Нужна видеовизитка + 2-3 фото\n"
+        "Девушки 20-28 лет\n"
+        "@isaev_den"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "isaev_den", "user_id": 1})
+    assert ok is True
+    assert cat == "hostess"
+    assert reason in ("accepted", "soft_accept:hostess")
+    assert detect_category(text) == "hostess"
+
+
 def test_roleplay_security_actress_rejected():
     text = (
         "20.06 «след» охранник, игровые девушки 25-30 лет 4000\n"
@@ -86,7 +102,66 @@ def test_delivery_courier_rejected():
     assert reason == "delivery_courier"
 
 
-def test_packing_job_is_loader_not_promoter():
+def test_globus_degustation_not_casting_reject():
+    text = (
+        "⚡ДЕГУСТАЦИЯ АЛКОГОЛЯ⚡ДЕВУШКИ И ЮНОШИ 18+ С МК\n"
+        "💰Ставка 600 в час\n"
+        "26 июня 17:00-21:00\n"
+        "📌 Глобус Красногорск\n"
+        "‼️ОТБОР ПО ФОТОКАСТИНГУ‼️\n"
+        "пишите в ЛС @Fibs_18 с пометкой ГЛОБУС"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "Fibs_18", "user_id": 1})
+    assert ok is True
+    assert cat == "promoter"
+    assert reason in ("accepted", "soft_accept:promoter")
+
+
+def test_bed_lift_classified_loader():
+    text = (
+        "прямо сейчас кому 30-40 минут\n"
+        "реутов новокосино метро\n"
+        "поднять кровать медицинскую пешком на 6 этаж\n"
+        "кровать весит 120 кг\n"
+        "2 чел 450:4\n"
+        "жду скриншот @boss"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text, {"username": "boss", "user_id": 1})
+    assert ok is True
+    assert cat == "loader"
+
+
+def test_pampers_route_driver():
+    text = (
+        "Подработка в Детский мир — Pampers\n"
+        "Строго с авто\n"
+        "разместить рекламные материалы по фото-инструкции\n"
+        "Синий маршрут — 20 точек — 9 000 ₽\n"
+        "Кто готов взять маршрут — напишите\n"
+        "@support"
+    )
+    ok, cat, _, _ = evaluate_vacancy(text, {"username": "support", "user_id": 1})
+    assert ok is True
+    assert cat == "driver"
+
+
+def test_message_with_close_footer_still_parses_vacancy():
+    from parser import strip_vacancy_close_footer, is_vacancy_closed_text
+
+    text = (
+        "ЗАВТРА К 07:00\n"
+        "Требуются 3 человека\n"
+        "погрузка/разгрузка машин\n"
+        "Ставка 550р/час\n"
+        "@egorwave\n"
+        "ЗАКРЫТО❌❌❌"
+    )
+    assert is_vacancy_closed_text(text)
+    stripped = strip_vacancy_close_footer(text)
+    ok, cat, _, _ = evaluate_vacancy(stripped, {"username": "egorwave", "user_id": 1})
+    assert ok is True
+    assert cat == "loader"
+
     text = (
         "ИЩЕМ АКТИВНЫХ РЕБЯТ НА УПАКОВКУ\n"
         "📍 Москва, метро Марьино\n"

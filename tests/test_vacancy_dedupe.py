@@ -116,26 +116,19 @@ def test_daily_repost_detected_as_duplicate(monkeypatch):
     assert dup in ("exact", "fuzzy", "campaign")
 
 
-def test_detect_duplicate_excludes_self_for_channel_crosspost(tmp_db):
+def test_detect_duplicate_excludes_self_for_channel_crosspost(monkeypatch):
     """Кросс-пост в канал: вакансия не должна считаться дублем самой себя."""
-    from db import save_vacancy
     import parser as p
 
     body = "Нужен промоутер на выставку, 900 ₽/ч, Москва"
     dedupe_key = p.build_vacancy_dedupe_key(body, "@boss")
-    save_vacancy(
-        "vac_self",
-        "c1",
-        "Chat",
-        "promoter",
-        body,
-        "https://t.me/x/1",
-        "@boss",
-        None,
-        False,
-        dedupe_key,
-        "2026-06-19 10:00:00",
-    )
+
+    def fake_has_recent(dedupe_key, max_age_days=1, *, exclude_id=None):
+        return exclude_id != "vac_self"
+
+    monkeypatch.setattr(p, "has_recent_duplicate_vacancy", fake_has_recent)
+    monkeypatch.setattr(p, "get_recent_open_vacancies_for_dedupe", lambda *_a, **_k: [])
+
     dup = p.detect_duplicate_type(
         body,
         "@boss",

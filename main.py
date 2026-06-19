@@ -2686,11 +2686,23 @@ async def send_vacancy_to_subscribers(order: dict):
         msg_text, poster, force_category=force_cat,
     )
     if not accepted or not category_code:
-        logger.info(
-            f"Push skip {vacancy_id}: quality re-check ({gate_reason}), "
-            f"stored={order.get('category')}"
-        )
-        return
+        recheck_reason = gate_reason
+        if stored_cat and (
+            not mod_row or push_field(mod_row, PUSH_IDX_MODERATION) in (None, "approved")
+        ):
+            category_code = stored_cat
+            logger.info(
+                "Push use stored category %s for %s (re-check: %s)",
+                stored_cat,
+                vacancy_id,
+                recheck_reason,
+            )
+        else:
+            logger.info(
+                f"Push skip {vacancy_id}: quality re-check ({recheck_reason}), "
+                f"stored={order.get('category')}"
+            )
+            return
 
     cat_name = get_category_name(category_code)
 

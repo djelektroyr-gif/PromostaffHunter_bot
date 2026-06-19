@@ -175,6 +175,27 @@ _STRIKE_CLOSE_HINT = re.compile(
 )
 
 
+def strip_vacancy_close_footer(text: str) -> str:
+    """Убирает хвост «ЗАКРЫТО» — в одном посте часто и новая вакансия, и закрытие."""
+    if not text or not text.strip():
+        return text or ""
+    lines = text.strip().splitlines()
+    changed = True
+    while lines and changed:
+        changed = False
+        last = lines[-1].strip()
+        if re.search(r"^\s*закрыт[ао]?\s*❌*\s*$", last, re.I):
+            lines.pop()
+            changed = True
+            continue
+        for pat in _CLOSED_LINE_PATTERNS:
+            if pat.search(last):
+                lines.pop()
+                changed = True
+                break
+    return "\n".join(lines).strip()
+
+
 def is_vacancy_closed_text(text: str) -> bool:
     """Пост с «ЗАКРЫТО» в том же сообщении (частый паттерн в HelpersTeam)."""
     if not text or not text.strip():
@@ -822,19 +843,30 @@ async def _process_single_message(
             await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return closed
 
+    ingest_text = strip_vacancy_close_footer(message.text)
+    had_close_footer = ingest_text != (message.text or "").strip()
     if is_vacancy_closed_text(message.text):
-        closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
-        if not allow_reprocess:
-            await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
-        return closed
+        poster_peek = await extract_poster_info(message)
+        if not (
+            had_close_footer
+            and ingest_text
+            and has_hiring_signal(ingest_text)
+            and has_payment_signal(ingest_text)
+            and has_contact_signal(ingest_text, poster_peek)
+        ):
+            closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
+            if not allow_reprocess:
+                await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
+            return closed
 
     if allow_reprocess:
         return None
 
     poster = await extract_poster_info(message)
+    parse_text = ingest_text if had_close_footer and ingest_text else message.text
 
-    if should_split_digest(message.text):
-        blocks = split_vacancy_blocks(message.text)[:MAX_DIGEST_BLOCKS]
+    if should_split_digest(parse_text):
+        blocks = split_vacancy_blocks(parse_text)[:MAX_DIGEST_BLOCKS]
         if stats is not None:
             stats["digest_posts"] = stats.get("digest_posts", 0) + 1
         orders = []
@@ -867,10 +899,12 @@ async def _process_single_message(
                 stats["non_relevant"] += 1
         if not orders:
             return None
+        if had_close_footer:
+            await _close_vacancy_by_message_id(message_id, chat_id, stats)
         return orders if len(orders) > 1 else orders[0]
 
     order = await _save_parsed_vacancy_block(
-        block_text=message.text,
+        block_text=parse_text,
         message=message,
         chat=chat,
         chat_id=chat_id,
@@ -885,6 +919,9 @@ async def _process_single_message(
             stats["non_relevant"] += 1
         await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
         return None
+
+    if had_close_footer:
+        await _close_vacancy_by_message_id(message_id, chat_id, stats)
 
     await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
     return order
@@ -2064,6 +2101,7 @@ _CATEGORY_KEYWORDS = {
         "погрузка", "разгрузка", "выгрузка", "выгрузк", "разгрузк", "погрузк",
         "такелаж", "такелажник",
         "подъем на этаж", "подъём на этаж", "подъем на этажи", "подъём на этажи",
+        "поднять", "подъем", "подъём", "на этаж",
         "помощь мастерам", "работа на лесах",
         "выгрузить", "загрузить", "разгрузить", "перемещение фур", "фасовочн", "конвейер",
         "упаковщик", "фасовщик", "комплектовщик", "комплектовка", "упаковка на склад",
@@ -2082,7 +2120,10 @@ _CATEGORY_KEYWORDS = {
         "промо на", "промо в", "позиция: промо", "позиция промо",
         "дегустац",
     ],
-    "hostess": ["хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн"],
+    "hostess": [
+        "хостес", "встреча гостей", "приветствие", "встречать гостей", "администратор ресепшн",
+        "welcome", "велком", "welcom", "роль welcome", "на роль welcome",
+    ],
     "wardrobe": ["гардеробщик", "гардеробщица", "гардероб", "раздевалка", "прием верхней одежды", "выдача номерков"],
     "animator": [
         "аниматор", "аниматоры", "аниматорша", "анимация", "детский праздник", "клоун",
@@ -2136,6 +2177,7 @@ _CATEGORY_KEYWORDS = {
         "застройщик", "стендов", "выставочн", "баннер", "натяжк баннер",
         "октанорм", "octanorm", "павильон", "конструкц", "забор стенд",
         "сборка стенд", "демонтаж стенд",
+        "разместить материал", "фотоотчёт", "фотоотчет", "маршрут",
     ],
     "merchandiser": [
         "мерчендайз", "мерчанд", "выкладк", "дегустац", "трейд маркетинг",
@@ -2243,6 +2285,8 @@ _LOADER_WAREHOUSE_COMBO_RE = re.compile(
 def _loader_role_confirmed(tl: str) -> bool:
     """Грузчик: явная роль или склад вместе с погрузкой/разгрузкой — не одно слово «склад»."""
     if re.search(r"упаковк", tl):
+        return True
+    if re.search(r"поднять|подъем|подъём", tl) and re.search(r"этаж|\d+\s*кг", tl):
         return True
     if any(w in tl for w in _LOADER_STRONG_HINTS):
         return True
@@ -2408,6 +2452,35 @@ def _security_role_confirmed(text_lower: str) -> bool:
         w in text_lower
         for w in ("охранник", "охрана", "контрол", "секьюрити", "пропускной")
     )
+
+
+def _is_welcome_hostess_hiring(text_lower: str) -> bool:
+    """Модель/актриса на welcome у бренда — хостес на мероприятии, не кино-кастинг."""
+    if not text_lower:
+        return False
+    if re.search(r"welcome|велком|welcom", text_lower):
+        return True
+    if re.search(r"модел\w*|актрис", text_lower) and re.search(
+        r"welcome|велком|welcom|хостес|встреч", text_lower,
+    ):
+        return True
+    return bool(re.search(r"на\s+роль\s+(?:welcome|велком)", text_lower))
+
+
+def _has_explicit_hostess_role(text_lower: str) -> bool:
+    if _is_welcome_hostess_hiring(text_lower):
+        return True
+    return bool(re.search(
+        r"хостес|ресепшн|встреча гостей|встречать гостей|приветств",
+        text_lower,
+    ))
+
+
+def _has_route_driver_role(text_lower: str) -> bool:
+    """Маршрут по точкам на своём авто — водитель, не курьер доставки."""
+    if not re.search(r"авто|машин", text_lower):
+        return False
+    return bool(re.search(r"маршрут|точек|точка", text_lower))
 
 
 def _is_driver_role(text_lower: str) -> bool:
@@ -2896,6 +2969,10 @@ def _detect_category_scored(text: str) -> str | None:
         return "electrician"
     if _has_explicit_animator_role(text_lower):
         return "animator"
+    if _has_explicit_hostess_role(text_lower):
+        return "hostess"
+    if _has_route_driver_role(text_lower):
+        return "driver"
     if re.search(r"упаковк", text_lower) and not re.search(
         r"промоутер|раздача листовок|дегустац|промо[\s\-]*акци", text_lower,
     ):
@@ -2931,15 +3008,13 @@ def is_roleplay_acting_job(text: str) -> bool:
     if not text:
         return False
     tl = text.lower()
-    acting_markers = (
-        "по сценарию", "видеовизитк", "игровые", "визжат",
-        "съемк", "съёмк", "массовк", "статист", "эпизодник",
-    )
-    if not any(m in tl for m in acting_markers):
+    if _is_welcome_hostess_hiring(tl):
         return False
     if "охранник" in tl and any(m in tl for m in ("игровые", "по сценарию", "девушк")):
         return True
-    if "девушк" in tl and any(m in tl for m in ("по сценарию", "видеовизитк", "игровые")):
+    if "по сценарию" in tl and "девушк" in tl:
+        return True
+    if "игровые" in tl and "девушк" in tl and "визжат" in tl:
         return True
     return False
 
@@ -2967,11 +3042,28 @@ def is_camp_educator_job(text: str) -> bool:
     return bool(re.search(r"вожат", text.lower()))
 
 
+_PROMO_PHOTO_SELECTION_MARKERS = (
+    "дегустац", "промоутер", "промо ", "промо-", "промо.", "акци", "мерчендайз",
+    "раздача листовок", "листовок", "глобус", "дегустация",
+)
+
+
+def _is_promo_photo_selection(text_lower: str) -> bool:
+    """Отбор по фото для промо/дегустации — найм персонала, не модельный кастинг."""
+    if "фотокастинг" not in text_lower and "фото кастинг" not in text_lower:
+        return False
+    return any(w in text_lower for w in _PROMO_PHOTO_SELECTION_MARKERS)
+
+
 def is_casting_call(text: str) -> bool:
     """Кастинг моделей/съёмок — не event-staff."""
     if not text:
         return False
     tl = text.lower()
+    if _is_welcome_hostess_hiring(tl):
+        return False
+    if _is_promo_photo_selection(tl):
+        return False
     markers = (
         "кастинг", "casting", "фотомодел", "видеомодел", "модель на съём",
         "модель на съем", "моделей на реклам", "open call",
@@ -2981,6 +3073,7 @@ def is_casting_call(text: str) -> bool:
     event_staff = (
         "промоутер", "хостес", "хелпер", "хэлпер", "грузчик", "аниматор",
         "мероприят", "на площадке", "смен", "персонал", "официант",
+        "дегустац", "промо", "акци", "глобус",
     )
     return not any(w in tl for w in event_staff)
 
@@ -3236,15 +3329,24 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         if not any(w in tl for w in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "промо", "нужны", "требу")):
             return False, "excluded_organizer", []
     for category in EXCLUDE_CATEGORIES:
-        if category.lower() in tl:
-            if not any(hw in tl for hw in ("хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "нужны", "требу")):
-                if (
-                    _STAFF_ROLE_HASHTAG_RE.search(text)
-                    and has_payment_signal(text)
-                    and has_contact_signal(text, poster)
-                ):
-                    continue
-                return False, f"excluded_category: {category}", []
+        cat_low = category.lower()
+        if cat_low == "кастинг" and _is_promo_photo_selection(tl):
+            continue
+        if cat_low in ("модель", "актриса", "актер") and _is_welcome_hostess_hiring(tl):
+            continue
+        if cat_low not in tl:
+            continue
+        if not any(hw in tl for hw in (
+            "хелпер", "хэлпер", "промоутер", "аниматор", "грузчик", "нужны", "требу",
+            "дегустац", "промо", "акци", "глобус", "хостес", "welcome", "велком",
+        )):
+            if (
+                _STAFF_ROLE_HASHTAG_RE.search(text)
+                and has_payment_signal(text)
+                and has_contact_signal(text, poster)
+            ):
+                continue
+            return False, f"excluded_category: {category}", []
     if not has_hiring_signal(text):
         return False, "no_hiring", []
     if not has_payment_signal(text):
@@ -3343,7 +3445,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if is_service_request(text):
             return False
     elif category == "hostess":
-        if not any(w in tl for w in ("хостес", "ресепшн", "встреча гостей", "встречать гостей")):
+        if not _has_explicit_hostess_role(tl):
             return False
     elif category == "wardrobe":
         if not any(w in tl for w in ("гардероб", "гардеробщ", "раздевалка", "номерков")):
