@@ -174,3 +174,116 @@ def test_message_with_close_footer_still_parses_vacancy():
     assert ok is True
     assert cat == "loader"
     assert reason == "accepted"
+
+
+def test_fridge_move_loader_not_electrician():
+    text = (
+        "Ⓜ️ Пионерская / Срочно\n"
+        "Задача: спустить холодильник. 7 этаж. Лифта нет.\n"
+        "поднять на 15 этаж. есть грузовой лифт\n"
+        "ОПЛАТА: 1800\n"
+        "@gruzrabota52"
+    )
+    assert detect_category(text) == "loader"
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "gruzrabota52", "user_id": 1})
+    assert ok is True
+    assert cat == "loader"
+    assert reason in ("accepted", "soft_accept:loader")
+
+
+def test_fridge_vitrine_unload_loader():
+    text = (
+        "Выгрузка и занос на 1й этаж 2х холодильных витрин по 240кг.\n"
+        "такелажные ремни. 550/ч\n"
+        "@Alex_Gruz"
+    )
+    assert detect_category(text) == "loader"
+
+
+def test_courier_own_car_rejected():
+    text = (
+        "🚗 Работа курьером на своем авто! Заработок без потолка!\n"
+        "Ищем курьеров с личными автомобилями для развоза заказов.\n"
+        "Минимальная нагрузка: от 22 смен\n"
+        "@MarkBondarev_1"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "MarkBondarev_1", "user_id": 1})
+    assert ok is False
+    assert cat is None
+    assert reason == "delivery_courier"
+
+
+def test_facility_cleaning_handyman_not_loader():
+    text = (
+        "Работа На Сегодня\n"
+        "4000 ₽/смена\n"
+        "Задача: Уборка На Территории\n"
+        "• уборка в цеху\n"
+        "@Artem_disp"
+    )
+    assert detect_category(text) == "handyman"
+    ok, cat, _, _ = evaluate_vacancy(text, {"username": "Artem_disp", "user_id": 1})
+    assert ok is True
+    assert cat == "handyman"
+
+
+def test_production_packer_handyman_not_loader():
+    text = (
+        "На завтра 2 упаковщицы Подольск\n"
+        "Упаковка роботов-пылесосов\n"
+        "с 9:30 до 18:30\n"
+        "550 ₽/ч\n"
+        "@nmk_everyone"
+    )
+    assert detect_category(text) == "handyman"
+    ok, cat, _, _ = evaluate_vacancy(text, {"username": "nmk_everyone", "user_id": 1})
+    assert ok is True
+    assert cat == "handyman"
+
+
+def _unicode_strike(text: str) -> str:
+    return "".join(c + "\u0336" if c.isalnum() else c for c in text)
+
+
+def test_unicode_strikethrough_gruzchik_order_parses_loader():
+    plain = (
+        "ЗАВТРА в 10:00 БЕЗ ОПОЗДАНИЙ\n"
+        "Нужен 1 грузчик. Всего будет - 4\n"
+        "Метро Царицыно. От метро 2650 метров.\n"
+        "Фронт работ: Выгрузка контейнера\n"
+        "Выплата по безналу с 16.00 до 20.00\n"
+        "450/4/1800\n"
+        "Заказ № 72297 - ТИ - ТИ"
+    )
+    struck = _unicode_strike(plain)
+    from parser import (
+        has_hiring_signal,
+        is_unicode_strikethrough_closure,
+        normalize_ingest_text,
+    )
+
+    assert is_unicode_strikethrough_closure(struck)
+    assert not has_hiring_signal(struck)
+    normalized = normalize_ingest_text(struck)
+    assert has_hiring_signal(normalized)
+    ok, cat, reason, _ = evaluate_vacancy(
+        struck, {"username": "gruzchik_plus", "user_id": 1},
+    )
+    assert ok is True
+    assert cat == "loader"
+    assert reason in ("accepted", "soft_accept:loader", "wide_accept:loader")
+
+
+def test_montazhnik_zil_without_rate_wide_accept():
+    text = (
+        "Нужен монтажник  на 26 июня 2026 с 9:30 до 13:30\n"
+        "Москва, ЗИЛ\n"
+        "Разгрузить машину\n"
+        "Собрать металический каркас 210*240\n"
+        "Собрать каркас из бруса 210*240\n"
+        "Для отклика - @Glazunova_Daria01"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "Glazunova_Daria01", "user_id": 1})
+    assert ok is True
+    assert cat in ("booth", "helper", "loader")
+    assert reason == "accepted" or reason.startswith(("soft_accept:", "wide_accept:"))

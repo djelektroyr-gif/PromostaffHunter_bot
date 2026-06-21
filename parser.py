@@ -246,6 +246,33 @@ def is_strikethrough_closure(text: str, entities=None) -> bool:
     return len(struck) / full_len >= 0.28
 
 
+_UNICODE_STRIKE_RE = re.compile(r"[\u0330-\u0339\u033d-\u033f\u20e5]")
+
+
+def normalize_ingest_text(text: str) -> str:
+    """Убирает «ручное» зачёркивание Unicode (канал ГРУЗЧИК+ и др.) — иначе no_hiring."""
+    if not text:
+        return ""
+    cleaned = _UNICODE_STRIKE_RE.sub("", text)
+    cleaned = re.sub(r"°+", " ", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def is_unicode_strikethrough_closure(text: str) -> bool:
+    """Пост целиком в combining-strikethrough — закрытый заказ, не шум."""
+    if not text:
+        return False
+    strikes = len(_UNICODE_STRIKE_RE.findall(text))
+    if strikes < 15:
+        return False
+    alnum = sum(1 for c in text if c.isalnum())
+    return strikes >= max(12, alnum // 3)
+
+
+def is_message_strikethrough_closed(text: str, entities=None) -> bool:
+    return is_strikethrough_closure(text, entities) or is_unicode_strikethrough_closure(text)
+
+
 async def _close_vacancy_by_message_id(
     message_id: str, chat_id: str, stats: dict = None,
 ) -> dict | None:
@@ -312,6 +339,7 @@ def _chat_bucket(stats: dict | None, chat_title: str) -> dict:
             "scanned": 0,
             "matched": 0,
             "rejected": 0,
+            "closed_skip": 0,
             "role_mismatch": 0,
             "already_sent": 0,
             "old": 0,
@@ -351,7 +379,7 @@ def _bump_chat_stat(stats: dict | None, chat_title: str, field: str, reason: str
     if stats is None or not chat_title:
         return
     bucket = _chat_bucket(stats, chat_title)
-    if field in ("scanned", "matched", "role_mismatch", "already_sent", "old", "no_text"):
+    if field in ("scanned", "matched", "role_mismatch", "already_sent", "old", "no_text", "closed_skip"):
         bucket[field] = bucket.get(field, 0) + 1
     elif field == "rejected":
         bucket["rejected"] = bucket.get("rejected", 0) + 1
@@ -465,11 +493,18 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
         scanned = bucket.get("scanned") or 0
         matched = bucket.get("matched") or 0
         rejected = bucket.get("rejected") or 0
-        total = max(scanned, matched + rejected)
+        closed_skip = bucket.get("closed_skip") or 0
+        total = max(scanned, matched + rejected + closed_skip)
         noise_pct = int(rejected * 100 / total) if total else 0
         ranked.append((noise_pct, title, bucket, total))
     ranked.sort(reverse=True)
-    for noise_pct, title, bucket, total in ranked[:12]:
+    shown = 0
+    for noise_pct, title, bucket, total in ranked:
+        if shown >= 25:
+            break
+        if total <= 0 and not (bucket.get("scanned") or 0):
+            continue
+        shown += 1
         top_reason = ""
         reasons = bucket.get("reasons") or {}
         if reasons:
@@ -479,13 +514,20 @@ def format_chat_noise_report(stats: dict | None = None) -> str:
         mm = f", вне профиля чата: {mismatch}" if mismatch else ""
         already = bucket.get("already_sent") or 0
         al = f", уже в БД: {already}" if already else ""
+        closed = bucket.get("closed_skip") or 0
+        cl = f", закрыто: {closed}" if closed else ""
         lines.append(
             f"• <b>{escape_html(title)}</b> — шум ~{noise_pct}% "
             f"({bucket.get('rejected', 0)}/{total}), "
-            f"в ленту: {bucket.get('matched', 0)}{escape_html(mm)}{escape_html(al)}"
+            f"в ленту: {bucket.get('matched', 0)}{escape_html(mm)}{escape_html(al)}{escape_html(cl)}"
             f"{escape_html(top_reason)}"
         )
-    lines.append("\nПрофиль чата: <code>/setchatroles ссылка promoter,helper,loader</code>")
+    if len(ranked) > shown:
+        lines.append(f"\n<i>… ещё {len(ranked) - shown} чатов (показаны топ-{shown} по шуму)</i>")
+    lines.append(
+        "\n<i>«Закрыто» — снятые заказы (зачёркивание), не шум.</i>\n"
+        "Профиль чата: <code>/setchatroles ссылка promoter,helper,loader</code>"
+    )
     return "\n".join(lines)
 
 
@@ -837,7 +879,29 @@ async def _process_single_message(
             if closed:
                 return closed
 
-    if is_strikethrough_closure(message.text, entities):
+    if is_strikethrough_closure(message.text, entities) or is_unicode_strikethrough_closure(message.text or ""):
+        normalized = normalize_ingest_text(message.text or "")
+        if is_unicode_strikethrough_closure(message.text or "") and normalized.strip():
+            poster_peek = await extract_poster_info(message)
+            ok_staff, _, _ = is_job_post_for_staff(normalized, poster_peek)
+            if ok_staff:
+                poster = poster_peek or await extract_poster_info(message)
+                order = await _save_parsed_vacancy_block(
+                    block_text=normalized,
+                    message=message,
+                    chat=chat,
+                    chat_id=chat_id,
+                    chat_title=chat_title,
+                    message_id=message_id,
+                    poster=poster,
+                    block_index=None,
+                    stats=stats,
+                )
+                if order:
+                    await _close_vacancy_by_message_id(message_id, chat_id, stats)
+                    if not allow_reprocess:
+                        await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
+                    return order
         closed = await _close_vacancy_by_message_id(message_id, chat_id, stats)
         if not allow_reprocess:
             await _mark_scanned_message(message, chat_id, allow_reprocess=allow_reprocess)
@@ -863,7 +927,9 @@ async def _process_single_message(
         return None
 
     poster = await extract_poster_info(message)
-    parse_text = ingest_text if had_close_footer and ingest_text else message.text
+    parse_text = normalize_ingest_text(
+        ingest_text if had_close_footer and ingest_text else message.text or ""
+    )
 
     if should_split_digest(parse_text):
         blocks = split_vacancy_blocks(parse_text)[:MAX_DIGEST_BLOCKS]
@@ -939,11 +1005,16 @@ def _audit_record_eval(stats: dict | None, chat_title: str, block_text: str, pos
             stats["categories"][category] = stats["categories"].get(category, 0) + 1
             stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
     else:
-        _bump_chat_stat(stats, chat_title, "rejected", reason)
-        if stats is not None:
-            stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
-            stats["non_relevant"] += 1
-        _record_reject_sample(stats, chat_title, reason, block_text, category=category)
+        if reason == "closed_vacancy":
+            _bump_chat_stat(stats, chat_title, "closed_skip")
+            if stats is not None:
+                stats["closed_skipped"] = stats.get("closed_skipped", 0) + 1
+        else:
+            _bump_chat_stat(stats, chat_title, "rejected", reason)
+            if stats is not None:
+                stats["reasons"][reason] = stats["reasons"].get(reason, 0) + 1
+                stats["non_relevant"] += 1
+            _record_reject_sample(stats, chat_title, reason, block_text, category=category)
 
 
 async def _audit_evaluate_message(
@@ -957,15 +1028,25 @@ async def _audit_evaluate_message(
             stats["no_text"] += 1
         _bump_chat_stat(stats, chat_title, "no_text")
         return
+    raw = message.text
+    entities = getattr(message, "entities", None)
+    if is_message_strikethrough_closed(raw, entities):
+        if stats is not None:
+            stats["messages_scanned"] = stats.get("messages_scanned", 0) + 1
+            stats["closed_skipped"] = stats.get("closed_skipped", 0) + 1
+        _bump_chat_stat(stats, chat_title, "scanned")
+        _bump_chat_stat(stats, chat_title, "closed_skip")
+        return
+    text = normalize_ingest_text(raw)
     poster = await extract_poster_info(message) if fetch_poster else None
-    if should_split_digest(message.text):
+    if should_split_digest(text):
         if stats is not None:
             stats["digest_posts"] = stats.get("digest_posts", 0) + 1
-        for block in split_vacancy_blocks(message.text)[:MAX_DIGEST_BLOCKS]:
-            enriched = enrich_digest_block(block, message.text)
+        for block in split_vacancy_blocks(text)[:MAX_DIGEST_BLOCKS]:
+            enriched = enrich_digest_block(block, raw)
             _audit_record_eval(stats, chat_title, enriched, poster)
         return
-    _audit_record_eval(stats, chat_title, message.text, poster)
+    _audit_record_eval(stats, chat_title, text, poster)
 
 
 def _message_utc(message) -> datetime:
@@ -2236,9 +2317,50 @@ def _helper_quality_marker_hit(text_lower: str, marker: str) -> bool:
     return marker in text_lower
 
 
+def _is_appliance_move_job(text_lower: str) -> bool:
+    """Перенос холодильника/витрины — грузчик, не электромонтаж."""
+    if not text_lower:
+        return False
+    if not re.search(r"холодильн|витрин", text_lower):
+        return False
+    return bool(re.search(
+        r"спустить|поднять|подъ[её]м|занос|выгруз|разгруз|"
+        r"этаж|\d+\s*кг|такелаж",
+        text_lower,
+    ))
+
+
+def _is_facility_cleaning_job(text_lower: str) -> bool:
+    """Уборка цеха/территории без погрузки — разнорабочий, не грузчик."""
+    if not text_lower or not re.search(r"уборк", text_lower):
+        return False
+    if not re.search(r"цех|территор|производств", text_lower):
+        return False
+    if any(w in text_lower for w in (
+        "разгруз", "погруз", "выгруз", "грузчик", "такелаж", "поднять", "подъем", "подъём",
+    )):
+        return False
+    return True
+
+
+def _is_production_packing_job(text_lower: str) -> bool:
+    """Упаковщик на линии/в цеху — handyman, не event-грузчик."""
+    if not text_lower or not re.search(r"упаков", text_lower):
+        return False
+    if re.search(r"промоутер|раздача листовок|дегустац|promo[\s\-]*акци", text_lower):
+        return False
+    if any(w in text_lower for w in ("грузчик", "разгруз", "погруз", "выгруз", "такелаж", "фура")):
+        return False
+    if re.search(r"упаковщ", text_lower):
+        return True
+    return bool(re.search(r"цех|робот|пылесос|конвейер", text_lower))
+
+
 def is_skilled_trade_job(text_lower: str) -> bool:
     """Профессия-специалист — отдельная категория electrician, не reject."""
     if not text_lower:
+        return False
+    if _is_appliance_move_job(text_lower):
         return False
     if not any(m in text_lower for m in _SKILLED_TRADE_MARKERS):
         return False
@@ -2284,7 +2406,7 @@ _LOADER_WAREHOUSE_COMBO_RE = re.compile(
 
 def _loader_role_confirmed(tl: str) -> bool:
     """Грузчик: явная роль или склад вместе с погрузкой/разгрузкой — не одно слово «склад»."""
-    if re.search(r"упаковк", tl):
+    if re.search(r"упаковк", tl) and not _is_production_packing_job(tl):
         return True
     if re.search(r"поднять|подъем|подъём", tl) and re.search(r"этаж|\d+\s*кг", tl):
         return True
@@ -2965,6 +3087,10 @@ def _detect_category_scored(text: str) -> str | None:
     if not text:
         return None
     text_lower = text.lower()
+    if _is_appliance_move_job(text_lower):
+        return "loader"
+    if _is_facility_cleaning_job(text_lower):
+        return "handyman"
     if is_skilled_trade_job(text_lower):
         return "electrician"
     if _has_explicit_animator_role(text_lower):
@@ -2976,6 +3102,8 @@ def _detect_category_scored(text: str) -> str | None:
     if re.search(r"упаковк", text_lower) and not re.search(
         r"промоутер|раздача листовок|дегустац|промо[\s\-]*акци", text_lower,
     ):
+        if _is_production_packing_job(text_lower):
+            return "handyman"
         return "loader"
     if _has_technician_role(text_lower):
         return "helper"
@@ -3026,13 +3154,26 @@ def is_delivery_courier_job(text: str) -> bool:
     tl = text.lower()
     if "курьер" not in tl:
         return False
-    if re.search(r"водител|личн\w+\s+авто|категор\w*\s+прав|экспедитор", tl):
+    if _has_route_driver_role(tl):
         return False
-    return bool(
-        re.search(r"ваканси\w*\s+курьер", tl)
-        or re.search(r"курьер\w*\s+с\s+ежедневн", tl)
-        or ("доставк" in tl and "курьер" in tl)
-    )
+    if re.search(r"мероприят|event staff|промоутер|хелпер|хэлпер", tl):
+        return False
+    gig_courier = bool(re.search(
+        r"доставк|развоз|заказов|"
+        r"сво[еёи]м\s+авто|с\s+личн|личн\w+\s+авт|"
+        r"работа\s+курьер|курьер\w*\s+на\s+сво|"
+        r"без\s+потолка|"
+        r"курьер\w*\s+с\s+ежедневн|ваканси\w*\s+курьер",
+        tl,
+    ))
+    if gig_courier:
+        return True
+    if re.search(r"водител|экспедитор", tl) and not re.search(
+        r"доставк|развоз|заказов|сво[еёи]м\s+авто|личн\w+\s+авт",
+        tl,
+    ):
+        return False
+    return bool("доставк" in tl and "курьер" in tl)
 
 
 def is_camp_educator_job(text: str) -> bool:
@@ -3515,10 +3656,19 @@ def _has_deferred_payment_context(text: str) -> bool:
     ):
         has_date = True
     has_hours = bool(re.search(r"\d+\s*\+\s*\d+|\d+\s*час", tl))
+    has_time_range = bool(re.search(r"\d{1,2}[:.]\d{2}\s*(?:до|-)\s*\d{1,2}[:.]\d{2}", tl))
+    has_staff_role = bool(re.search(
+        r"(?<![а-яё])(?:монтажник|хелпер|хэлпер|грузчик|промоутер|"
+        r"хостес|аниматор|официант|разнорабоч)\w*",
+        tl,
+    ))
     has_pay_hint = any(w in tl for w in (
         "оплат", "ставк", "₽", "руб", "гонорар", "зарплат", "доход", "бюджет", "тысяч", "тыс",
     ))
-    return (has_shift or has_date or has_hours) and (has_people or has_pay_hint)
+    role_shift = has_staff_role and (has_date or has_time_range or has_shift)
+    return (has_shift or has_date or has_hours or has_time_range) and (
+        has_people or has_pay_hint or role_shift
+    )
 
 
 def _has_implicit_contact_intent(text: str) -> bool:
@@ -3613,6 +3763,9 @@ def evaluate_vacancy(
     text: str, poster: dict | None = None, *, force_category: str | None = None,
 ) -> tuple[bool, str | None, str, list]:
     """Полный P0-pipeline: staff gate → category → per-category gate."""
+    text = normalize_ingest_text(text or "")
+    if not text:
+        return False, None, "empty", []
     if should_split_digest(text):
         return False, None, "digest_split_required", []
     ok, reason, keywords = is_job_post_for_staff(text, poster)
