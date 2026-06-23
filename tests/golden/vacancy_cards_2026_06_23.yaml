@@ -1,0 +1,328 @@
+# Эталон: push PromoStaff Hunter, 23.06.2026
+# Фокус: primary category + строка адреса на карточке
+# Источник: лента подписчика (фрагменты текста из push)
+
+meta:
+  date: "2026-06-23"
+  author: owner
+  purpose: "Роль и 📍 — не базовый ingest"
+
+cases:
+  - id: jun23_promo_vdnh_ok
+    title: "Промо ВДНХ — эталон «хорошо»"
+    text: |
+      Пресс-мероприятие одного крупного московского проекта
+      Ищем промо с опытом работы на конференциях/форумах/выставках
+      Презентабельная девушка, до 25 лет
+      м. ВДНХ
+      23 июня (СЕГОДНЯ), с 15:30 до 19:00
+      Оплата 3500р
+      @ramil_ve
+    bot_wrong:
+      role: promoter
+      address: "metro:вднх"
+    expected_ingest: true
+    expected_primary_category: promoter
+    expected_address: "м. ВДНХ"
+    notes: "Контрольный «как должно быть»."
+
+  - id: jun23_promo_vdnh_foto_line
+    title: "Тот же заказ — в 📍 попала строка про фото"
+    text: |
+      Ищем промо с опытом работы на конференциях/форумах/выставках
+      м. ВДНХ
+      ФОТО - 2 штуки (портрет и полный рост).
+      23 июня, с 15:30, Оплата 3500р
+      @ramil_ve
+    bot_wrong:
+      role: promoter
+      address: "ФОТО - 2"
+    expected_ingest: true
+    expected_primary_category: promoter
+    expected_address: "м. ВДНХ"
+    notes: "Дубль кампании; адрес из соседнего поста / метро в тексте, не требование к фото."
+
+  - id: jun23_promo_chekhov
+    title: "Промо Чехов — в 📍 фраза «взять 4 промоутеров»"
+    text: |
+      27 июня. На мероприятие нужен промо на машине (парень или девочка)
+      Мероприятие будет в Чехове
+      Нужно будет взять с собой 4 промоутера от метро, там поработать и вернуть к метро
+      выдавать кофе гостям, работа на регистрации
+      @ruslan_smyshlyaev
+    bot_wrong:
+      role: promoter
+      address: "Нужно будет взять с собой 4"
+    expected_ingest: true
+    expected_primary_category: promoter
+    expected_address: "Чехов, МО"
+    notes: "Город в теле поста; не путать с задачей «привезти людей»."
+
+  - id: jun23_security_vakhta
+    title: "Охрана вахта — не разовая смена"
+    text: |
+      Требуются сотрудники охраны с удостоверением!!!
+      Московской области
+      4000 ₽/смена
+      График вахта 15х15, 30х30, проживание, питание
+      Прямой работодатель. Выплаты два раза в месяц.
+    bot_wrong:
+      role: security
+      address: "Московской области"
+    expected_ingest: false
+    reject_reason: permanent
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Вахта/постоянка — не целевой продукт Hunter (разовые смены)."
+
+  - id: jun23_fasovka_dubrovka
+    title: "Фасовка на производстве — не чистый грузчик"
+    text: |
+      Требуется на подработку 24 июня. Работа не тяжелая
+      мцк Дубровка или метро Дубровка, торговый центр Мозаика, 1 этаж
+      Фасовка / упаковка сухой смеси в баночки
+      женщина от 23 до 45 лет, с 11 до 18.30, 3700 за смену
+    bot_wrong:
+      role: loader
+      address: "мцк Дубровка или метро Дубровка ,торговый центр Мозаика ... фасовщик"
+    expected_ingest: true
+    expected_primary_category: handyman
+    expected_address: "м. Дубровка, ТЦ Мозаика"
+    notes: "Упаковка/фасовка → handyman или misc; в 📍 без телефона и слова «фасовщик»."
+
+  - id: jun23_loader_khodynka
+    title: "Грузчики Ходынка — адрес ок"
+    text: |
+      Сегодня 3 человека к 10:30
+      Москва, Ходынский бульвар 22
+      Задача: выгрузить 5 ящиков 130кг, ремни с собой
+      Оплата: 500/ч, 2000 за смену
+      @artem_logist34
+    bot_wrong:
+      role: loader
+      address: "Москва, Ходынский бульвар 22, Задача: выгрузить..."
+    expected_ingest: true
+    expected_primary_category: loader
+    expected_address: "м. ЦСКА / Ходынский б-р, 22"
+    notes: "Обрезать задачу из поля адреса."
+
+  - id: jun23_loader_sokolniki
+    title: "Сокольники — адрес в тексте, 📍 пустой"
+    text: |
+      На сегодня нужна пара грузчиков. Сокольники. 12:00.
+      @katialunina22
+    bot_wrong:
+      role: loader
+      address: null
+    expected_ingest: true
+    expected_primary_category: loader
+    expected_address: "м. Сокольники"
+    notes: "Короткий пост: вытащить район из тела, не оставлять 📍 пустым."
+
+  - id: jun23_loader_shpatlevka
+    title: "Разгрузка — в 📍 повтор задачи"
+    text: |
+      Разгрузить машину
+      Шпатлевка 50 ведер по 25 кг и Плита ГВЛ 120 шт
+      на сегодня с 10:30, 450 ₽/ч, 5 часов
+      @FII_van
+    bot_wrong:
+      role: loader
+      address: "Разгрузить машину"
+    expected_ingest: true
+    expected_primary_category: loader
+    expected_address: "уточнить в ЛС / адрес в оригинале канала"
+    notes: "Если в канале нет адреса — честно «адрес уточняйте», не дублировать задачу."
+
+  - id: jun23_helper_photobooth
+    title: "Фотобудка — хелпер, адрес есть"
+    text: |
+      НАЖИМАТЬ СТАРТ НА ФОТОБУДКЕ
+      Москва, ул. Ленинская Слобода
+      25 июня 14:00—17:00, ROYAL BLANC, д.26, стр.35
+      @photofabrika
+    bot_wrong:
+      role: helper
+      address: "Москва, ул. Ленинская Слобода"
+    expected_ingest: true
+    expected_primary_category: helper
+    expected_address: "м. Автозаводская, ул. Ленинская Слобода, 26с35"
+    notes: "Дополнить корпусом из текста."
+
+  - id: jun23_helper_kazansky
+    title: "Хелперы Казанский вокзал"
+    text: |
+      Нужны Хэлперы
+      25.06 Казанский вокзал
+      с 8:30 до 10:30, помогать детям затаскивать чемодан
+      оплата 500 в час
+    bot_wrong:
+      role: helper
+      address: null
+    expected_ingest: true
+    expected_primary_category: helper
+    expected_address: "Казанский вокзал, Москва"
+    notes: "Дата/вокзал в теле — обязательно в 📍."
+
+  - id: jun23_brigade_resume_montazh
+    title: "«Свободны 14 монтажников» — резюме бригады"
+    text: |
+      С 23.06 свободны 14 универсалов/монтажников + шеф-монтажа.
+      Москва, ВДНХ
+      Работали на выставке Россия, ПМЭФ...
+      Фото, видео работ по запросу!
+    bot_wrong:
+      role: booth
+      address: "Москва, ВДНХ"
+    expected_ingest: false
+    reject_reason: resume
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Ищут работу исполнители, не заказ на смену."
+
+  - id: jun23_vakhta_kolomna_handyman
+    title: "Вахта разнорабочие Коломенский р-н"
+    text: |
+      Работа/Вахта на 2 недели/Коломенский р-н
+      Нужны Разнорабочие на Монолитные Работы
+      М/О, Коломенский р-н, д Щурово
+      С 09:00 до 19:00, вахта
+    bot_wrong:
+      role: loader
+      address: null
+    expected_ingest: false
+    reject_reason: permanent
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Вахта 2 недели — не event-смена."
+
+  - id: jun23_khabarovsk_multi
+    title: "Хабаровск — промо+фото+хелпер"
+    text: |
+      требуется 1 человек Промо, 1 фотограф и 1 Хелпер
+      ХАБАРОВСК
+      Платинум Арена, Ул Дикопольцева 12
+      10-18:00 (приезд к 8:30)
+    bot_wrong:
+      role: helper
+      address: "Платинум Арена, Ул Дикопольцева 12..."
+    expected_ingest: true
+    expected_primary_category: promoter
+    expected_address: "Хабаровск, ул. Дикопольцева, 12"
+    notes: "Primary — промо; для московских подписчиков фильтр geo на выдаче."
+
+  - id: jun23_coordinator_as_promoter
+    title: "Координаторы — не промоутер"
+    text: |
+      Сюда еще нужны Координаторы 5
+      25 июня Московская консерватория
+      информирование гостей, помощь на площадке
+      @majoreventsmanager
+    bot_wrong:
+      role: promoter
+      address: "Сюда еще нужны"
+    expected_ingest: true
+    expected_primary_category: helper
+    expected_address: "Московская консерватория, Москва"
+    notes: "Координатор на площадке → helper, не promoter."
+
+  - id: jun23_guitarist_as_hostess
+    title: "Гитарист на свадьбу — не хостес"
+    text: |
+      На 24.06 нужен гитарист. Задача играть на welcome на свадьбе.
+      Бюджет небольшой. @klgnmx
+    bot_wrong:
+      role: hostess
+      address: null
+    expected_ingest: true
+    expected_primary_category: misc
+    expected_address: "уточнить у заказчика"
+    notes: "Гитарист → misc (отдельной категории нет), не hostess и не dj."
+
+  - id: jun23_earngo_spam
+    title: "EarnGo — реклама чатов"
+    text: |
+      Welcome, EarnGo Заработок
+      Разместите рекламу в Telegram чатах
+    bot_wrong:
+      role: hostess
+      address: null
+    expected_ingest: false
+    reject_reason: spam
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Не вакансия."
+
+  - id: jun23_fake_hostess_job_title
+    title: "Заголовок вакансии вместо адреса"
+    text: |
+      Человек в уютное пространство - 6200 - 3/2
+      встречать гостей, навигация по залу
+      Пиши в чат
+    bot_wrong:
+      role: hostess
+      address: "Человек в уютное пространство  -  6200"
+    expected_ingest: false
+    reject_reason: spam
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Постоянка без адреса / типичный спам-шаблон."
+
+  - id: jun23_casting_sochi_actors
+    title: "Кастинг актёров — не грузчик"
+    text: |
+      (ТОЛЬКО СОЧИ/АДЛЕР) смотрим актеров на главные роли
+      Баба Роза (62 года)... Дядя БОРЯ... СЛАВИК...
+    bot_wrong:
+      role: loader
+      address: "СЪЕМКИ УЖЕ С 10"
+    expected_ingest: false
+    reject_reason: casting
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Кастинг/съёмки — другой продукт."
+
+  - id: jun23_realty_spam
+    title: "Реклама квартир от застройщика"
+    text: |
+      Ремонт от застройщика — на выбор.
+      ЖК «Страна.Парковая» 15 мин от парка
+      Получите подборку по ссылке
+      #реклама
+    bot_wrong:
+      role: booth
+      address: "метро рф"
+    expected_ingest: false
+    reject_reason: spam
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Явная реклама недвижимости."
+
+  - id: jun23_forklift_as_hostess
+    title: "Карщик на складе — не хостес"
+    text: |
+      Склад Фулфилмент ищет водителей карщиков с правами
+      МО, Раменский р-н, деревня Софьино
+      ричтрак Jungheinrich, от 6500 до 9000 за смену
+    bot_wrong:
+      role: hostess
+      address: "Московская область, Раменский район..."
+    expected_ingest: false
+    reject_reason: permanent
+    expected_primary_category: reject
+    expected_address: null
+    notes: "Склад/карщик — постоянная работа; автопост часто ломает категорию."
+
+  - id: jun23_leaflets_as_driver
+    title: "Раздача листовок — не водитель"
+    text: |
+      Раздача листовок
+      метро Солнцево, 1400₽/смена, 16:00-20:00 (2 чел)
+      @finessaaaa
+    bot_wrong:
+      role: driver
+      address: "метро Солнцево"
+    expected_ingest: true
+    expected_primary_category: promoter
+    expected_address: "м. Солнцево"
+    notes: "Листовки = promoter, не driver."

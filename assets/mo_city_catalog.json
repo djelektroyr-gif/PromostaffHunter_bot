@@ -19,5 +19,6 @@
   {"slug": "dolgoprudny", "names": ["долгопрудный", "долгопрудном"], "lat": 55.9386, "lon": 37.5200},
   {"slug": "zheleznodorozhny", "names": ["железнодорожный"], "lat": 55.7440, "lon": 38.0168},
   {"slug": "pushkino", "names": ["пушкино"], "lat": 56.0100, "lon": 37.8462},
-  {"slug": "lobnya", "names": ["лобня", "лобне"], "lat": 56.0125, "lon": 37.4744}
+  {"slug": "lobnya", "names": ["лобня", "лобне"], "lat": 56.0125, "lon": 37.4744},
+  {"slug": "chekhov", "names": ["чехов", "чехове"], "lat": 55.1477, "lon": 37.4773}
 ]

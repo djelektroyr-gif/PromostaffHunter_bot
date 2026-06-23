@@ -208,3 +208,103 @@ async def notify_admin_chat_suggestion(
         )
     except Exception as e:
         logger.warning("notify_admin_chat_suggestion #%s: %s", suggestion_id, e)
+
+
+def notfit_admin_keyboard(vacancy_id: str, user_id: int, message_link: str | None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="👤 Карточка",
+                callback_data=f"adm_u_{user_id}_0",
+            ),
+        ],
+    ]
+    if message_link and str(message_link).startswith("http"):
+        rows.append([InlineKeyboardButton(text="🔗 Пост в канале", url=message_link)])
+    rows.append([InlineKeyboardButton(text="🟡 Все отзывы", callback_data="adm_notfit_list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_notfit_admin_html(
+    *,
+    feedback_id: int,
+    user_id: int,
+    username: str | None,
+    vacancy_id: str,
+    reason_code: str,
+    reason_label: str,
+    reason_text: str | None,
+    vacancy_category: str | None,
+    source_chat_title: str | None,
+    message_preview: str | None,
+) -> str:
+    uname = f"@{escape_html(username)}" if username else "—"
+    comment = escape_html((reason_text or "").strip()) or "—"
+    preview = escape_html((message_preview or "").replace("\n", " ")[:220])
+    if message_preview and len(message_preview) > 220:
+        preview += "…"
+    chat = escape_html(source_chat_title or "—")
+    cat = escape_html(vacancy_category or "—")
+    return (
+        f"🟡 <b>Не подходит #{feedback_id}</b>\n\n"
+        f"👤 <code>{user_id}</code> · {uname}\n"
+        f"📋 {escape_html(reason_label)}"
+        f"{f' ({escape_html(reason_code)})' if reason_code else ''}\n"
+        f"💬 <b>Комментарий:</b> {comment}\n"
+        f"🏷 Категория: {cat} · чат: {chat}\n"
+        f"🆔 <code>{escape_html(vacancy_id or '—')}</code>\n\n"
+        f"{preview}"
+    )
+
+
+async def notify_admin_notfit_feedback(
+    bot,
+    *,
+    feedback_id: int,
+    user_id: int,
+    vacancy_id: str,
+    reason_code: str,
+    reason_label: str,
+    reason_text: str | None,
+    username: str | None = None,
+) -> None:
+    if not YOUR_USER_ID:
+        return
+    row = fetchone(
+        """
+        SELECT message_text, source_chat_title, message_link, category_code
+        FROM vacancies WHERE id = ?
+        """,
+        (vacancy_id,),
+    )
+    message_text = row[0] if row else None
+    source_chat = row[1] if row else None
+    message_link = row[2] if row else None
+    vac_cat = row[3] if row else None
+    if username is None:
+        from db import get_subscriber_profile
+        profile = get_subscriber_profile(user_id) or {}
+        username = profile.get("username")
+    text = format_notfit_admin_html(
+        feedback_id=feedback_id,
+        user_id=user_id,
+        username=username,
+        vacancy_id=vacancy_id,
+        reason_code=reason_code,
+        reason_label=reason_label,
+        reason_text=reason_text,
+        vacancy_category=vac_cat,
+        source_chat_title=source_chat,
+        message_preview=message_text,
+    )
+    markup = notfit_admin_keyboard(vacancy_id, user_id, message_link)
+    try:
+        await bot.send_message(
+            YOUR_USER_ID,
+            text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning("notify_admin_notfit_feedback #%s: %s", feedback_id, e)

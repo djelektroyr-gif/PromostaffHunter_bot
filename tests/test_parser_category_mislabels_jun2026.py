@@ -287,3 +287,45 @@ def test_montazhnik_zil_without_rate_wide_accept():
     assert ok is True
     assert cat in ("booth", "helper", "loader")
     assert reason == "accepted" or reason.startswith(("soft_accept:", "wide_accept:"))
+
+
+def test_hostess_resume_with_payment_accepted():
+    text = (
+        "На VI Ежегодный форум 24-26 июня требуются хостес.\n"
+        "Выдавать бейджи участникам на регистрации.\n"
+        "Ставка 8000 рублей на руки за день.\n"
+        "Резюме с ФИО, параметрами и фото отправляйте @funtik2027"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "funtik2027", "user_id": 1})
+    assert ok is True
+    assert cat == "hostess"
+    assert reason in ("accepted", "soft_accept:hostess", "wide_accept:hostess")
+
+
+def test_promo_prokatnaya_poster_as_contact():
+    text = (
+        "Приглашаем промоутеров для листовок: г. Москва, ул. Прокатная, д. 2\n"
+        "На работу 2- х промоутеров, по 2 часа работы в день.\n"
+        "Период: с 22 июня по 1 июля включительно.\n"
+        "475 р/час."
+    )
+    poster = {"username": "promo_manager", "user_id": 999, "is_person": True}
+    ok, cat, reason, _ = evaluate_vacancy(text, poster)
+    assert ok is True
+    assert cat == "promoter"
+    assert reason in ("accepted", "soft_accept:promoter", "wide_accept:promoter")
+
+
+def test_write_in_private_poster_contact():
+    text = (
+        "На завтра 22.06 нужен официант-мужчина.\n"
+        "Ставка: 2400₽\n"
+        "Контакт для связи: пишите в личку"
+    )
+    poster = {"username": "SofiaKhodus", "user_id": 42, "is_person": True}
+    from parser import has_contact_signal, resolve_vacancy_contact
+
+    assert has_contact_signal(text, poster)
+    contact, source = resolve_vacancy_contact(text, poster)
+    assert contact == "@SofiaKhodus"
+    assert source == "sender"

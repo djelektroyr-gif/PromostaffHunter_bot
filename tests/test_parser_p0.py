@@ -139,8 +139,12 @@ def test_helper_position_promo_rejected_as_helper():
 def test_is_job_post_for_staff_requires_contact():
     text = "Нужны грузчики, 500 р/ч, оплата сразу"
     ok, reason, _ = is_job_post_for_staff(text)
-    assert ok is False
-    assert reason == "no_contact"
+    assert ok is True
+    assert reason == "staff_job"
+    bare = "Нужны грузчики на завтра, метро Сокол"
+    ok2, reason2, _ = is_job_post_for_staff(bare)
+    assert ok2 is False
+    assert reason2 == "no_contact"
 
 
 def test_extract_wa_me_contact():
@@ -195,7 +199,7 @@ def test_loader_uborka_two_people():
     )
     ok, cat, _, _ = evaluate_vacancy(text)
     assert ok is True
-    assert cat == "loader"
+    assert cat == "handyman"
 
 
 def test_format_chat_noise_report_in_progress():

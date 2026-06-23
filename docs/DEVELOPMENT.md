@@ -78,7 +78,9 @@
 
 → **[`docs/BACKLOG_REFERRAL_AND_ENGAGEMENT.md`](BACKLOG_REFERRAL_AND_ENGAGEMENT.md)** — рефералка (отложено) + анонсы выкатов / `/start` re-engagement.
 
-**Env Bothost перед выкатом:**
+→ **[`docs/HUNTER_ARCHITECTURE_MIGRATION.md`](HUNTER_ARCHITECTURE_MIGRATION.md)** — «файл сегодня → модуль завтра» (5 open-source образцов).
+
+→ **[`docs/GOLDEN_VACANCY_CARDS_2026_06_23.md`](GOLDEN_VACANCY_CARDS_2026_06_23.md)** — эталон роль+адрес (21 кейс из ленты 23.06).
 
 ```env
 APP_BUILD=tool-v4

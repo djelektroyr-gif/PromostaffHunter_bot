@@ -428,6 +428,12 @@ def init_db():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        add_column_if_missing(
+            "user_general_vacancy_pin",
+            "message_thread_id",
+            "ALTER TABLE user_general_vacancy_pin ADD COLUMN message_thread_id INTEGER",
+            cur=cur,
+        )
 
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS vacancy_channel_posts (
@@ -2027,7 +2033,7 @@ def record_vacancy_notfit(
     *,
     reason_code: str = "",
     reason_text: str | None = None,
-):
+) -> int:
     cats = ",".join(user_categories) if user_categories else ""
     execute(
         """
@@ -2043,6 +2049,11 @@ def record_vacancy_notfit(
         """,
         (user_id, vacancy_id, vacancy_category, cats, reason_code or None, reason_text),
     )
+    row = fetchone(
+        "SELECT id FROM vacancy_notfit_feedback WHERE user_id = ? AND vacancy_id = ?",
+        (user_id, vacancy_id),
+    )
+    return int(row[0]) if row else 0
 
 
 def get_notfit_stats(limit: int = 10) -> list[dict]:
@@ -2057,6 +2068,37 @@ def get_notfit_stats(limit: int = 10) -> list[dict]:
         (limit,),
     )
     return [{"category": r[0], "reason_code": r[1], "count": r[2]} for r in rows]
+
+
+def count_notfit_feedback_total() -> int:
+    row = fetchone("SELECT COUNT(*) FROM vacancy_notfit_feedback")
+    return int(row[0]) if row else 0
+
+
+def get_notfit_recent(limit: int = 12) -> list[dict]:
+    """Последние отзывы «не подходит» с комментариями — для админки в боте."""
+    rows = fetchall(q(f"""
+        SELECT
+            f.id, f.user_id, f.vacancy_id, f.vacancy_category, f.user_categories,
+            f.reason_code, f.reason_text, f.created_at,
+            v.message_text, v.source_chat_title, v.message_link,
+            s.username, s.full_name, s.first_name
+        FROM vacancy_notfit_feedback f
+        LEFT JOIN vacancies v ON v.id = f.vacancy_id
+        LEFT JOIN subscribers s ON s.user_id = f.user_id
+        ORDER BY f.created_at DESC
+        LIMIT ?
+    """), (limit,))
+    return [
+        {
+            "id": r[0], "user_id": r[1], "vacancy_id": r[2],
+            "vacancy_category": r[3], "user_categories": r[4],
+            "reason_code": r[5], "reason_text": r[6], "created_at": r[7],
+            "message_text": r[8], "source_chat_title": r[9], "message_link": r[10],
+            "username": r[11], "full_name": r[12], "first_name": r[13],
+        }
+        for r in rows
+    ]
 
 
 def get_notfit_export_rows(limit: int = 15000) -> list[dict]:
@@ -2115,14 +2157,19 @@ def delete_user_topic_thread(user_id: int, topic_key: str) -> None:
 def get_general_vacancy_pin(user_id: int) -> dict | None:
     row = fetchone(
         q("""
-            SELECT message_id, vacancy_id, card_text
+            SELECT message_id, vacancy_id, card_text, message_thread_id
             FROM user_general_vacancy_pin WHERE user_id = ?
         """),
         (user_id,),
     )
     if not row:
         return None
-    return {"message_id": row[0], "vacancy_id": row[1], "card_text": row[2]}
+    return {
+        "message_id": row[0],
+        "vacancy_id": row[1],
+        "card_text": row[2],
+        "message_thread_id": row[3],
+    }
 
 
 def set_general_vacancy_pin(
@@ -2130,18 +2177,23 @@ def set_general_vacancy_pin(
     message_id: int,
     vacancy_id: str,
     card_text: str,
+    *,
+    message_thread_id: int | None = None,
 ) -> None:
     execute(
         q("""
-            INSERT INTO user_general_vacancy_pin (user_id, message_id, vacancy_id, card_text, updated_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO user_general_vacancy_pin (
+                user_id, message_id, vacancy_id, card_text, message_thread_id, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 message_id = excluded.message_id,
                 vacancy_id = excluded.vacancy_id,
                 card_text = excluded.card_text,
+                message_thread_id = excluded.message_thread_id,
                 updated_at = CURRENT_TIMESTAMP
         """),
-        (user_id, message_id, vacancy_id, card_text),
+        (user_id, message_id, vacancy_id, card_text, message_thread_id),
     )
 
 

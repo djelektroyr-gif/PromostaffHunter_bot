@@ -40,7 +40,7 @@ def test_extract_address_detects_metro():
 
 def test_extract_address_detects_metro_with_emoji():
     text = "Метро: 🚇 Беляево"
-    assert extract_address_from_text(text) == "метро Беляево"
+    assert extract_address_from_text(text) == "м. Беляево"
 
 def test_extract_contact_from_tg_resolve_link():
     text = "Контакт: tg://resolve?domain=GuseynzadeGF"

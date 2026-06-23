@@ -18,6 +18,7 @@ from parser import (
     run_parser, get_last_debug_report, detect_category, extract_contact_from_text,
     pick_employer_contact_for_response,
     start_realtime_listener, stop_realtime_listener, get_new_messages, extract_address_from_text,
+    backfill_chat,
     make_vacancy_id, PARSER_LABEL, inspect_parser_chats, format_parser_chats_report,
     get_parser_status_snapshot, format_parser_status_line, vacancy_matches_user_metro,
     spawn_background_task, vacancy_matches_category, evaluate_vacancy,
@@ -42,9 +43,15 @@ from config import (
     VACANCY_MAX_AGE_HOURS,
     FEED_FRESH_HOURS, FEED_ARCHIVE_MAX_HOURS, FEED_HISTORY_MAX_HOURS,
     FORUM_TOPICS_ENABLED, CHANNEL_CROSSPOST_ENABLED, HUNTER_CHANNEL_ID,
+    PRODUCT_SOFT_LAUNCH,
     LLM_ENABLED, LLM_DAILY_LIMIT_PREMIUM, STARS_ENABLED, STARS_EXTENDED_RESPONSE_PRICE,
     STARS_RESPONSE_PRICE, PAID_RESPONSES_ENABLED, RESPONSE_PACK_CREDITS, RESPONSE_PACK_PRICE_RUB,
     TRIAL_ON_FIRST_RESPONSE,
+)
+from services.beta_access import (
+    effective_free_category_limit,
+    is_soft_launch_ui,
+    vacancy_push_enabled_for_user,
 )
 from profile_photos import (
     get_user_photos_dir, persist_user_photo, photo_health_loop, send_profile_photo,
@@ -417,6 +424,53 @@ NOTFIT_REASONS = {
 }
 
 
+def format_notfit_feedback_report_html(limit: int = 12) -> str:
+    from admin_exports import NOTFIT_REASON_LABELS
+
+    total = count_notfit_feedback_total()
+    if total <= 0:
+        return (
+            "🟡 <b>Отзывы «не подходит»</b>\n\n"
+            "Пока нет записей. Excel: «📥 Excel: не подходит»."
+        )
+    lines = [
+        f"🟡 <b>Отзывы «не подходит»</b> (всего {total}, последние {min(limit, total)})",
+        "",
+        "<i>Комментарии пользователей — ниже. Новые отзывы приходят в push.</i>",
+        "",
+    ]
+    for row in get_notfit_recent(limit):
+        code = row.get("reason_code") or ""
+        label = NOTFIT_REASON_LABELS.get(code, NOTFIT_REASONS.get(code, code))
+        uname = row.get("username")
+        who = f"@{escape_html(uname)}" if uname else f"id {row.get('user_id')}"
+        created = str(row.get("created_at") or "")[:16]
+        comment = (row.get("reason_text") or "").strip()
+        comment_line = f"\n💬 <b>{escape_html(comment)}</b>" if comment else ""
+        preview = (row.get("message_text") or "").replace("\n", " ")[:120]
+        if row.get("message_text") and len(row["message_text"]) > 120:
+            preview += "…"
+        chat = escape_html(row.get("source_chat_title") or "—")
+        lines.append(
+            f"<b>#{row.get('id')}</b> · {escape_html(created)} · {who}\n"
+            f"📋 {escape_html(label)} · {escape_html(row.get('vacancy_category') or '—')} · {chat}"
+            f"{comment_line}\n"
+            f"{escape_html(preview)}"
+        )
+        if row.get("message_link"):
+            lines.append(f"🔗 {escape_html(row['message_link'])}")
+        lines.append("")
+    stats = get_notfit_stats(8)
+    if stats:
+        lines.append("<b>Сводка по причинам:</b>")
+        for s in stats:
+            code = s.get("reason_code") or "—"
+            label = NOTFIT_REASON_LABELS.get(code, code)
+            lines.append(f"• {escape_html(label)}: {s.get('count', 0)}")
+    lines.append("\nПолная выгрузка: «📥 Excel: не подходит».")
+    return "\n".join(lines)
+
+
 def build_notfit_reason_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:
     rows = [
         [_inline_btn(label, callback_data=f"nfr:{code}:{vacancy_id}")]
@@ -711,9 +765,20 @@ async def _offer_feed_session_restart(message: types.Message) -> None:
 
 
 def _free_category_hint_short() -> str:
-    if FREE_CATEGORY_LIMIT == 1:
+    limit = effective_free_category_limit()
+    if limit == 1:
         return "1 категория бесплатно"
-    return f"до {FREE_CATEGORY_LIMIT} категорий на Free"
+    return f"до {limit} категорий на Free"
+
+
+def _finish_categories_delivery_hint(is_premium: bool) -> str:
+    if FORUM_TOPICS_ENABLED:
+        base = "💎 Новые вакансии — в теме «📬 Вакансии»."
+    else:
+        base = "💎 Новые вакансии приходят моментально в чат."
+    if is_premium:
+        return f"{base} Push Premium."
+    return f"{base} Free: «Посмотреть новые»."
 
 
 def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> str:
@@ -721,6 +786,14 @@ def category_picker_text(selected_count: int, user_id: int, hint: str = "") -> s
     trial_used = bool(profile and profile.get("trial_used"))
     if is_user_premium(user_id):
         limit_line = f"💎 Premium: все категории и push. Выбрано: *{selected_count}*."
+    elif is_soft_launch_ui():
+        limit_line = (
+            f"🧪 Бот в активной разработке — лимиты Free сохраняются.\n"
+            f"🆓 Free: {_free_category_hint_short()}, лента «🔍 Посмотреть…».\n"
+            f"💎 Push и все категории — Premium ({escape_markdown(SUBSCRIPTION_PRICE_RUB)} ₽/мес).\n"
+            f"«🟡 Не подходит» с комментарием помогает улучшить фильтры.\n"
+            f"Выбрано: *{selected_count}*."
+        )
     else:
         trial_line = ""
         if not trial_used and TRIAL_DAYS > 0 and TRIAL_ON_FIRST_RESPONSE:
@@ -756,7 +829,7 @@ def build_categories_markup(selected_codes: list, user_id: int) -> InlineKeyboar
         # Одна кнопка в ряд — проще читать при 18+ категориях
         buttons.append(row)
         row = []
-    if not is_user_premium(user_id):
+    if not is_user_premium(user_id) and not is_soft_launch_ui():
         buttons.append([InlineKeyboardButton(
             text="💎 Premium — несколько категорий и push",
             callback_data="subscription_from_categories",
@@ -792,7 +865,7 @@ async def send_category_picker(
             apply_vacancy_deeplink_category_preselect,
             user_id,
             deeplink_category,
-            free_limit=FREE_CATEGORY_LIMIT,
+            free_limit=effective_free_category_limit(),
         )
         if pre_hint:
             hint = f"{pre_hint}\n\n{hint}" if hint else pre_hint
@@ -1192,7 +1265,8 @@ async def setup_forum_topics_for_user(user_id: int):
 
 
 async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwargs):
-    """send_message в тему лички (или general без topic_key)."""
+    """send_message в тему лички (или General без topic_key)."""
+    from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
     from services.forum_topics import (
         is_forum_thread_missing_error,
         merge_send_kwargs,
@@ -1205,6 +1279,8 @@ async def send_user_message(user_id: int, *, topic_key: str | None = None, **kwa
         if not get_user_topic_thread_id(user_id, topic_key):
             await setup_forum_topics_for_user(user_id)
         extra = topic_message_kwargs(user_id, topic_key)
+    elif FORUM_TOPICS_ENABLED:
+        extra = {"message_thread_id": GENERAL_TOPIC_THREAD_ID}
     payload = merge_send_kwargs(kwargs, extra)
     try:
         return await send_message_with_retry(user_id, **payload)
@@ -1883,6 +1959,7 @@ def build_admin_help_html() -> str:
         "• «💎 Запросы Premium» — чек на оплату, ✅ оплата или 🎁 подарок N дн.\n"
         "• «📋 Список откликов» — отклики кандидатов на вакансии.\n"
         "• «⚠️ Жалобы», «❓ Поддержка (админ)» — push + «✉️ Ответить»; из карточки пользователя — «✉️ Написать».\n"
+        "• «🟡 Не подходит (отзывы)» — последние причины и комментарии (не только Excel); push при каждом отзыве.\n"
         "• Команды: `/answer ID текст`, `/complaint_answer ID текст`.\n"
         "• Push «📡 Заявка на мониторинг канала» — от Premium-пользователей; "
         "кнопки «✅ Добавить» / «❌ Отклонить».\n"
@@ -2790,7 +2867,7 @@ async def send_vacancy_to_subscribers(order: dict):
     )
 
     for subscriber in subscribers:
-        if not is_user_premium(subscriber['user_id']):
+        if not vacancy_push_enabled_for_user(subscriber['user_id']):
             skipped_free += 1
             continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
@@ -3005,6 +3082,7 @@ def get_admin_users_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="⏳ Premium истекает"), KeyboardButton(text="💎 Запросы Premium")],
             [KeyboardButton(text="📋 Список откликов")],
             [KeyboardButton(text="⚠️ Жалобы"), KeyboardButton(text="❓ Поддержка (админ)")],
+            [KeyboardButton(text="🟡 Не подходит (отзывы)")],
             [KeyboardButton(text="📣 Техсообщение")],
             [KeyboardButton(text=ADMIN_BTN_BACK)],
         ],
@@ -3204,7 +3282,8 @@ ADMIN_MENU_BUTTONS = {
     ADMIN_BTN_BACK, ADMIN_BTN_STATS_24H, ADMIN_BTN_STATS_TOTAL,
     "📊 Статистика", "🔍 Ручная проверка", "📋 Список откликов", "📝 Отчёт парсера",
     "👥 Список подписчиков", "📢 Рассылка", "🗂️ Карточки пользователей", "💎 Запросы Premium",
-    "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "📣 Техсообщение", "➕ Добавить чат",
+    "🧭 Маппинг категорий", "⚠️ Жалобы", "❓ Поддержка (админ)", "🟡 Не подходит (отзывы)",
+    "📣 Техсообщение", "➕ Добавить чат",
     "📋 Список чатов парсинга", "💬 Чаты парсинга", "📤 Отправить вакансию",
     "📥 Excel: подписчики", "📥 Excel: вакансии", "📥 Excel: заказчики",
     "📥 Excel: отклики", "📥 Excel: не подходит", "📊 Шум по чатам", "📝 Модерация вакансий",
@@ -3293,7 +3372,7 @@ async def start_cmd(message: types.Message, state: FSMContext):
     expired_msg = downgrade_expired_premium(user_id)
     if expired_msg:
         await message.answer(expired_msg, parse_mode="Markdown")
-    elif enforce_free_category_limit(user_id, FREE_CATEGORY_LIMIT):
+    elif enforce_free_category_limit(user_id, effective_free_category_limit()):
         await message.answer(
             f"ℹ️ На Free доступна *{_free_category_hint_short()}*. "
             "Лишние категории сняты — проверьте «⚙️ Настройки».",
@@ -3759,7 +3838,7 @@ async def select_category(callback: types.CallbackQuery):
         toggle_user_category,
         user_id,
         category_code,
-        free_limit=FREE_CATEGORY_LIMIT,
+        free_limit=effective_free_category_limit(),
     )
     cat_name = get_category_name(category_code)
     if blocked:
@@ -3859,7 +3938,7 @@ async def finish_categories(callback: types.CallbackQuery):
         if not categories:
             await safe_callback_answer(callback, "⚠️ Выберите хотя бы одну категорию!", show_alert=True)
             return
-        if not await run_db(is_user_premium, user_id) and len(categories) > FREE_CATEGORY_LIMIT:
+        if not await run_db(is_user_premium, user_id) and len(categories) > effective_free_category_limit():
             await safe_callback_answer(
                 callback,
                 f"На Free — {_free_category_hint_short()}. Оформите Premium.",
@@ -3885,14 +3964,20 @@ async def finish_categories(callback: types.CallbackQuery):
                 await callback.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:
                 pass
+        is_premium = await run_db(is_user_premium, user_id)
+        delivery_hint = _finish_categories_delivery_hint(is_premium)
+        trial_tail = ""
+        if not is_soft_launch_ui() and TRIAL_DAYS > 0 and TRIAL_ON_FIRST_RESPONSE:
+            trial_tail = (
+                f"\n\n🎁 *Пробный Premium* выдаётся при первом отклике на вакансию ({TRIAL_DAYS} дн.)."
+            )
         await bot_send_user_reply_keyboard(
             bot,
             user_id,
             f"{title}\n\n"
             f"📌 Ваши категории:\n{categories_text}\n\n"
-            f"{'💎 Новые вакансии — в теме «📬 Вакансии».' if FORUM_TOPICS_ENABLED else '💎 Новые вакансии приходят моментально в чат.'}"
-            f"{' Push Premium.' if await run_db(is_user_premium, user_id) else ' Free: «Посмотреть новые».'}"
-            f"\n\n🎁 *Пробный Premium* выдаётся при первом отклике на вакансию ({TRIAL_DAYS} дн.).\n\n"
+            f"{delivery_hint}"
+            f"{trial_tail}\n\n"
             f"📖 Инструкция — «Как пользоваться» или /help\n\n"
             f"Используйте кнопки меню:",
             keyboard,
@@ -4410,9 +4495,17 @@ async def show_feed_mode_menu(message: types.Message, user_id: int):
     fresh_total, archive_total, all_total, history_total = _feed_mode_totals_from_snapshot(snap)
     hint = "\n\n🎯 Учитываются фильтры Premium в ленте." if snap.apply_filters else ""
     if fresh_total == 0 and archive_total == 0 and all_total == 0 and history_total == 0:
+        if is_user_premium(user_id):
+            empty_tail = "💎 Premium — push сразу в чат."
+        elif is_soft_launch_ui():
+            empty_tail = (
+                "Я продолжаю мониторинг. Если вакансия не подходит — "
+                "«🟡 Не подходит» с комментарием: так мы улучшаем фильтры."
+            )
+        else:
+            empty_tail = "Я продолжаю мониторинг."
         await message.answer(
-            f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n"
-            f"{'💎 Premium — push сразу в чат.' if is_user_premium(user_id) else 'Я продолжаю мониторинг.'}",
+            f"🔍 *Новых вакансий по вашим категориям пока нет.*{hint}\n\n{empty_tail}",
             parse_mode="Markdown",
         )
         return
@@ -5314,15 +5407,14 @@ async def _finalize_notfit_feedback(
     row = fetchone("SELECT category_code FROM vacancies WHERE id = ?", (vacancy_id,))
     vac_cat = row[0] if row else ""
     user_cats = [c["code"] for c in get_user_categories(user_id)]
-    record_vacancy_notfit(
+    feedback_id = record_vacancy_notfit(
         user_id, vacancy_id, vac_cat or "", user_cats,
         reason_code=reason_code, reason_text=reason_text,
     )
     mark_vacancy_sent_to_user(vacancy_id, user_id)
-    thank = (
-        "Спасибо! Эту вакансию больше не покажем.\n"
-        "Причина сохранена — по ней настраиваем фильтры и Excel-отчёт для админа."
-    )
+    from services.forum_vacancy_pin import clear_general_vacancy_if_pinned
+    await clear_general_vacancy_if_pinned(bot, user_id, vacancy_id)
+    thank = "Спасибо! Эту вакансию больше не покажем — отзыв передан в разработку."
     if callback:
         await callback.answer("Учтено")
         try:
@@ -5332,6 +5424,23 @@ async def _finalize_notfit_feedback(
         await callback.message.answer(thank)
     elif message:
         await message.answer(thank)
+
+    username = None
+    if callback and callback.from_user:
+        username = callback.from_user.username
+    elif message and message.from_user:
+        username = message.from_user.username
+    from services.admin_inbox_alerts import notify_admin_notfit_feedback
+    await notify_admin_notfit_feedback(
+        bot,
+        feedback_id=feedback_id,
+        user_id=user_id,
+        vacancy_id=vacancy_id,
+        reason_code=reason_code,
+        reason_label=NOTFIT_REASONS.get(reason_code, reason_code),
+        reason_text=reason_text,
+        username=username,
+    )
 
 
 async def _edit_vacancy_card_message(
@@ -5378,6 +5487,26 @@ async def vacancy_card_close(callback: types.CallbackQuery):
         await safe_callback_answer(callback, "Вакансия недоступна", show_alert=True)
         return
     await safe_callback_answer(callback, "Свернуто")
+
+
+@dp.callback_query(lambda c: c.data == "adm_notfit_list")
+async def admin_notfit_list_callback(callback: types.CallbackQuery):
+    if callback.from_user.id != YOUR_USER_ID:
+        await safe_callback_answer(callback)
+        return
+    text = format_notfit_feedback_report_html()
+    await callback.message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await safe_callback_answer(callback)
+
+
+@dp.message(lambda m: m.from_user.id == YOUR_USER_ID and m.text == "🟡 Не подходит (отзывы)")
+async def admin_notfit_feedback_list(message: types.Message):
+    await message.answer(
+        format_notfit_feedback_report_html(),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=get_admin_users_keyboard(),
+    )
 
 
 @dp.callback_query(lambda c: c.data and re.fullmatch(r"notfit_[^:]+", c.data))
@@ -5929,6 +6058,8 @@ async def _execute_response_flow(
         record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id, "via": "admin_forward"})
         if callback:
             await _mark_vacancy_card_responded(callback, vacancy_id, address)
+        from services.forum_vacancy_pin import clear_general_vacancy_if_pinned
+        await clear_general_vacancy_if_pinned(bot, user_id, vacancy_id)
         await send_to_admin(
             profile,
             vacancy_row,
@@ -5959,6 +6090,8 @@ async def _execute_response_flow(
     record_bot_event(user_id, EVENT_RESPONSE_SENT, {"vacancy_id": vacancy_id})
     if callback:
         await _mark_vacancy_card_responded(callback, vacancy_id, address)
+    from services.forum_vacancy_pin import clear_general_vacancy_if_pinned
+    await clear_general_vacancy_if_pinned(bot, user_id, vacancy_id)
     required_fields = extract_required_fields_from_vacancy(vacancy_text or "")
     draft_text = build_candidate_profile_text(profile)
     await state.update_data(vacancy_id=vacancy_id, contact=employer_contact, draft_text=draft_text)
@@ -7067,6 +7200,33 @@ async def clean_old_vacancies(message: types.Message):
         cur.execute(f"DELETE FROM processed_messages WHERE processed_at < {now_minus_days(3)}")
     await message.answer("✅ Удалены вакансии и обработанные сообщения старше 3 дней.")
 
+async def _run_chat_backfill_job(chat_link: str, admin_user_id: int):
+    """Фоновый бэкфилл после /addchat — не блокирует админку."""
+    try:
+        result = await backfill_chat(
+            chat_link,
+            schedule_vacancy_push,
+            notify_closed_vacancies,
+        )
+        if result.get("error") == "parser_offline":
+            text = (
+                f"⚠️ Бэкфилл {chat_link}: парсер offline.\n"
+                "Новые посты подхватятся при старте парсера или /check_now."
+            )
+        elif result.get("error"):
+            text = f"⚠️ Бэкфилл {chat_link}: {result.get('error')}"
+        else:
+            text = (
+                f"📥 Бэкфилл {chat_link}:\n"
+                f"• в ленту: +{result.get('saved', 0)}\n"
+                f"• закрыто: {result.get('closed', 0)}\n"
+                f"• просмотрено постов: {result.get('scanned', 0)}"
+            )
+        await bot.send_message(admin_user_id, text)
+    except Exception as e:
+        logger.warning("backfill notify admin=%s: %s", admin_user_id, e)
+
+
 @dp.message(Command("addchat"))
 async def add_chat_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id != YOUR_USER_ID:
@@ -7085,9 +7245,10 @@ async def process_add_chat(message: types.Message, state: FSMContext):
     if add_target_chat(chat_link):
         await message.answer(
             f"✅ Чат {chat_link} добавлен для парсинга.\n"
-            "Новые сообщения будут подхватываться автоматически.",
+            f"Запускаю бэкфилл последних постов…",
             reply_markup=get_admin_keyboard(),
         )
+        spawn_background_task(_run_chat_backfill_job(chat_link, message.from_user.id))
     else:
         await message.answer(f"⚠️ Чат {chat_link} уже существует.", reply_markup=get_admin_keyboard())
     await state.clear()

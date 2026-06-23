@@ -38,6 +38,9 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "7"))
 # Free: сколько категорий без Premium (1 = одна бесплатно, 2+ только Premium)
 FREE_CATEGORY_LIMIT = int(os.getenv("FREE_CATEGORY_LIMIT", "1"))
 
+# Пока продукт «сырой» — честный текст в UI (лимиты Free не отключаем)
+PRODUCT_SOFT_LAUNCH = os.getenv("PRODUCT_SOFT_LAUNCH", "1").strip().lower() in ("1", "true", "yes", "on")
+
 # За сколько дней до конца Premium/Trial слать напоминание (cron, 0 = отключить)
 PREMIUM_RENEWAL_REMIND_DAYS = int(os.getenv("PREMIUM_RENEWAL_REMIND_DAYS", "3"))
 

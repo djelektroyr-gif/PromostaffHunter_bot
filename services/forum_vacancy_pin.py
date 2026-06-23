@@ -53,7 +53,8 @@ async def _send_html_card(
     reply_markup: InlineKeyboardMarkup | None,
     *,
     topic_key: str | None,
-) -> int | None:
+) -> tuple[int | None, int | None]:
+    """Возвращает (message_id, message_thread_id для General)."""
     extra = _delivery_kwargs(user_id, topic_key)
     try:
         msg = await bot.send_message(
@@ -64,13 +65,13 @@ async def _send_html_card(
             disable_web_page_preview=True,
             **extra,
         )
-        return msg.message_id
+        return msg.message_id, extra.get("message_thread_id")
     except TelegramBadRequest as e:
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
             logger.warning("forum_vacancy_pin: topic miss user=%s key=%s", user_id, topic_key)
             if not topic_key:
-                return None
+                return None, None
             msg = await bot.send_message(
                 user_id,
                 text,
@@ -78,7 +79,7 @@ async def _send_html_card(
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
             )
-            return msg.message_id
+            return msg.message_id, None
         if "parse" in err:
             plain = re.sub(r"<[^>]*>", "", text)
             msg = await bot.send_message(
@@ -88,7 +89,7 @@ async def _send_html_card(
                 disable_web_page_preview=True,
                 **extra,
             )
-            return msg.message_id
+            return msg.message_id, extra.get("message_thread_id")
         raise
 
 
@@ -138,37 +139,69 @@ async def _try_edit_general_card(
         return False
 
 
+async def _delete_general_message(
+    bot: Bot,
+    user_id: int,
+    message_id: int,
+    *,
+    stored_thread_id: int | None = None,
+) -> None:
+    """Удаление с перебором thread_id — legacy push без thread_id не оставляет мусор."""
+    from config import FORUM_TOPICS_ENABLED
+    from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
+
+    attempts: list[dict] = []
+    if stored_thread_id is not None:
+        attempts.append({"message_thread_id": stored_thread_id})
+    if FORUM_TOPICS_ENABLED:
+        if GENERAL_TOPIC_THREAD_ID not in {stored_thread_id}:
+            attempts.append({"message_thread_id": GENERAL_TOPIC_THREAD_ID})
+    attempts.append({})
+
+    for extra in attempts:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=message_id, **extra)
+            return
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if "message to delete not found" in err:
+                return
+            if extra:
+                continue
+            logger.warning(
+                "delete general vacancy pin user=%s msg=%s: %s",
+                user_id,
+                message_id,
+                e,
+            )
+
+
 async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> None:
     """Убирает предыдущую push-карточку из General (история уже в «Вакансии»)."""
     pin = get_general_vacancy_pin(user_id)
     if not pin:
         return
-    message_id = pin["message_id"]
-    extra = _delivery_kwargs(user_id, None)
-    try:
-        await bot.delete_message(chat_id=user_id, message_id=message_id, **extra)
-    except TelegramBadRequest as e:
-        err = str(e).lower()
-        if "message to delete not found" not in err:
-            if extra.get("message_thread_id"):
-                try:
-                    await bot.delete_message(chat_id=user_id, message_id=message_id)
-                except TelegramBadRequest as e2:
-                    if "message to delete not found" not in str(e2).lower():
-                        logger.warning(
-                            "delete general vacancy pin user=%s msg=%s: %s",
-                            user_id,
-                            message_id,
-                            e2,
-                        )
-            else:
-                logger.warning(
-                    "delete general vacancy pin user=%s msg=%s: %s",
-                    user_id,
-                    message_id,
-                    e,
-                )
+    await _delete_general_message(
+        bot,
+        user_id,
+        pin["message_id"],
+        stored_thread_id=pin.get("message_thread_id"),
+    )
     clear_general_vacancy_pin(user_id)
+
+
+async def clear_general_vacancy_if_pinned(
+    bot: Bot,
+    user_id: int,
+    vacancy_id: str | None = None,
+) -> None:
+    """После отклика / «не подходит» — убрать карточку из General."""
+    pin = get_general_vacancy_pin(user_id)
+    if not pin:
+        return
+    if vacancy_id and pin["vacancy_id"] != vacancy_id:
+        return
+    await _clear_general_vacancy_display(bot, user_id)
 
 
 async def _append_vacancy_history(
@@ -217,16 +250,28 @@ async def send_vacancy_push_pinned_general(
     async with _user_pin_lock(user_id):
         await ensure_topics(user_id)
         pin = get_general_vacancy_pin(user_id)
-        if pin and await _try_edit_general_card(
-            bot, user_id, pin["message_id"], text, reply_markup
-        ):
-            set_general_vacancy_pin(user_id, pin["message_id"], vacancy_id, text)
-            await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
-            return True
+        if pin and pin["vacancy_id"] == vacancy_id:
+            if await _try_edit_general_card(
+                bot, user_id, pin["message_id"], text, reply_markup
+            ):
+                set_general_vacancy_pin(
+                    user_id,
+                    pin["message_id"],
+                    vacancy_id,
+                    text,
+                    message_thread_id=pin.get("message_thread_id"),
+                )
+                return True
         await _clear_general_vacancy_display(bot, user_id)
-        msg_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
+        msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
         if msg_id is None:
             return False
-        set_general_vacancy_pin(user_id, msg_id, vacancy_id, text)
+        set_general_vacancy_pin(
+            user_id,
+            msg_id,
+            vacancy_id,
+            text,
+            message_thread_id=thread_id,
+        )
         await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
     return True

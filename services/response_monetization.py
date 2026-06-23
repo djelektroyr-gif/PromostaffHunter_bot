@@ -4,12 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from config import (
-    FREE_CATEGORY_LIMIT,
     PAID_RESPONSES_ENABLED,
     RESPONSE_PACK_CREDITS,
     TRIAL_DAYS,
     TRIAL_ON_FIRST_RESPONSE,
 )
+from services.beta_access import effective_free_category_limit
 from db import (
     count_user_responses,
     get_subscriber_profile,
@@ -68,7 +68,7 @@ def setup_trial_from_first_response(user_id: int, vacancy_id: str) -> dict:
         codes, blocked = toggle_user_category(
             user_id,
             category_code,
-            free_limit=FREE_CATEGORY_LIMIT,
+            free_limit=effective_free_category_limit(),
         )
         category_added = not blocked and category_code in codes
     return {

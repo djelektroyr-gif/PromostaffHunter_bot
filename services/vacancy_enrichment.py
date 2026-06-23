@@ -25,7 +25,51 @@ _CITY_STREET_RE = re.compile(
     re.IGNORECASE,
 )
 _VENUE_RE = re.compile(
-    r"\b((?:ТЦ|ТРЦ|ТК|МФК|БЦ|ТРК)\s+[«\"]?[А-Яа-яёЁ0-9\- ]{2,60}[»\"]?)",
+    r"\b((?:ТЦ|ТРЦ|ТК|МФК|БЦ|ТРК)\s+[«\"]?[А-Яа-яёЁ0-9\- ]{2,60}[»\"]?|"
+    r"(?:торговый центр|тц)\s+[«\"]?[А-Яа-яёЁ0-9\- ]{2,60}[»\"]?)",
+    re.IGNORECASE,
+)
+_NAMED_VENUE_RE = re.compile(
+    r"\b("
+    r"(?:казанский|ленинградский|курский|ярославский|павелецкий|киевский|"
+    r"белорусский|савёловский|рижский)\s+вокзал|"
+    r"московская\s+консерватория|"
+    r"платинум\s+арена"
+    r")\b",
+    re.IGNORECASE,
+)
+_MOSCOW_COMMA_LINE_RE = re.compile(
+    r"(?:^|\n)\s*Москва\s*,\s*([^\n]{4,100}?)(?:\s*$|\s*(?:задача|оплат|@))",
+    re.IGNORECASE | re.MULTILINE,
+)
+_METRO_TC_LINE_RE = re.compile(
+    r"(?:мцк|м\.|метро)\s+([А-Яа-яёЁ\- ]{2,40}).{0,30}?"
+    r"(?:торговый центр|тц)\s+([«\"]?[А-Яа-яёЁ0-9\- ]{2,50}[»\"]?)",
+    re.IGNORECASE,
+)
+_CITY_LOCATIVE_RE = re.compile(
+    r"\b(?:в|на)\s+([А-Яа-яёЁ][а-яёЁ\-]{2,30}(?:е|у|и|о))\b",
+    re.IGNORECASE,
+)
+_REGIONAL_CITY_LINE_RE = re.compile(
+    r"(?:^|\n)\s*([А-ЯЁ]{4,24})\s*(?:\n|$)",
+)
+_STREET_WITH_NUMBER_RE = re.compile(
+    r"(?:"
+    r"(?:ул\.?|улиц[аеи])\s+([А-Яа-яёЁ][А-Яа-яёЁa-z\- ]{1,40}\d{1,4}[а-яёa-z]?(?:с\d+)?)|"
+    r"([А-Яа-яёЁ][а-яёЁ\-]{1,40}\s+бульвар\s+\d{1,4}[а-яёa-z]?(?:с\d+)?)"
+    r")",
+    re.IGNORECASE,
+)
+_ADDR_TASK_NOISE_RE = re.compile(
+    r"фото\s*[-–—]\s*\d|"
+    r"нужно\s+будет\s+взять|"
+    r"взять\s+с\s+собой|"
+    r"сюда\s+еще\s+нужн|"
+    r"координатор\w*\s+\d|"
+    r"требуется\s+на\s+подработку|"
+    r"требуется\s+\d+\s*человек|"
+    r"^\s*оплат\w*\s+\d",
     re.IGNORECASE,
 )
 _LANDMARK_RE = re.compile(
@@ -44,7 +88,8 @@ _GARBAGE_ADDR_RE = re.compile(
 )
 _TELEGRAM_MENTION_RE = re.compile(r"@\w+", re.I)
 _MAP_WORTHY_RE = re.compile(
-    r"вднх|vdnh|выставочн|метро|м\.|ул\.|улица|проспект|пр-т|наб\.|шоссе|"
+    r"вднх|vdnh|выставочн|сокольник|лужник|вокзал|консерватор|арена|экспо|"
+    r"метро|м\.|ул\.|улица|проспект|пр-т|наб\.|шоссе|"
     r"бульвар|проезд|тц|трц|москва|област|район|"
     r"\d{1,5}\s*[а-яa-z]?(?:/\d+)?(?:\s|,|$)",
     re.IGNORECASE,
@@ -267,6 +312,23 @@ def _extract_location_block(text: str) -> str | None:
         inline = m.group(1).strip().strip("*")
         if _is_form_address_placeholder(inline):
             continue
+        if re.match(
+            r"^(?:[📍🗺]\s*)?(?:\*\*)?(?:м\.|метро)(?:\*\*)?\s*",
+            line.strip(),
+            re.I,
+        ):
+            station = inline or re.sub(
+                r"^(?:[📍🗺]\s*)?(?:\*\*)?(?:м\.|метро)(?:\*\*)?\s*[:\-]?\s*",
+                "",
+                line.strip(),
+                flags=re.I,
+            ).strip("* ")
+            station = re.sub(r"^🚇\s*", "", station).strip()
+            follow = _collect_lines_after_header(lines, i, "")
+            if station and (
+                not follow or all(_is_noise_location_followup(p) for p in follow)
+            ):
+                return f"м. {station}"
         parts = _collect_lines_after_header(lines, i, inline)
         composed = _compose_location_address(parts)
         if composed and not _is_form_address_placeholder(composed):
@@ -288,6 +350,24 @@ _FORM_ADDRESS_INLINE_RE = re.compile(
     r"^укажите\s+адрес",
     re.IGNORECASE,
 )
+
+_DATE_OR_PAY_FOLLOWUP_RE = re.compile(
+    r"^\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)|"
+    r"^\d{1,2}[./]\d{1,2}|"
+    r"оплат|ставк|₽|руб|р/ч",
+    re.IGNORECASE,
+)
+
+
+def _is_noise_location_followup(line: str) -> bool:
+    if not line:
+        return True
+    if _ADDR_TASK_NOISE_RE.search(line):
+        return True
+    if _DATE_OR_PAY_FOLLOWUP_RE.search(line):
+        return True
+    return False
+
 
 _LABEL_ONLY_WORDS = frozenset(
     {
@@ -335,6 +415,8 @@ def is_plausible_map_address(text: str | None) -> bool:
         return False
     if _GARBAGE_ADDR_RE.search(s):
         return False
+    if re.search(r",\s*МО\b", s):
+        return True
     if _MAP_WORTHY_RE.search(s):
         return True
     return len(s) >= 12 and not _GARBAGE_ADDR_RE.search(s)
@@ -347,12 +429,119 @@ def _extract_landmark_address(text: str) -> str | None:
     if not m:
         return None
     name = m.group(1).strip(" .,!—")
+    name_l = name.lower()
     tl = text.lower()
+    metro_landmarks = ("сокольники", "лужники", "вднх", "vdnh")
+    if any(x in name_l for x in metro_landmarks):
+        station = "ВДНХ" if "вднх" in name_l or "vdnh" in name_l else name.title()
+        if re.search(r"\bмосква\b", tl):
+            return f"Москва, м. {station}"
+        return f"м. {station}"
     if "москва" in name.lower():
         return name
-    if re.search(r"\bмосква\b", tl) or "вднх" in name.lower() or "vdnh" in name.lower():
+    if re.search(r"\bмосква\b", tl) or "вднх" in name_l or "vdnh" in name_l:
         return f"Москва, {name}"
     return name
+
+
+def _extract_moscow_comma_line(text: str) -> str | None:
+    if not text:
+        return None
+    m = _MOSCOW_COMMA_LINE_RE.search(text)
+    if not m:
+        return None
+    tail = _sanitize_address_fragment(m.group(1).strip(" .,"))
+    if not tail or _ADDR_TASK_NOISE_RE.search(tail):
+        return None
+    if re.search(r"задача\s*:", tail, re.I):
+        tail = re.split(r"задача\s*:", tail, maxsplit=1, flags=re.I)[0].strip(" .,")
+    return f"Москва, {tail}" if tail else None
+
+
+def _extract_metro_tc_line(text: str) -> str | None:
+    if not text:
+        return None
+    m = _METRO_TC_LINE_RE.search(text)
+    if not m:
+        return None
+    station = m.group(1).strip(" .,")
+    mall = m.group(2).strip(" .,")
+    if not station or not mall:
+        return None
+    return f"м. {station}, ТЦ {mall}"
+
+
+def _extract_named_venue_address(text: str) -> str | None:
+    if not text:
+        return None
+    m = _NAMED_VENUE_RE.search(text)
+    if not m:
+        return None
+    venue = m.group(1).strip()
+    venue_title = venue[0].upper() + venue[1:] if venue else venue
+    tail = text[m.end(): m.end() + 120]
+    street_m = _STREET_WITH_NUMBER_RE.search(tail)
+    if street_m:
+        street = (street_m.group(1) or street_m.group(2) or "").strip(" .,")
+        if street:
+            return f"{venue_title}, ул. {street}"
+    city = _match_city_slug(text)
+    if city and city not in ("moscow", "mo"):
+        names = next(
+            (names for slug, names in _load_city_catalog() if slug == city),
+            (city,),
+        )
+        return f"{_city_display_name(city, names)}, {venue_title}"
+    if re.search(r"\bмосква\b", text, re.I) or "вокзал" in venue.lower() or "консерватор" in venue.lower():
+        return f"Москва, {venue_title}"
+    return venue_title
+
+
+def _extract_city_locative_address(text: str) -> str | None:
+    if not text:
+        return None
+    for m in _CITY_LOCATIVE_RE.finditer(text):
+        place = m.group(1).strip()
+        place_l = place.lower()
+        if _ADDR_TASK_NOISE_RE.search(place):
+            continue
+        if re.search(r"мероприят|площадк|смен|склад|работ|регистрац", place_l):
+            continue
+        if place_l in _LABEL_ONLY_WORDS:
+            continue
+        slug = _match_city_slug(place) or _match_city_slug(f"в {place}")
+        if not slug or slug in ("moscow",):
+            continue
+        names = next(
+            (names for s, names in _load_city_catalog() if s == slug),
+            (place,),
+        )
+        display = _city_display_name(slug, names)
+        if slug == "mo":
+            continue
+        return f"{display}, МО"
+    return None
+
+
+def _extract_regional_block_address(text: str) -> str | None:
+    """Город капсом на отдельной строке + площадка/улица ниже (регионы)."""
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    city_display: str | None = None
+    for i, line in enumerate(lines):
+        if _REGIONAL_CITY_LINE_RE.fullmatch(line) and line not in ("ПРОМО", "ХЕЛПЕР"):
+            city_display = line.title()
+            block = "\n".join(lines[i + 1: i + 4])
+            venue_m = _NAMED_VENUE_RE.search(block)
+            street_m = _STREET_WITH_NUMBER_RE.search(block)
+            if venue_m and street_m:
+                street = (street_m.group(1) or street_m.group(2) or "").strip(" .,")
+                return f"{city_display}, ул. {street}"
+            if venue_m:
+                return f"{city_display}, {venue_m.group(1).title()}"
+            break
+    return None
 
 
 def _collect_lines_after_header(lines: list[str], start: int, inline: str) -> list[str]:
@@ -363,6 +552,8 @@ def _collect_lines_after_header(lines: list[str], start: int, inline: str) -> li
         nxt = lines[j].strip().strip("*").strip()
         if not nxt:
             continue
+        if _is_noise_location_followup(nxt):
+            break
         if _NEXT_SECTION_RE.match(nxt):
             break
         parts.append(nxt)
@@ -399,6 +590,10 @@ def _extract_bare_line_address(text: str) -> str | None:
         if len(candidate) < 8:
             continue
         if _GARBAGE_ADDR_RE.search(candidate):
+            continue
+        if _ADDR_TASK_NOISE_RE.search(candidate):
+            continue
+        if re.match(r"^[кс]\s+\d", candidate, re.I):
             continue
         if re.search(r"\d{3,4}\s*/\s*\d", candidate):
             continue
@@ -512,6 +707,21 @@ def extract_address_normalized(text: str, legacy_address: str | None = None) -> 
     explicit = _EXPLICIT_ADDR_RE.search(text)
     if explicit:
         return _ok(explicit.group(1).strip(" .,"))
+    moscow_line = _extract_moscow_comma_line(text)
+    if moscow_line:
+        return _ok(moscow_line)
+    metro_tc = _extract_metro_tc_line(text)
+    if metro_tc:
+        return _ok(metro_tc)
+    regional = _extract_regional_block_address(text)
+    if regional:
+        return _ok(regional)
+    named_venue = _extract_named_venue_address(text)
+    if named_venue:
+        return _ok(named_venue)
+    city_loc = _extract_city_locative_address(text)
+    if city_loc:
+        return _ok(city_loc)
     city_street = _CITY_STREET_RE.search(text)
     if city_street:
         city = city_street.group(1).strip()

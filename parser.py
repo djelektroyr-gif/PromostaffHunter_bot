@@ -37,6 +37,11 @@ PARSER_HEALTH_INTERVAL_SEC = 600
 PARSER_RECONNECT_DELAY_SEC = 30
 PARSER_SESSION_MISSING_BACKOFF_SEC = 1800
 PER_CHAT_SCAN_LIMIT = 120
+CHAT_BACKFILL_LIMIT = max(20, int(os.getenv("CHAT_BACKFILL_LIMIT", "80")))
+CHAT_BACKFILL_MAX_AGE_HOURS = max(
+    VACANCY_MAX_AGE_HOURS,
+    int(os.getenv("CHAT_BACKFILL_MAX_AGE_HOURS", "72")),
+)
 PARSER_INCREMENTAL_LOOKBACK = max(0, int(os.getenv("PARSER_INCREMENTAL_LOOKBACK", "30")))
 PARSER_WIDE_INGEST = os.getenv("PARSER_WIDE_INGEST", "1").strip().lower() in ("1", "true", "yes", "on")
 AUDIT_SCAN_LIMIT = max(5, int(os.getenv("PARSER_AUDIT_SCAN_LIMIT", "30")))  # legacy fallback
@@ -847,7 +852,10 @@ async def _mark_scanned_message(
 
 
 async def _process_single_message(
-    message, chat, chat_id: str, chat_title: str, stats: dict = None, *, allow_reprocess: bool = False,
+    message, chat, chat_id: str, chat_title: str, stats: dict = None, *,
+    allow_reprocess: bool = False,
+    max_age_hours: int | None = None,
+    client=None,
 ):
     """Обрабатывает одно сообщение. Возвращает order, list[order] (digest) или closed."""
     if not message.text:
@@ -862,7 +870,8 @@ async def _process_single_message(
             stats["already_sent"] += 1
             _bump_chat_stat(stats, chat_title, "already_sent")
         return None
-    if not allow_reprocess and not is_message_recent(message.date):
+    age_limit = max_age_hours if max_age_hours is not None else VACANCY_MAX_AGE_HOURS
+    if not allow_reprocess and not is_message_recent(message.date, max_age_hours=age_limit):
         if stats is not None:
             stats["old_messages"] += 1
             _bump_chat_stat(stats, chat_title, "old")
@@ -882,10 +891,10 @@ async def _process_single_message(
     if is_strikethrough_closure(message.text, entities) or is_unicode_strikethrough_closure(message.text or ""):
         normalized = normalize_ingest_text(message.text or "")
         if is_unicode_strikethrough_closure(message.text or "") and normalized.strip():
-            poster_peek = await extract_poster_info(message)
+            poster_peek = await extract_poster_info(message, client=client)
             ok_staff, _, _ = is_job_post_for_staff(normalized, poster_peek)
             if ok_staff:
-                poster = poster_peek or await extract_poster_info(message)
+                poster = poster_peek or await extract_poster_info(message, client=client)
                 order = await _save_parsed_vacancy_block(
                     block_text=normalized,
                     message=message,
@@ -910,7 +919,7 @@ async def _process_single_message(
     ingest_text = strip_vacancy_close_footer(message.text)
     had_close_footer = ingest_text != (message.text or "").strip()
     if is_vacancy_closed_text(message.text):
-        poster_peek = await extract_poster_info(message)
+        poster_peek = await extract_poster_info(message, client=client)
         if not (
             had_close_footer
             and ingest_text
@@ -926,7 +935,7 @@ async def _process_single_message(
     if allow_reprocess:
         return None
 
-    poster = await extract_poster_info(message)
+    poster = await extract_poster_info(message, client=client)
     parse_text = normalize_ingest_text(
         ingest_text if had_close_footer and ingest_text else message.text or ""
     )
@@ -1146,7 +1155,9 @@ async def _scan_all_chats(
                 if audit_only:
                     await _audit_evaluate_message(message, chat_title, stats)
                 else:
-                    result = await _process_single_message(message, entity, chat_id, chat_title, stats)
+                    result = await _process_single_message(
+                        message, entity, chat_id, chat_title, stats, client=client,
+                    )
                     for item in _flatten_parser_result(result):
                         if item.get("type") == "closed":
                             closed_vacancies_users.append((item["vacancy_id"], item["users"]))
@@ -1325,7 +1336,9 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                 chat_title = chat.title or "Без названия"
 
                 try:
-                    result = await _process_single_message(message, chat, chat_id, chat_title)
+                    result = await _process_single_message(
+                        message, chat, chat_id, chat_title, client=_realtime_client,
+                    )
                     await _dispatch_parser_result(result, chat_title)
                 except Exception as e:
                     logger.warning(f"⚠️ {PARSER_LABEL}: ошибка chat={chat_title}: {e}")
@@ -1349,6 +1362,7 @@ async def start_realtime_listener(bot_callback, closed_callback=None, health_not
                 try:
                     result = await _process_single_message(
                         message, chat, chat_id, chat_title, allow_reprocess=True,
+                        client=_realtime_client,
                     )
                     await _dispatch_parser_result(result, chat_title, edited=True)
                 except Exception as e:
@@ -2242,6 +2256,7 @@ _CATEGORY_KEYWORDS = {
         "бэкстейдж", "бэкстейж",
         "ассистент по акт", "ассистент на площадке",
         "волонтер", "волонтёр",
+        "фотобудк",
     ],
     "handyman": [
         "разнорабочий", "разнорабочие", "разнорабоч",
@@ -2351,7 +2366,11 @@ def _is_production_packing_job(text_lower: str) -> bool:
         return False
     if any(w in text_lower for w in ("грузчик", "разгруз", "погруз", "выгруз", "такелаж", "фура")):
         return False
-    if re.search(r"упаковщ", text_lower):
+    if re.search(r"упаковщ|фасовщ", text_lower):
+        return True
+    if re.search(r"фасовк", text_lower) and re.search(
+        r"метро|мцк|тц\b|торгов|центр|подработк", text_lower,
+    ):
         return True
     return bool(re.search(r"цех|робот|пылесос|конвейер", text_lower))
 
@@ -2384,6 +2403,20 @@ _LABOR_HINTS = (
 )
 _HANDYMAN_HINTS = (
     "разнорабоч", "клининг", "уборщ", "посудомой", "котломой", "мойка посуды", "уборк",
+    "фасовк", "упаковщ",
+)
+_GUITARIST_RE = re.compile(r"гитар", re.I)
+_MUSICIAN_ROLE_RE = re.compile(
+    r"гитар|музыкант|вокалист|саксофон|клавишн|\bdj\b|диджей|кавер",
+    re.I,
+)
+_MULTI_HIRE_PROMO_FIRST_RE = re.compile(
+    r"требу\w*\s+\d+\s*человек\s+промо",
+    re.I,
+)
+_EVENT_TIME_RANGE_RE = re.compile(
+    r"\d{1,2}(?:[:.]\d{2})?\s*(?:до|[-–—])\s*\d{1,2}(?:[:.]\d{2})?",
+    re.I,
 )
 # В gate грузчика не отсекаем общую «уборку» — её ловит отдельная ветка ниже.
 _HANDYMAN_LOADER_REJECT = (
@@ -2580,7 +2613,11 @@ def _is_welcome_hostess_hiring(text_lower: str) -> bool:
     """Модель/актриса на welcome у бренда — хостес на мероприятии, не кино-кастинг."""
     if not text_lower:
         return False
+    if _MUSICIAN_ROLE_RE.search(text_lower):
+        return False
     if re.search(r"welcome|велком|welcom", text_lower):
+        if not re.search(r"нужен|нужна|нужны|требу|ищем|ваканси|на\s+роль", text_lower):
+            return False
         return True
     if re.search(r"модел\w*|актрис", text_lower) and re.search(
         r"welcome|велком|welcom|хостес|встреч", text_lower,
@@ -2661,6 +2698,14 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
         return None
     if is_skilled_trade_job(text_lower):
         return "electrician"
+    if _GUITARIST_RE.search(text_lower) and re.search(r"нужен|нужна|требу", text_lower):
+        return "misc"
+    if re.search(r"фотобудк", text_lower):
+        return "helper"
+    if _MULTI_HIRE_PROMO_FIRST_RE.search(text_lower) and scores.get("promoter"):
+        return "promoter"
+    if re.search(r"координатор", text_lower) and "помощь на площадке" in text_lower:
+        return "helper"
     if _has_explicit_event_staff_role(text_lower):
         return "helper"
     if scores.get("booth") and scores.get("helper"):
@@ -2765,6 +2810,7 @@ _PAYMENT_RATE_RE = re.compile(
 )
 _LS_CONTACT_RE = re.compile(
     r"пиш\w*\s+(?:telegram|телеграм|tg|в\s+)?(?:лс|личк)|"
+    r"пиш\w*\s+в\s+лич\w*|"
     r"пишите\s+(?:telegram|телеграм|tg|мне\s+)?(?:в\s+)?лс|"
     r"заявки?\s+в\s+лс|"
     r"напишите\s+(?:мне\s+)?(?:в\s+)?лс|"
@@ -2774,6 +2820,8 @@ _LS_CONTACT_RE = re.compile(
     r"в\s+лс\s+пиш|"
     r"личн\w*\s+сообщен|"
     r"для\s+запис\w*|"
+    r"для\s+отклик\w*|"
+    r"отклик\w*\s+(?:с\s+)?анкет|"
     r"записаться\s*:?\s*$",
     re.I | re.M,
 )
@@ -3000,11 +3048,29 @@ def is_non_event_labor_spam(text: str) -> bool:
     return True
 
 
+def is_contractor_resume_listing(text: str) -> bool:
+    """Бригада публикует «свободны N монтажников» — резюме, не заказ."""
+    if not text:
+        return False
+    tl = text.lower()
+    if not re.search(r"свободн", tl):
+        return False
+    if re.search(r"требу|нужн|ищем\s", tl):
+        return False
+    if re.search(r"свободн\w*\s+\d+", tl):
+        return True
+    return bool(re.search(r"\d+\s+(?:универсал|монтажник|разнорабоч)", tl))
+
+
 def is_permanent_job_spam(text: str) -> bool:
     """Вахта/ТК — не разовая смена для бота."""
     if not text:
         return False
     tl = text.lower()
+    if re.search(r"карщик|ричтрак|фулфилмент", tl) and "склад" in tl:
+        return True
+    if re.search(r"\bвахта\b", tl) and re.search(r"недел|разнорабоч|монолит", tl):
+        return True
     if re.search(r"\d{2,3}[\s\d]*000\s*(?:-|–|—)?\s*\d{0,3}[\s\d]*000\s*(?:руб|₽|р)?\s*(?:в\s+)?месяц", tl):
         if not any(m in tl for m in _SHORT_TERM_SHIFT_MARKERS):
             return True
@@ -3049,6 +3115,8 @@ def is_chat_listing_noise(text: str) -> bool:
         return False
     tl = text.lower()
     if is_group_welcome_spam(text):
+        return True
+    if re.search(r"earngo|разместите рекламу в telegram", tl):
         return True
     if "бот для отправки объявлений" in tl:
         return True
@@ -3095,6 +3163,10 @@ def _detect_category_scored(text: str) -> str | None:
         return "electrician"
     if _has_explicit_animator_role(text_lower):
         return "animator"
+    if _GUITARIST_RE.search(text_lower) and re.search(r"нужен|нужна|требу", text_lower):
+        return "misc"
+    if re.search(r"фотобудк", text_lower):
+        return "helper"
     if _has_explicit_hostess_role(text_lower):
         return "hostess"
     if _has_route_driver_role(text_lower):
@@ -3160,13 +3232,17 @@ def is_delivery_courier_job(text: str) -> bool:
         return False
     gig_courier = bool(re.search(
         r"доставк|развоз|заказов|"
-        r"сво[еёи]м\s+авто|с\s+личн|личн\w+\s+авт|"
         r"работа\s+курьер|курьер\w*\s+на\s+сво|"
         r"без\s+потолка|"
-        r"курьер\w*\s+с\s+ежедневн|ваканси\w*\s+курьер",
+        r"курьер\w*\s+с\s+ежедневн",
         tl,
     ))
     if gig_courier:
+        return True
+    if re.search(r"сво[еёи]м\s+авто|личн\w+\s+авт", tl) and re.search(
+        r"доставк|развоз|заказов|посылок|самокат|яндекс",
+        tl,
+    ):
         return True
     if re.search(r"водител|экспедитор", tl) and not re.search(
         r"доставк|развоз|заказов|сво[еёи]м\s+авто|личн\w+\s+авт",
@@ -3264,33 +3340,97 @@ def has_ls_contact_phrase(text: str) -> bool:
     return bool(_LS_CONTACT_RE.search(text))
 
 
-def has_contact_signal(text: str, poster: dict | None = None) -> bool:
-    if extract_contact_from_text(text or ""):
-        return True
-    if has_ls_contact_phrase(text):
-        return True
-    if _extract_phone_digits(text or ""):
-        return True
-    if poster and (poster.get("username") or poster.get("user_id")):
+def _poster_is_contact_person(poster: dict | None) -> bool:
+    """Контакт — человек (админ канала), не сам канал."""
+    if not poster:
+        return False
+    if poster.get("is_person"):
+        return bool(poster.get("username") or poster.get("user_id"))
+    if poster.get("username") and poster.get("user_id"):
         return True
     return False
 
 
-async def extract_poster_info(message) -> dict:
-    """Автор поста из Telethon (не список участников группы)."""
+def _has_explicit_paid_shift_rate(text: str) -> bool:
+    """Явная цифра ставки — достаточно для контакта без @ в фрагменте поста."""
+    if not text:
+        return False
+    from services.vacancy_rate import extract_hourly_rate_rub, extract_shift_rate_rub
+
+    if extract_hourly_rate_rub(text) or extract_shift_rate_rub(text):
+        return True
+    return bool(re.search(
+        r"\d{3,5}\s*(?:₽|руб|р\b)|"
+        r"оплат\w*[^\n]{0,20}\d{3,5}|"
+        r"\d{3,5}\s*за\s*смен",
+        text,
+        re.I,
+    ))
+
+
+def has_contact_signal(text: str, poster: dict | None = None) -> bool:
+    if extract_contact_from_text(text or ""):
+        return True
+    if _extract_phone_digits(text or ""):
+        return True
+    if has_hiring_signal(text) and _has_explicit_paid_shift_rate(text):
+        return True
+    if (
+        has_hiring_signal(text)
+        and PARSER_WIDE_INGEST
+        and _has_deferred_payment_context(text)
+        and re.search(r"требу\w*\s+\d+\s*человек", text or "", re.I)
+    ):
+        return True
+    if not _poster_is_contact_person(poster):
+        return False
+    if has_ls_contact_phrase(text) or _has_implicit_contact_intent(text):
+        return True
+    if has_hiring_signal(text) and (
+        has_payment_signal(text) or _has_deferred_payment_context(text)
+    ):
+        return True
+    return False
+
+
+async def extract_poster_info(message, client=None) -> dict:
+    """Автор поста — человек, который публикует (подпись канала / from_id User)."""
+    from telethon.tl.types import PeerUser, User
+
     info: dict = {}
-    try:
-        sender = await message.get_sender()
-        if sender and getattr(sender, "id", None):
-            info["user_id"] = int(sender.id)
-            uname = getattr(sender, "username", None)
-            if uname:
-                info["username"] = uname
-            fn = (getattr(sender, "first_name", None) or "").strip()
-            ln = (getattr(sender, "last_name", None) or "").strip()
-            info["display_name"] = f"{fn} {ln}".strip() or None
-    except Exception as e:
-        logger.debug("extract_poster_info sender: %s", e)
+    person: User | None = None
+
+    from_id = getattr(message, "from_id", None)
+    if isinstance(from_id, PeerUser):
+        try:
+            if client:
+                entity = await client.get_entity(from_id)
+                if isinstance(entity, User):
+                    person = entity
+            else:
+                info["user_id"] = int(from_id.user_id)
+        except Exception as e:
+            logger.debug("extract_poster_info from_id: %s", e)
+            if not info.get("user_id"):
+                info["user_id"] = int(from_id.user_id)
+
+    if person is None:
+        try:
+            sender = await message.get_sender()
+            if isinstance(sender, User):
+                person = sender
+        except Exception as e:
+            logger.debug("extract_poster_info sender: %s", e)
+
+    if isinstance(person, User):
+        info["user_id"] = int(person.id)
+        if person.username:
+            info["username"] = person.username
+        fn = (person.first_name or "").strip()
+        ln = (person.last_name or "").strip()
+        info["display_name"] = f"{fn} {ln}".strip() or None
+        info["is_person"] = True
+
     post_author = getattr(message, "post_author", None)
     if post_author and not info.get("display_name"):
         info["display_name"] = str(post_author).strip()
@@ -3421,6 +3561,15 @@ def is_mixed_digest_post(text: str) -> bool:
     return should_split_digest(text)
 
 
+def _is_staff_resume_response(text: str) -> bool:
+    """«Резюме с фото» на оплачиваемую смену — отклик, не «ищу работу»."""
+    if not text or "резюме" not in text.lower():
+        return False
+    if not has_hiring_signal(text):
+        return False
+    return has_payment_signal(text) or _has_deferred_payment_context(text)
+
+
 def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, str, list]:
     """Общий gate: найм персонала на смену (все категории)."""
     if not text:
@@ -3430,6 +3579,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "closed_vacancy", []
     if is_chat_listing_noise(text):
         return False, "chat_noise", []
+    if is_contractor_resume_listing(text):
+        return False, "contractor_resume", []
     if is_massovka_or_film_extras(text):
         return False, "massovka_film", []
     if is_permanent_job_spam(text):
@@ -3456,6 +3607,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "camp_educator", []
     for phrase in STOP_PHRASES:
         if phrase.lower() in tl:
+            if phrase.lower() in ("резюме", "резюме в лс") and _is_staff_resume_response(text):
+                continue
             return False, f"stop_phrase: {phrase}", []
     if is_service_request(text):
         return False, "service_request", []
@@ -3541,6 +3694,7 @@ def passes_quality_gate(category: str, text: str) -> bool:
             "бекфотограф", "бэкфотограф", "бэкфото", "бэкстейдж", "бэкстейж",
             "ассистент по акт", "ассистент на площадке",
             "зоопарк", "сафари", "выставочн", "павильон",
+            "фотобудк", "координатор", "помощь на площадке",
         )
         if not any(_helper_quality_marker_hit(tl, m) for m in helper_markers):
             return False
@@ -3656,10 +3810,10 @@ def _has_deferred_payment_context(text: str) -> bool:
     ):
         has_date = True
     has_hours = bool(re.search(r"\d+\s*\+\s*\d+|\d+\s*час", tl))
-    has_time_range = bool(re.search(r"\d{1,2}[:.]\d{2}\s*(?:до|-)\s*\d{1,2}[:.]\d{2}", tl))
+    has_time_range = bool(_EVENT_TIME_RANGE_RE.search(tl))
     has_staff_role = bool(re.search(
         r"(?<![а-яё])(?:монтажник|хелпер|хэлпер|грузчик|промоутер|"
-        r"хостес|аниматор|официант|разнорабоч)\w*",
+        r"хостес|аниматор|официант|разнорабоч|координатор|фотобудк)\w*",
         tl,
     ))
     has_pay_hint = any(w in tl for w in (
@@ -3894,6 +4048,107 @@ async def run_parser_audit() -> dict:
         logger.error(f"❌ Ошибка аудита фильтра: {e}", exc_info=True)
         _mark_stats_finished(stats, error=str(e))
         return stats
+
+
+async def backfill_chat(
+    chat_link: str,
+    bot_callback,
+    closed_callback=None,
+) -> dict:
+    """Прогон последних N постов при добавлении канала (не только realtime)."""
+    summary: dict = {
+        "ok": False,
+        "chat_link": chat_link,
+        "saved": 0,
+        "closed": 0,
+        "scanned": 0,
+        "error": None,
+    }
+    client = _realtime_client
+    if not client or not client.is_connected():
+        summary["error"] = "parser_offline"
+        return summary
+
+    stats = _new_stats("backfill")
+    stats["chats_total"] = 1
+    orders: list = []
+    closed_pairs: list = []
+
+    try:
+        async with _parser_lock:
+            _publish_debug_stats(stats)
+            entity = await safe_get_entity(client, chat_link)
+            if not entity:
+                summary["error"] = "entity_failed"
+                _mark_stats_finished(stats, error="entity_failed")
+                return summary
+
+            await refresh_monitored_chat_ids(client)
+            chat_title = getattr(entity, "title", None) or "Без названия"
+            chat_id = str(entity.id)
+            stats["chats_ok"] = 1
+
+            logger.info(
+                "📥 Бэкфилл «%s»: последние %s постов, окно %s ч",
+                chat_title,
+                CHAT_BACKFILL_LIMIT,
+                CHAT_BACKFILL_MAX_AGE_HOURS,
+            )
+
+            async for message in client.iter_messages(entity, limit=CHAT_BACKFILL_LIMIT):
+                stats["messages_scanned"] += 1
+                _bump_chat_stat(stats, chat_title, "scanned")
+                try:
+                    result = await _process_single_message(
+                        message,
+                        entity,
+                        chat_id,
+                        chat_title,
+                        stats,
+                        max_age_hours=CHAT_BACKFILL_MAX_AGE_HOURS,
+                        client=client,
+                    )
+                    for item in _flatten_parser_result(result):
+                        if item.get("type") == "closed":
+                            closed_pairs.append((item["vacancy_id"], item["users"]))
+                        else:
+                            orders.append(item)
+                            await asyncio.sleep(0.05)
+                except Exception as e:
+                    stats["errors"] += 1
+                    stats["errors_by_chat"][chat_title] = stats["errors_by_chat"].get(chat_title, 0) + 1
+                    logger.warning(
+                        "⚠️ Бэкфилл: пропуск сообщения chat=%s id=%s: %s",
+                        chat_title,
+                        getattr(message, "id", "?"),
+                        e,
+                    )
+
+        _mark_stats_finished(stats)
+        if closed_callback and closed_pairs:
+            await closed_callback(closed_pairs)
+        for order in orders:
+            bot_callback(order)
+
+        summary.update(
+            ok=True,
+            saved=len(orders),
+            closed=len(closed_pairs),
+            scanned=stats.get("messages_scanned") or 0,
+        )
+        logger.info(
+            "✅ Бэкфилл «%s»: +%s в ленту, закрыто %s, просмотрено %s",
+            chat_title,
+            len(orders),
+            len(closed_pairs),
+            summary["scanned"],
+        )
+    except Exception as e:
+        logger.error("Бэкфилл %s: %s", chat_link, e, exc_info=True)
+        _mark_stats_finished(stats, error=str(e))
+        summary["error"] = str(e)
+
+    return summary
 
 
 async def get_new_messages(limit_per_chat: int = PER_CHAT_SCAN_LIMIT):

@@ -48,6 +48,31 @@ def test_subscriber_activity_counts(monkeypatch, tmp_path):
     assert get_subscriber_registered_at(uid) is not None
 
 
+def test_notfit_recent_with_comment(monkeypatch, tmp_path):
+    from db import get_notfit_recent, count_notfit_feedback_total
+
+    _init_test_db(monkeypatch, tmp_path)
+    uid = 9001
+    execute(
+        "INSERT INTO subscribers (user_id, username, first_name, is_active) VALUES (?, ?, ?, 1)",
+        (uid, "tester", "T"),
+    )
+    execute(
+        "INSERT INTO vacancies (id, message_text, category_code, source_chat_title, message_link) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("vac_nf", "Нужен промоутер", "promoter", "Test chat", "https://t.me/c/1/2"),
+    )
+    fid = record_vacancy_notfit(
+        uid, "vac_nf", "promoter", ["promoter"],
+        reason_code="other", reason_text="Я мужчина",
+    )
+    assert fid > 0
+    assert count_notfit_feedback_total() == 1
+    recent = get_notfit_recent(5)
+    assert recent[0]["reason_text"] == "Я мужчина"
+    assert recent[0]["username"] == "tester"
+
+
 def test_set_subscriber_active(monkeypatch, tmp_path):
     _init_test_db(monkeypatch, tmp_path)
     uid = 100500

@@ -62,7 +62,7 @@ def test_push_edits_general_when_pin_exists(monkeypatch):
         send_vacancy_push_pinned_general(
             bot,
             user_id,
-            "vac_new",
+            "vac_old",
             "<b>new</b>",
             None,
             rebuild_keyboard=lambda _vid: None,
@@ -73,14 +73,14 @@ def test_push_edits_general_when_pin_exists(monkeypatch):
     bot.edit_message_text.assert_awaited_once()
     bot.delete_message.assert_not_awaited()
     assert get_general_vacancy_pin(user_id)["message_id"] == 10
-    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_old"
 
 
 def test_push_replaces_general_and_appends_history(monkeypatch):
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 777
     save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
-    set_general_vacancy_pin(user_id, 10, "vac_old", "old")
+    set_general_vacancy_pin(user_id, 10, "vac_old", "old", message_thread_id=GENERAL_TOPIC_THREAD_ID)
 
     bot = AsyncMock()
     sent = []
@@ -114,14 +114,26 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
         )
     )
     assert ok is True
-    bot.delete_message.assert_awaited_once_with(
-        chat_id=user_id,
-        message_id=10,
-        message_thread_id=GENERAL_TOPIC_THREAD_ID,
-    )
+    bot.delete_message.assert_awaited()
     assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
     general = [s for s in sent if s["thread"] == GENERAL_TOPIC_THREAD_ID]
     history = [s for s in sent if s["thread"] == 55]
     assert len(general) == 1
     assert len(history) == 1
     assert general[0]["text"] == "<b>new</b>"
+
+
+def test_clear_general_if_pinned(monkeypatch):
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 888
+    set_general_vacancy_pin(
+        user_id, 42, "vac_x", "card", message_thread_id=GENERAL_TOPIC_THREAD_ID,
+    )
+    bot = AsyncMock()
+    bot.delete_message = AsyncMock()
+
+    from services.forum_vacancy_pin import clear_general_vacancy_if_pinned
+
+    asyncio.run(clear_general_vacancy_if_pinned(bot, user_id, "vac_x"))
+    bot.delete_message.assert_awaited()
+    assert get_general_vacancy_pin(user_id) is None

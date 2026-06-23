@@ -286,6 +286,44 @@ def test_garbage_shift_on_warehouse_not_address():
     assert extract_address_normalized("Смена на склад 10.000р.") is None
 
 
+def test_extract_address_golden_jun23_metro_not_task_line():
+    text = (
+        "Ищем промо с опытом работы на конференциях\n"
+        "м. ВДНХ\n"
+        "ФОТО - 2 штуки (портрет и полный рост).\n"
+        "23 июня, Оплата 3500р"
+    )
+    addr = extract_address_normalized(text)
+    assert addr is not None
+    assert "вднх" in addr.lower()
+    assert "фото" not in addr.lower()
+
+
+def test_extract_address_golden_jun23_chekhov_and_sokolniki():
+    chekhov = (
+        "Мероприятие будет в Чехове\n"
+        "Нужно будет взять с собой 4 промоутера от метро"
+    )
+    assert extract_address_normalized(chekhov) == "Чехов, МО"
+    sok = "На сегодня нужна пара грузчиков. Сокольники. 12:00."
+    addr = extract_address_normalized(sok)
+    assert addr is not None
+    assert "сокольник" in addr.lower()
+
+
+def test_extract_address_golden_jun23_metro_tc_and_khodynka():
+    fasovka = (
+        "мцк Дубровка или метро Дубровка, торговый центр Мозаика, 1 этаж\n"
+        "Фасовка / упаковка"
+    )
+    addr = extract_address_normalized(fasovka)
+    assert addr is not None
+    assert "дубровк" in addr.lower()
+    assert "мозаик" in addr.lower()
+    khodynka = "Москва, Ходынский бульвар 22\nЗадача: выгрузить 5 ящиков"
+    assert "Ходынский" in extract_address_normalized(khodynka)
+
+
 def test_address_strips_trailing_telegram_mention():
     text = (
         "Метро стахановская\n"
