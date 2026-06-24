@@ -2226,7 +2226,11 @@ _CATEGORY_KEYWORDS = {
         "бейбиситтер", "babysitter", "детскую комнату", "игры с детьми", "присмотр за детьми",
         "творческий мастер", "мастер-класс", "поделки с детьми",
     ],
-    "waiter": ["официант", "официантка", "официанты", "бармен", "обслуживание гостей"],
+    "waiter": [
+        "официант", "официантка", "официанты", "бармен", "обслуживание гостей",
+        "заготовщик", "заготовщика", "заготовщица", "заготовщицы", "заготовщиц",
+        "су-шеф", "су шеф", "повар", "кухонн",
+    ],
     "driver": ["водитель", "водители", "курьер", "экспедитор"],
     "security": ["охранник", "контролёр", "контролер", "охрана", "секьюрити", "контроль доступа", "пропускной режим"],
     "parking": ["парковщик", "парковка vip", "паркинг", "парковочный"],
@@ -2514,7 +2518,7 @@ def enrich_digest_block(block_text: str, full_text: str) -> str:
     """Подмешивает роль/ставку/контакт из шапки digest в блок без своих."""
     from services.post_header_context import enrich_block_with_header_context
 
-    return enrich_block_with_header_context(
+    result = enrich_block_with_header_context(
         block_text,
         full_text,
         category_scorer=_detect_category_scored,
@@ -2524,6 +2528,23 @@ def enrich_digest_block(block_text: str, full_text: str) -> str:
         extract_contact=extract_contact_from_text,
         has_ls_contact=has_ls_contact_phrase,
     )
+    tl = result.lower()
+    if _has_horeca_kitchen_hiring(tl) or re.search(r"загото\w*|ресторан|all day", tl):
+        extras: list[str] = []
+        for line in (full_text or "").splitlines():
+            s = line.strip()
+            if not s or s in result:
+                continue
+            ll = s.lower()
+            if re.search(
+                r"график\s+\d/\d|\d/\d\s+по\s+\d+\s+час|"
+                r"доход\s+от\s+\d{2,3}|трёхразовое питание|заготовщик",
+                ll,
+            ):
+                extras.append(s)
+        if extras:
+            result = result + "\n" + "\n".join(extras)
+    return result
 
 
 def _numbered_vacancy_count(text: str) -> int:
@@ -2588,17 +2609,35 @@ def is_group_welcome_spam(text: str) -> bool:
 def _has_explicit_animator_role(text_lower: str) -> bool:
     if not text_lower:
         return False
+    if _has_horeca_kitchen_hiring(text_lower):
+        return False
     if not re.search(
         r"аниматор|бейбиситтер|babysitter|ресторанн\w*\s+аниматор", text_lower,
     ):
         return False
     return not re.search(
-        r"официант|официантк|бармен|обслуживание гостей", text_lower,
+        r"официант|официантк|бармен|заготовщик|заготовщиц|су-шеф|обслуживание гостей",
+        text_lower,
     )
 
 
+def _has_horeca_kitchen_hiring(text_lower: str) -> bool:
+    """Кухня/бар ресторана — не аниматор и не event-хелпер."""
+    if not text_lower:
+        return False
+    return bool(re.search(
+        r"заготовщик|заготовщиц|загото\w*|су-шеф|су\s+шеф|"
+        r"официант|официантк|бармен|"
+        r"кухонн\w*\s+работ|работник\s+кухн",
+        text_lower,
+    ))
+
+
 def _waiter_role_confirmed(text_lower: str) -> bool:
-    return bool(re.search(r"официант|бармен|обслуживание гостей", text_lower))
+    return bool(re.search(
+        r"официант|бармен|заготовщик|заготовщиц|загото\w*|су-шеф|обслуживание гостей",
+        text_lower,
+    ))
 
 
 def _security_role_confirmed(text_lower: str) -> bool:
@@ -2742,9 +2781,12 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
     if scores.get("animator") and scores.get("waiter"):
         if re.search(r"аниматор|бейбиситтер|babysitter|ресторанн\w*\s+аниматор", text_lower):
             if not re.search(
-                r"официант|официантк|бармен|обслуживание гостей|хостес", text_lower
+                r"официант|официантк|бармен|заготовщик|заготовщиц|"
+                r"обслуживание гостей|хостес", text_lower
             ):
                 return "animator"
+        if _has_horeca_kitchen_hiring(text_lower):
+            return "waiter"
     if re.search(r"упаковк", text_lower) and scores.get("loader"):
         if not re.search(r"промоутер|раздача листовок|дегустац|промо[\s\-]*акци", text_lower):
             return "loader"
@@ -3065,11 +3107,34 @@ def is_contractor_resume_listing(text: str) -> bool:
     return bool(re.search(r"\d+\s+(?:универсал|монтажник|разнорабоч)", tl))
 
 
+def _is_horeca_permanent_employment(tl: str) -> bool:
+    """Ресторан/бар: график 4/3, 5/2 + оклад — штат, не разовая смена."""
+    if not re.search(r"ресторан|общепит|\bбар\b|all day|заготовщик|официант|кухн", tl):
+        return False
+    has_staff_schedule = bool(re.search(
+        r"график\s+\d/\d|\d/\d\s+по\s+\d+\s+час|\d/\d\s+по\s+12",
+        tl,
+    ))
+    has_monthly_pay = bool(re.search(
+        r"доход\s+от\s+\d{2,3}[.\s]?\d{0,3}\s*[-–—]\s*\d{2,3}|"
+        r"\d{2,3}[.\s]\d{3}\s*[-–—]\s*\d{2,3}[.\s]?\d{0,3}|"
+        r"(?:от\s+)?\d{2,3}\s*тр\s*(?:в\s+)?месяц",
+        tl,
+    ))
+    if has_staff_schedule and (has_monthly_pay or "трёхразовое питание" in tl):
+        return True
+    if has_staff_schedule and re.search(r"оформлен|трудовой|отпуск|больничн", tl):
+        return True
+    return False
+
+
 def is_permanent_job_spam(text: str) -> bool:
     """Вахта/ТК — не разовая смена для бота."""
     if not text:
         return False
     tl = text.lower()
+    if _is_horeca_permanent_employment(tl):
+        return True
     if re.search(r"карщик|ричтрак|фулфилмент", tl) and "склад" in tl:
         return True
     if re.search(r"\bвахта\b", tl) and re.search(r"недел|разнорабоч|монолит", tl):
@@ -3164,6 +3229,8 @@ def _detect_category_scored(text: str) -> str | None:
         return "handyman"
     if is_skilled_trade_job(text_lower):
         return "electrician"
+    if _has_horeca_kitchen_hiring(text_lower):
+        return "waiter"
     if _has_explicit_animator_role(text_lower):
         return "animator"
     if _GUITARIST_RE.search(text_lower) and re.search(r"нужен|нужна|требу", text_lower):
@@ -3736,6 +3803,8 @@ def passes_quality_gate(category: str, text: str) -> bool:
         if re.search(r"позиция\s*[:\s].*хелпер", tl) and "промо" not in tl and "промоутер" not in tl:
             return False
     elif category == "animator":
+        if _has_horeca_kitchen_hiring(tl):
+            return False
         if is_massovka_or_film_extras(text):
             return False
         if not any(w in tl for w in ("аниматор", "анимац", "клоун", "ростовые")):

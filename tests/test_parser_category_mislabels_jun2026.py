@@ -346,3 +346,46 @@ def test_write_in_private_poster_contact():
     contact, source = resolve_vacancy_contact(text, poster)
     assert contact == "@SofiaKhodus"
     assert source == "sender"
+
+
+def test_lucky_group_bar_prep_permanent_job_rejected():
+    """Штатный заготовщик бара (4/3, оклад) — не разовая смена."""
+    text = (
+        "Прикрепляю основные условия:\n"
+        "📍 метро Деловой центр от Lucky Group ищут загото\n"
+        "💰 4000 ₽/смена\n"
+        "В ресторан All Day на станции метро Деловой центр от Lucky Group ищут заготовщика бара\n"
+        "• График 4/3 по 12 часов\n"
+        "• Смены 9:00-21:00\n"
+        "• Доход от 60.000-80.000\n"
+        "• Трёхразовое питание\n"
+        "👉 @Hrlucky_group"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "Hrlucky_group", "user_id": 1})
+    assert ok is False
+    assert cat is None
+    assert reason == "permanent_job"
+
+
+def test_digest_animator_header_does_not_poison_bar_block():
+    """Шапка «аниматоры» в digest не должна перекрашивать блок про заготовщика."""
+    from parser import enrich_digest_block
+
+    block = (
+        "📍 метро Деловой центр от Lucky Group ищут загото\n"
+        "💰 4000 ₽/смена\n"
+        "👉 @Hrlucky_group"
+    )
+    full = (
+        "🎭 АНИМАТОРЫ НА ВЫХОДНЫЕ\n"
+        "Свежие вакансии Lucky Group\n"
+        + block
+        + "\nВ ресторан All Day ищут заготовщика бара\n"
+        "• График 4/3 по 12 часов\n"
+        "• Доход от 60.000-80.000"
+    )
+    enriched = enrich_digest_block(block, full)
+    ok, cat, reason, _ = evaluate_vacancy(enriched, {"username": "Hrlucky_group", "user_id": 1})
+    assert ok is False
+    assert reason == "permanent_job"
+    assert cat != "animator"

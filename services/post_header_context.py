@@ -106,6 +106,48 @@ def collect_context_lines(
     return out
 
 
+def _header_role_conflicts_with_block(
+    block: str,
+    role_line: str,
+    *,
+    category_scorer=None,
+) -> bool:
+    """Не подмешивать роль из шапки digest, если блок явно про другую сферу."""
+    if not block or not role_line:
+        return False
+    if category_scorer:
+        block_cat = category_scorer(block)
+        line_cat = category_scorer(role_line)
+        if (
+            block_cat
+            and line_cat
+            and block_cat != line_cat
+            and block_cat != "misc"
+            and line_cat != "misc"
+        ):
+            return True
+    bl = block.lower()
+    rl = role_line.lower()
+    horeca_block = bool(re.search(
+        r"ресторан|общепит|\bбар\b|all day|загото|заготовщ|официант|кухн",
+        bl,
+    ))
+    animator_header = "аниматор" in rl or "🎭" in role_line
+    if horeca_block and animator_header:
+        return True
+    promo_header = any(w in rl for w in ("промоутер", "промо", "📢", "раздача"))
+    if horeca_block and promo_header:
+        return True
+    loader_block = bool(re.search(r"грузчик|разгруз|погруз|фура|такелаж", bl))
+    hostess_header = any(w in rl for w in ("хостес", "welcome", "велком", "👩"))
+    if loader_block and hostess_header:
+        return True
+    security_header = any(w in rl for w in ("охранник", "охрана", "🛡"))
+    if loader_block and security_header and "грузчик" in bl:
+        return True
+    return False
+
+
 def enrich_block_with_header_context(
     block_text: str,
     full_text: str,
@@ -128,6 +170,8 @@ def enrich_block_with_header_context(
             category_scorer=category_scorer,
             payment_checker=payment_checker,
         ):
+            if _header_role_conflicts_with_block(block, line, category_scorer=category_scorer):
+                continue
             if line not in prefix and line not in block:
                 prefix.append(line)
 

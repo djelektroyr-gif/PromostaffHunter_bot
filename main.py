@@ -2723,6 +2723,20 @@ async def dispatch_vacancy_push(order: dict):
 
 
 def schedule_vacancy_push(order: dict):
+    from services.broadcast_quality import assess_vacancy_broadcast
+
+    decision = assess_vacancy_broadcast(order)
+    if not decision.eligible:
+        logger.info(
+            "Push skip schedule %s: %s (ingest=%s)",
+            order.get("vacancy_id"),
+            decision.reason,
+            order.get("reason"),
+        )
+        return
+    if decision.category_code:
+        order["category"] = decision.category_code
+        order["category_code"] = decision.category_code
     spawn_background_task(dispatch_vacancy_push(order))
 
 
@@ -2732,7 +2746,6 @@ async def send_vacancy_to_subscribers(order: dict):
     vacancy_id = order.get("vacancy_id") or make_vacancy_id(
         order.get('chat_id', ''), order.get('message_id', ''), dedupe_key=order.get("dedupe_key")
     )
-    stored_cat = order.get("category") or order.get("category_code")
     mod_row = get_vacancy_push_row(vacancy_id)
     from services.vacancy_push_row import (
         PUSH_IDX_MODERATION,
@@ -2743,48 +2756,37 @@ async def send_vacancy_to_subscribers(order: dict):
         logger.info(f"Push skip {vacancy_id}: moderation_status={push_field(mod_row, PUSH_IDX_MODERATION)}")
         return
 
+    from services.broadcast_quality import assess_vacancy_broadcast
+
+    broadcast = assess_vacancy_broadcast(order)
+    if not broadcast.eligible or not broadcast.category_code:
+        logger.info(
+            "Push skip %s: broadcast gate (%s), ingest=%s",
+            vacancy_id,
+            broadcast.reason,
+            order.get("reason"),
+        )
+        return
+
+    category_code = broadcast.category_code
+
     published_raw = order.get("published_at")
     published_at = format_publication_time(published_raw)
     freshness = get_freshness_label(published_raw)
 
-    if stored_cat:
-        from services.vacancy_channel_dispatch import schedule_vacancy_channel_crosspost
+    from services.vacancy_channel_dispatch import schedule_vacancy_channel_crosspost
 
-        schedule_vacancy_channel_crosspost(
-            spawn_background_task,
-            bot,
-            order=order,
-            vacancy_id=vacancy_id,
-            category_code=stored_cat,
-            category_name=get_category_name(stored_cat),
-            category_emoji=get_category_emoji(stored_cat),
-            body=msg_text,
-            freshness=freshness,
-        )
-
-    poster = poster_from_order(order)
-    force_cat = order.get('category') if order.get('from_bot_employer') else None
-    accepted, category_code, gate_reason, _ = evaluate_vacancy(
-        msg_text, poster, force_category=force_cat,
+    schedule_vacancy_channel_crosspost(
+        spawn_background_task,
+        bot,
+        order=order,
+        vacancy_id=vacancy_id,
+        category_code=category_code,
+        category_name=get_category_name(category_code),
+        category_emoji=get_category_emoji(category_code),
+        body=msg_text,
+        freshness=freshness,
     )
-    if not accepted or not category_code:
-        recheck_reason = gate_reason
-        if stored_cat and (
-            not mod_row or push_field(mod_row, PUSH_IDX_MODERATION) in (None, "approved")
-        ):
-            category_code = stored_cat
-            logger.info(
-                "Push use stored category %s for %s (re-check: %s)",
-                stored_cat,
-                vacancy_id,
-                recheck_reason,
-            )
-        else:
-            logger.info(
-                f"Push skip {vacancy_id}: quality re-check ({recheck_reason}), "
-                f"stored={order.get('category')}"
-            )
-            return
 
     cat_name = get_category_name(category_code)
 
