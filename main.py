@@ -778,7 +778,7 @@ def _free_category_hint_short() -> str:
 
 def _finish_categories_delivery_hint(is_premium: bool) -> str:
     if FORUM_TOPICS_ENABLED:
-        base = "💎 Новые вакансии — в теме «📬 Вакансии»."
+        base = "💎 Свежий push — в «Все» (одна карточка); архив — в «📬 Вакансии»."
     else:
         base = "💎 Новые вакансии приходят моментально в чат."
     if is_premium:
@@ -2911,44 +2911,17 @@ async def send_vacancy_to_subscribers(order: dict):
         try:
             uid = subscriber['user_id']
             if FORUM_TOPICS_ENABLED:
-                from services.forum_vacancy_pin import send_vacancy_push_pinned_general
+                from services.forum_vacancy_pin import deliver_forum_vacancy_push
 
-                def _rebuild_kb(vid: str):
-                    r = get_vacancy_push_row(vid)
-                    if not r:
-                        return None
-                    return build_vacancy_preview_keyboard(vid, **_map_fields_from_push_row(r))
-
-                try:
-                    ok = await send_vacancy_push_pinned_general(
-                        bot,
-                        uid,
-                        vacancy_id,
-                        push_preview_html,
-                        keyboard,
-                        rebuild_keyboard=_rebuild_kb,
-                        ensure_topics=setup_forum_topics_for_user,
-                    )
-                    if not ok:
-                        raise RuntimeError("pinned general push returned false")
-                except Exception as pin_exc:
-                    logger.warning(
-                        "pinned general push failed user=%s vac=%s: %s — fallback General",
-                        uid,
-                        vacancy_id,
-                        pin_exc,
-                    )
-                    await send_vacancy_card(
-                        uid,
-                        text=push_preview_html,
-                        reply_markup=keyboard,
-                        topic_key=None,
-                    )
-                    from services.forum_vacancy_pin import append_vacancy_history_message
-
-                    await append_vacancy_history_message(
-                        bot, uid, vacancy_id, push_preview_html, keyboard,
-                    )
+                if not await deliver_forum_vacancy_push(
+                    bot,
+                    uid,
+                    vacancy_id,
+                    push_preview_html,
+                    keyboard,
+                    ensure_topics=setup_forum_topics_for_user,
+                ):
+                    raise RuntimeError("forum vacancy push delivery failed")
             else:
                 await send_vacancy_card(
                     uid,

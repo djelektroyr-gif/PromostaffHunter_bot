@@ -75,12 +75,10 @@ async def _send_html_card(
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
             if topic_key:
-                # Топик «Вакансии» и др. — не слать в General (иначе дубль push).
                 raise
             logger.warning(
-                "forum_vacancy_pin: topic miss user=%s key=%s — fallback без thread_id",
+                "forum_vacancy_pin: General thread miss user=%s — fallback без thread_id",
                 user_id,
-                topic_key,
             )
             msg = await bot.send_message(
                 user_id,
@@ -155,21 +153,23 @@ async def _delete_general_message(
     message_id: int,
     *,
     stored_thread_id: int | None = None,
-) -> None:
-    """Удаление push-карточки в General (deleteMessage — только chat_id + message_id)."""
-    del stored_thread_id  # thread_id не передаётся в deleteMessage (aiogram / Bot API)
+) -> bool:
+    """Удаление push-карточки. True = можно сбросить pin (удалили или уже нет)."""
+    del stored_thread_id
     try:
         await bot.delete_message(chat_id=user_id, message_id=message_id)
+        return True
     except TelegramBadRequest as e:
         err = str(e).lower()
         if "message to delete not found" in err:
-            return
+            return True
         logger.warning(
             "delete general vacancy pin user=%s msg=%s: %s",
             user_id,
             message_id,
             e,
         )
+        return False
     except TypeError as e:
         logger.warning(
             "delete general vacancy pin user=%s msg=%s: %s",
@@ -177,20 +177,28 @@ async def _delete_general_message(
             message_id,
             e,
         )
+        return False
 
 
-async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> None:
-    """Убирает предыдущую push-карточку из General (история уже в «Вакансии»)."""
+async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> bool:
+    """Убирает предыдущую push-карточку из General. False = pin оставлен для повтора delete."""
     pin = get_general_vacancy_pin(user_id)
     if not pin:
-        return
-    await _delete_general_message(
+        return True
+    if await _delete_general_message(
         bot,
         user_id,
         pin["message_id"],
         stored_thread_id=pin.get("message_thread_id"),
+    ):
+        clear_general_vacancy_pin(user_id)
+        return True
+    logger.warning(
+        "general pin kept user=%s msg=%s — delete failed, retry next push",
+        user_id,
+        pin["message_id"],
     )
-    clear_general_vacancy_pin(user_id)
+    return False
 
 
 async def clear_general_vacancy_if_pinned(
@@ -269,6 +277,41 @@ async def append_vacancy_history_message(
     await _append_vacancy_history(bot, user_id, vacancy_id, card_text, reply_markup)
 
 
+async def _install_general_push_card(
+    bot: Bot,
+    user_id: int,
+    vacancy_id: str,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> bool:
+    """Одна карточка в General + pin в БД (после удаления предыдущей, если получилось)."""
+    if not await _clear_general_vacancy_display(bot, user_id):
+        pin = get_general_vacancy_pin(user_id)
+        if pin:
+            for attempt in range(2):
+                if await _delete_general_message(
+                    bot,
+                    user_id,
+                    pin["message_id"],
+                    stored_thread_id=pin.get("message_thread_id"),
+                ):
+                    clear_general_vacancy_pin(user_id)
+                    break
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+    msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
+    if msg_id is None:
+        return False
+    set_general_vacancy_pin(
+        user_id,
+        msg_id,
+        vacancy_id,
+        text,
+        message_thread_id=thread_id,
+    )
+    return True
+
+
 async def archive_general_vacancy_to_topic(
     bot: Bot,
     user_id: int,
@@ -276,6 +319,7 @@ async def archive_general_vacancy_to_topic(
     rebuild_keyboard,
 ) -> None:
     """Обратная совместимость: только очистка General."""
+    del rebuild_keyboard
     await _clear_general_vacancy_display(bot, user_id)
 
 
@@ -289,8 +333,8 @@ async def send_vacancy_push_pinned_general(
     rebuild_keyboard,
     ensure_topics,
 ) -> bool:
-    """Push: одна карточка в General; копия сразу в «Вакансии»."""
-    del rebuild_keyboard  # история сохраняется при push, не при archive
+    """Push: одна карточка в General; копия в «Вакансии»."""
+    del rebuild_keyboard
     async with _user_pin_lock(user_id):
         await ensure_topics(user_id)
         pin = get_general_vacancy_pin(user_id)
@@ -307,23 +351,60 @@ async def send_vacancy_push_pinned_general(
                 )
                 return True
         try:
-            await _clear_general_vacancy_display(bot, user_id)
+            if not await _install_general_push_card(bot, user_id, vacancy_id, text, reply_markup):
+                return False
         except Exception as e:
             logger.warning(
-                "clear general pin before push user=%s vac=%s: %s",
+                "install general push user=%s vac=%s: %s",
                 user_id,
                 vacancy_id,
                 e,
             )
-        msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
-        if msg_id is None:
             return False
-        set_general_vacancy_pin(
+        await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
+    return True
+
+
+async def deliver_forum_vacancy_push(
+    bot: Bot,
+    user_id: int,
+    vacancy_id: str,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    *,
+    ensure_topics,
+) -> bool:
+    """Единая точка Premium push: General (1 карточка) + история в «Вакансии»."""
+    try:
+        if await send_vacancy_push_pinned_general(
+            bot,
             user_id,
-            msg_id,
             vacancy_id,
             text,
-            message_thread_id=thread_id,
+            reply_markup,
+            rebuild_keyboard=None,
+            ensure_topics=ensure_topics,
+        ):
+            return True
+    except Exception as exc:
+        logger.warning(
+            "deliver forum push user=%s vac=%s: %s — fallback install",
+            user_id,
+            vacancy_id,
+            exc,
         )
+    async with _user_pin_lock(user_id):
+        await ensure_topics(user_id)
+        try:
+            if not await _install_general_push_card(bot, user_id, vacancy_id, text, reply_markup):
+                return False
+        except Exception as exc:
+            logger.warning(
+                "deliver forum push fallback user=%s vac=%s: %s",
+                user_id,
+                vacancy_id,
+                exc,
+            )
+            return False
         await _append_vacancy_history(bot, user_id, vacancy_id, text, reply_markup)
     return True

@@ -17,7 +17,9 @@ from db import (
 from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
 from services.forum_topics import TOPIC_VACANCIES
 from services.forum_vacancy_pin import (
+    _clear_general_vacancy_display,
     _delivery_kwargs,
+    deliver_forum_vacancy_push,
     send_vacancy_push_pinned_general,
 )
 
@@ -254,3 +256,67 @@ def test_vacancies_topic_miss_does_not_fallback_to_general(monkeypatch):
     )
     assert GENERAL_TOPIC_THREAD_ID not in threads_sent
     assert 55 in threads_sent or 77 in threads_sent
+
+
+def test_pin_kept_when_delete_fails(monkeypatch):
+    """Если delete не удался — pin не сбрасываем (повтор на следующем push)."""
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 891
+    set_general_vacancy_pin(user_id, 10, "vac_old", "old", message_thread_id=GENERAL_TOPIC_THREAD_ID)
+
+    bot = AsyncMock()
+    bot.delete_message = AsyncMock(
+        side_effect=TelegramBadRequest(method="deleteMessage", message="forbidden"),
+    )
+
+    asyncio.run(_clear_general_vacancy_display(bot, user_id))
+    pin = get_general_vacancy_pin(user_id)
+    assert pin is not None
+    assert pin["message_id"] == 10
+
+
+def test_deliver_forum_push_fallback_sets_pin(monkeypatch):
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 892
+    clear_general_vacancy_pin(user_id)
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+
+    bot = AsyncMock()
+    sent_threads = []
+
+    async def _send(chat_id, text, **kwargs):
+        msg = MagicMock()
+        msg.message_id = 500 + len(sent_threads)
+        sent_threads.append(kwargs.get("message_thread_id"))
+        return msg
+
+    bot.send_message = _send
+    bot.delete_message = AsyncMock()
+
+    async def _ensure(_uid):
+        return None
+
+    async def _pinned_fail(*_a, **_k):
+        raise RuntimeError("simulated pinned failure")
+
+    monkeypatch.setattr(
+        "services.forum_vacancy_pin.send_vacancy_push_pinned_general",
+        _pinned_fail,
+    )
+
+    from services.forum_vacancy_pin import deliver_forum_vacancy_push
+
+    ok = asyncio.run(
+        deliver_forum_vacancy_push(
+            bot,
+            user_id,
+            "vac_fb",
+            "<b>fb</b>",
+            None,
+            ensure_topics=_ensure,
+        )
+    )
+    assert ok is True
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_fb"
+    assert GENERAL_TOPIC_THREAD_ID in sent_threads
+    assert 55 in sent_threads
