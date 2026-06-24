@@ -69,9 +69,11 @@ async def _send_html_card(
     except TelegramBadRequest as e:
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
-            logger.warning("forum_vacancy_pin: topic miss user=%s key=%s", user_id, topic_key)
-            if not topic_key:
-                return None, None
+            logger.warning(
+                "forum_vacancy_pin: topic miss user=%s key=%s — fallback без thread_id",
+                user_id,
+                topic_key,
+            )
             msg = await bot.send_message(
                 user_id,
                 text,

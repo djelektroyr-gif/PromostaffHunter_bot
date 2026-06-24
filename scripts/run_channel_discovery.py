@@ -29,6 +29,58 @@ ACCOUNTS_DIR = PARSER_ROOT / "Accounts"
 SESSION_COPY = ACCOUNTS_DIR / "hunter_telethon.session"
 ACCOUNT_JSON = ACCOUNTS_DIR / "hunter.json"
 
+# Названия каналов с такими словами — почти всегда не hiring-чаты
+_JUNK_TITLE_RE = re.compile(
+    r"wildberries|вайлдберри|ozon|озон|скидк|промокод|кешбэк|крипт|казино|ставк|"
+    r"1xbet|forex|mlm|инфобиз|знакомств|dating|эскорт|наркот|betting|"
+    r"wb скидки|маркетплейс скидки|купоны|кешбек",
+    re.IGNORECASE,
+)
+
+
+def _discovery_min_members() -> int:
+    raw = os.environ.get("DISCOVERY_MIN_MEMBERS", "50").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 50
+
+
+def _load_queries(path: Path) -> list[str]:
+    if not path.is_file():
+        return []
+    queries: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        queries.append(line)
+    return queries
+
+
+def _write_queries_for_parser(queries_dst: Path) -> int:
+    queries = _load_queries(QUERIES_SRC)
+    if not queries:
+        raise FileNotFoundError(f"Нет запросов в {QUERIES_SRC}")
+    queries_dst.write_text("\n".join(queries) + "\n", encoding="utf-8")
+    return len(queries)
+
+
+def _filter_discovery_rows(rows: list[dict], *, min_members: int) -> tuple[list[dict], dict[str, int]]:
+    kept: list[dict] = []
+    stats = {"low_members": 0, "junk_title": 0}
+    for row in rows:
+        members = row.get("members")
+        if members is not None and members < min_members:
+            stats["low_members"] += 1
+            continue
+        title = (row.get("title") or "").strip()
+        if title and _JUNK_TITLE_RE.search(title):
+            stats["junk_title"] += 1
+            continue
+        kept.append(row)
+    return kept, stats
+
 
 def _normalize_link(link: str) -> str:
     link = (link or "").strip()
@@ -89,10 +141,10 @@ def _setup_parser_account(api_id: int, api_hash: str) -> None:
     )
 
 
-def _write_parser_env(api_id: int, api_hash: str) -> None:
+def _write_parser_env(api_id: int, api_hash: str) -> int:
     env_path = PARSER_ROOT / ".env"
     queries_dst = PARSER_ROOT / "queries.txt"
-    shutil.copy2(QUERIES_SRC, queries_dst)
+    query_count = _write_queries_for_parser(queries_dst)
     env_path.write_text(
         "\n".join(
             [
@@ -113,6 +165,7 @@ def _write_parser_env(api_id: int, api_hash: str) -> None:
         + "\n",
         encoding="utf-8",
     )
+    return query_count
 
 
 def _parse_result_line(line: str) -> tuple[str, int | None, str] | None:
@@ -215,7 +268,9 @@ def main() -> int:
         "той же user_session — иначе Telethon на проде получит TypeNotFoundError."
     )
     _setup_parser_account(api_id, api_hash)
-    _write_parser_env(api_id, api_hash)
+    min_members = _discovery_min_members()
+    query_count = _write_parser_env(api_id, api_hash)
+    print(f"Запросов для поиска: {query_count} | мин. участников в Excel: {min_members}")
 
     for fname in ("results_channels.txt", "results_chats.txt"):
         path = PARSER_ROOT / fname
@@ -235,7 +290,8 @@ def main() -> int:
     print("3/4 Сбор результатов…")
     channels = _read_results(PARSER_ROOT / "results_channels.txt", "канал")
     chats = _read_results(PARSER_ROOT / "results_chats.txt", "чат")
-    all_rows = channels + chats
+    raw_rows = channels + chats
+    all_rows, filt = _filter_discovery_rows(raw_rows, min_members=min_members)
     existing = _existing_bot_links()
 
     today = date.today().isoformat()
@@ -244,7 +300,12 @@ def main() -> int:
     _export_excel(all_rows, existing, out_xlsx)
 
     new_count = sum(1 for r in all_rows if r["normalized_link"] not in existing)
-    print(f"Готово: {len(all_rows)} уникальных записей ({new_count} новых для бота).")
+    skipped = len(raw_rows) - len(all_rows)
+    print(
+        f"Готово: {len(all_rows)} в Excel ({new_count} новых для бота). "
+        f"Отфильтровано: {skipped} "
+        f"(мало участников: {filt['low_members']}, мусор в названии: {filt['junk_title']})."
+    )
     print(f"Файл: {out_xlsx}")
     return 0
 

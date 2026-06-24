@@ -123,6 +123,45 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
     assert general[0]["text"] == "<b>new</b>"
 
 
+def test_general_push_falls_back_without_thread(monkeypatch):
+    """General с thread_id=1 не должен ронять push — как send_vacancy_card."""
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 779
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+
+    bot = AsyncMock()
+    calls = {"n": 0}
+
+    async def _send(chat_id, text, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1 and kwargs.get("message_thread_id") == GENERAL_TOPIC_THREAD_ID:
+            raise TelegramBadRequest(method="sendMessage", message="message thread not found")
+        msg = MagicMock()
+        msg.message_id = 200 + calls["n"]
+        return msg
+
+    bot.send_message = _send
+    bot.delete_message = AsyncMock()
+
+    async def _ensure(_uid):
+        return None
+
+    ok = asyncio.run(
+        send_vacancy_push_pinned_general(
+            bot,
+            user_id,
+            "vac_fb",
+            "<b>fallback</b>",
+            None,
+            rebuild_keyboard=lambda _vid: None,
+            ensure_topics=_ensure,
+        )
+    )
+    assert ok is True
+    assert calls["n"] >= 2
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_fb"
+
+
 def test_clear_general_if_pinned(monkeypatch):
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 888

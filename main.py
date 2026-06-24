@@ -2924,7 +2924,17 @@ async def send_vacancy_to_subscribers(order: dict):
                     ensure_topics=setup_forum_topics_for_user,
                 )
                 if not ok:
-                    raise RuntimeError("pinned general push failed")
+                    logger.warning(
+                        "pinned general push failed user=%s vac=%s — fallback send_vacancy_card",
+                        uid,
+                        vacancy_id,
+                    )
+                    await send_vacancy_card(
+                        uid,
+                        text=push_preview_html,
+                        reply_markup=keyboard,
+                        topic_key=None,
+                    )
             else:
                 await send_vacancy_card(
                     uid,

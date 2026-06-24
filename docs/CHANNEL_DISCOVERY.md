@@ -68,7 +68,33 @@ Rename-Item user_session.session discovery_session.session
 Rename-Item user_session_main.session user_session.session -ErrorAction SilentlyContinue
 ```
 
+Если `discovery_session.session` уже создан (вход по QR / код), а прод-сессия лежит как `user_session_main.session`:
+
+```powershell
+# Вернуть прод-парсеру имя user_session.session
+Rename-Item user_session_main.session user_session.session
+```
+
+Проверка: `user_session.session` — прод (929…), `discovery_session.session` — поиск каналов (968…).
+
 Файл `discovery_session.session` остаётся в папке проекта (не загружать на Bothost для discovery).
+
+**Если код не приходит (ни в чат Telegram, ни SMS):**
+
+1. Telegram часто шлёт код **только в уже открытый Telegram** (`SentCodeTypeApp`), а не в SMS.
+2. После нескольких попыток срабатывает лимит — подождите **1–2 часа**, не жмите скрипт снова.
+3. Проверьте на телефоне: **Настройки → Номер** — именно `+7 968 533-73-32`, не прод `929…`.
+4. **Вход по QR** (рекомендуется для discovery):
+
+```powershell
+Remove-Item user_session.session -ErrorAction SilentlyContinue
+pip install qrcode pillow
+python create_telethon_session.py --qr --name discovery_session
+# Откроется PNG _telethon_qr_login.png — скан только через:
+# Настройки → Устройства → Подключить устройство (не камера телефона)
+```
+
+Диагностика: `python scripts/diagnose_telethon_code.py +79685337332` — покажет тип доставки кода.
 
 Для **первого** аккаунта прод-парсера сессия создаётся так же, но файл называется `user_session.session` и живёт на Bothost в shared.
 
@@ -105,7 +131,13 @@ $env:DISCOVERY_SESSION = "discovery_session.session"
 python scripts/run_channel_discovery.py
 ```
 
-**Запросы** — править в `scripts/channel_discovery_queries.txt`.
+**Запросы** — править в `scripts/channel_discovery_queries.txt` (строки с `#` — комментарии).
+
+**Фильтр в Excel** (после поиска, до выгрузки):
+- меньше `DISCOVERY_MIN_MEMBERS` участников — не попадает в файл (по умолчанию **50**);
+- каналы с «скидки WB», «крипто», «казино» и т.п. в названии — отбрасываются.
+
+Свой порог: `$env:DISCOVERY_MIN_MEMBERS = "100"` перед запуском.
 
 **Результат:**
 
