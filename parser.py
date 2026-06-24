@@ -294,6 +294,7 @@ REJECT_REASON_LABELS = {
     "unpaid": "без оплаты",
     "service_request": "услуга, не найм",
     "casting": "кастинг/модель",
+    "social_media_shoot": "съёмка для соцсетей (Likee/TikTok)",
     "roleplay_acting": "ролевая съёмка",
     "delivery_courier": "курьер доставки",
     "camp_educator": "вожатый/лагерь",
@@ -2746,8 +2747,12 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
         return "booth"
     if _MULTI_HIRE_PROMO_FIRST_RE.search(text_lower) and scores.get("promoter"):
         return "promoter"
-    if re.search(r"координатор", text_lower) and "помощь на площадке" in text_lower:
-        return "helper"
+    if re.search(r"координатор", text_lower):
+        if any(
+            p in text_lower
+            for p in ("помощь на площадке", "информирование гостей", "на площадке")
+        ):
+            return "helper"
     if _has_explicit_event_staff_role(text_lower):
         return "helper"
     if scores.get("booth") and scores.get("helper"):
@@ -2956,7 +2961,16 @@ def _looks_like_hourly_shift_job(text: str) -> bool:
 
 _PRO_CASTING_MARKERS = (
     "спектакл", "гастрол", "проф. артист", "профессиональный акт",
-    "актер в ", "актёр в ", "командировка в ",
+    "актер в ", "актёр в ", "актеров на главные", "актёров на главные",
+    "главные роли", "смотрим актер", "смотрим актёр", "командировка в ",
+)
+
+_SOCIAL_MEDIA_SHOOT_MARKERS = (
+    "likee", "лайк", "tiktok", "тикток", "тик ток", "reels", "рилс", "shorts",
+    "instagram", "инстаграм", "блогер", "блогерша", "тиктокер", "тиктокерша",
+    "ugc", "контент для likee", "контент для tiktok", "съёмка для likee",
+    "съемка для likee", "съёмка для tiktok", "съемка для tiktok",
+    "съёмка для соц", "съемка для соц",
 )
 
 _ACADEMIC_WRITING_MARKERS = (
@@ -3025,6 +3039,45 @@ def is_closed_vacancy_post(text: str) -> bool:
         return False
     head = text.lstrip()[:80].lower()
     return head.startswith("❌") and "закрыто" in head
+
+
+def is_social_media_shoot_casting(text: str) -> bool:
+    """Съёмка для Likee/TikTok/UGC — не промоутер на мероприятии."""
+    if not text:
+        return False
+    tl = text.lower()
+    if _is_promo_photo_selection(tl):
+        return False
+    if _is_welcome_hostess_hiring(tl):
+        return False
+    has_social = any(m in tl for m in _SOCIAL_MEDIA_SHOOT_MARKERS)
+    if not has_social:
+        has_social = bool(
+            re.search(
+                r"съ[её]мк\w*.{0,40}(?:likee|tiktok|тикток|рилс|reels|соц\s*сет|ugc)",
+                tl,
+            )
+            or re.search(
+                r"(?:likee|tiktok|тикток|блогер|ugc).{0,40}съ[её]мк",
+                tl,
+            )
+            or (
+                re.search(r"съ[её]мк\w*\s+промо", tl)
+                and re.search(r"(?:likee|tiktok|тикток|блогер|ugc|рилс|reels)", tl)
+            )
+        )
+    if not has_social:
+        return False
+    if any(
+        w in tl
+        for w in (
+            "мероприят", "на площадке", "выставк", "дегустац", "глобус",
+            "фотокастинг", "раздача листовок", "промоутер",
+        )
+    ):
+        if not any(m in tl for m in ("likee", "tiktok", "тикток", "блогер", "ugc")):
+            return False
+    return True
 
 
 def is_massovka_or_film_extras(text: str) -> bool:
@@ -3237,6 +3290,19 @@ def _detect_category_scored(text: str) -> str | None:
         return "misc"
     if re.search(r"фотобудк", text_lower):
         return "helper"
+    if re.search(r"стендист", text_lower):
+        return "booth"
+    if is_social_media_shoot_casting(text):
+        return None
+    if re.search(r"раздача листовок|листовок", text_lower):
+        if not _has_route_driver_role(text_lower):
+            return "promoter"
+    if re.search(r"координатор", text_lower):
+        if any(
+            p in text_lower
+            for p in ("помощь на площадке", "информирование гостей", "на площадке")
+        ):
+            return "helper"
     if _has_explicit_hostess_role(text_lower):
         return "hostess"
     if _has_route_driver_role(text_lower):
@@ -3360,7 +3426,7 @@ def is_casting_call(text: str) -> bool:
     event_staff = (
         "промоутер", "хостес", "хелпер", "хэлпер", "грузчик", "аниматор",
         "мероприят", "на площадке", "смен", "персонал", "официант",
-        "дегустац", "промо", "акци", "глобус",
+        "дегустац", "промо-акци", "промо акци", "промоут", "глобус",
     )
     return not any(w in tl for w in event_staff)
 
@@ -3669,6 +3735,8 @@ def is_job_post_for_staff(text: str, poster: dict | None = None) -> tuple[bool, 
         return False, "remote_office_job", []
     if is_professional_casting_spam(text):
         return False, "professional_casting", []
+    if is_social_media_shoot_casting(text):
+        return False, "social_media_shoot", []
     if is_roleplay_acting_job(text):
         return False, "roleplay_acting", []
     if is_delivery_courier_job(text):

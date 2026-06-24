@@ -389,3 +389,67 @@ def test_digest_animator_header_does_not_poison_bar_block():
     assert ok is False
     assert reason == "permanent_job"
     assert cat != "animator"
+
+
+def test_coordinator_conservatory_helper_not_promoter():
+    text = (
+        "Сюда еще нужны Координаторы 5\n"
+        "25 июня Московская консерватория\n"
+        "информирование гостей, помощь на площадке\n"
+        "@majoreventsmanager\n"
+    )
+    assert detect_category(text) == "helper"
+    ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
+    assert ok is True
+    assert cat == "helper"
+    assert reason in ("accepted", "soft_accept:helper", "wide_accept:helper")
+
+
+def test_leaflets_solnzevo_promoter_not_driver():
+    text = (
+        "Раздача листовок\n"
+        "метро Солнцево, 1400₽/смена, 16:00-20:00 (2 чел)\n"
+        "@finessaaaa\n"
+    )
+    assert detect_category(text) == "promoter"
+    ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
+    assert ok is True
+    assert cat == "promoter"
+    assert reason in ("accepted", "soft_accept:promoter", "wide_accept:promoter")
+
+
+def test_forklift_warehouse_permanent_rejected():
+    text = (
+        "Склад Фулфилмент ищет водителей карщиков с правами\n"
+        "МО, Раменский р-н, деревня Софьино\n"
+        "ричтрак Jungheinrich, от 6500 до 9000 за смену\n"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
+    assert ok is False
+    assert cat is None
+    assert reason == "permanent_job"
+
+
+def test_casting_sochi_actors_rejected():
+    text = (
+        "(ТОЛЬКО СОЧИ/АДЛЕР) смотрим актеров на главные роли\n"
+        "Баба Роза (62 года)... Дядя БОРЯ... СЛАВИК...\n"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
+    assert ok is False
+    assert cat is None
+    assert reason in ("professional_casting", "casting")
+
+
+def test_likee_social_media_shoot_rejected_not_promoter():
+    text = (
+        "Кастинг на съёмку промо-ролика для Likee\n"
+        "Нужна активная девушка 20-25, опыт не обязателен\n"
+        "Оплата 5000₽ за смену\n"
+        "@content_cast\n"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, {"username": "content_cast", "user_id": 1})
+    assert ok is False
+    assert cat is None
+    assert reason == "social_media_shoot"
+    assert detect_category(text) != "promoter"
