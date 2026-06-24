@@ -2266,6 +2266,7 @@ _CATEGORY_KEYWORDS = {
         "клинер", "cleaning",
     ],
     "booth": [
+        "стендист", "стендистк", "стендисты", "стендистка",
         "монтажник", "монтажники", "постановщик", "постановщиц", "декоратор",
         "декоратор мероприят", "декоратор выстав", "оформител", "монтаж декор",
         "монтаж оформ", "монтаж сцен", "монтаж конструкц",
@@ -2392,7 +2393,7 @@ def is_skilled_trade_spam(text: str) -> bool:
 
 
 _BOOTH_HINTS = (
-    "монтажник", "постановщик", "декоратор", "оформител",
+    "стендист", "стендистк", "монтажник", "постановщик", "декоратор", "оформител",
     "стенд", "выставочн", "баннер", "застройк", "октанорм", "octanorm",
     "павильон", "конструкц", "монтаж декор", "монтаж оформ",
 )
@@ -2702,6 +2703,8 @@ def _pick_category_from_scores(scores: dict, text_lower: str) -> str | None:
         return "misc"
     if re.search(r"фотобудк", text_lower):
         return "helper"
+    if re.search(r"стендист", text_lower):
+        return "booth"
     if _MULTI_HIRE_PROMO_FIRST_RE.search(text_lower) and scores.get("promoter"):
         return "promoter"
     if re.search(r"координатор", text_lower) and "помощь на площадке" in text_lower:

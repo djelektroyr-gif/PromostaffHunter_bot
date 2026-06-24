@@ -6,6 +6,23 @@ from parser import detect_category, evaluate_vacancy, vacancy_matches_category
 _POSTER = {"username": "boss", "user_id": 1}
 
 
+def test_stendistka_booth_not_promoter():
+    text = (
+        "‼️МСК‼️СТЕНДИСТКА ‼️\n"
+        "📍 Крокус Экспо\n"
+        "🗓️25 июня\n"
+        "🕰️ 11:00-16:00\n"
+        "💰за смену 2 500р.\n"
+        "**Функционал: **раздача листовок\n"
+        "Заявку в лс с пометкой «стендистка МСК»:\n"
+        "@kseniaeventora"
+    )
+    ok, cat, reason, _ = evaluate_vacancy(text, _POSTER)
+    assert ok is True
+    assert cat == "booth"
+    assert detect_category(text) == "booth"
+
+
 def test_babysitter_animator_not_waiter():
     text = (
         "🔥 СРОЧНО ЭТИ ВЫХОДНЫЕ\n"

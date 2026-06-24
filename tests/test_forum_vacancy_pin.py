@@ -220,3 +220,37 @@ def test_push_survives_delete_typeerror(monkeypatch):
     assert GENERAL_TOPIC_THREAD_ID in sent
     assert 55 in sent
     assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
+
+
+def test_vacancies_topic_miss_does_not_fallback_to_general(monkeypatch):
+    """Сбой thread «Вакансии» не должен дублировать карточку в General."""
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 890
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+
+    bot = AsyncMock()
+    threads_sent = []
+
+    async def _send(chat_id, text, **kwargs):
+        tid = kwargs.get("message_thread_id")
+        threads_sent.append(tid)
+        if tid == 55:
+            raise TelegramBadRequest(method="sendMessage", message="message thread not found")
+        msg = MagicMock()
+        msg.message_id = 401
+        return msg
+
+    bot.send_message = _send
+    bot.create_forum_topic = AsyncMock(
+        return_value=MagicMock(message_thread_id=77),
+    )
+
+    from services.forum_vacancy_pin import append_vacancy_history_message
+
+    asyncio.run(
+        append_vacancy_history_message(
+            bot, user_id, "vac_hist", "<b>x</b>", None,
+        )
+    )
+    assert GENERAL_TOPIC_THREAD_ID not in threads_sent
+    assert 55 in threads_sent or 77 in threads_sent
