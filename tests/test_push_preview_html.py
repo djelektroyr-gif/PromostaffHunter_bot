@@ -16,4 +16,5 @@ def test_push_preview_html_from_card_input():
     )
     html = build_vacancy_preview_html(inp, show_published_at=True)
     assert "Грузчик" in html
-    assert "boss" in html.lower()
+    assert "boss" not in html.lower()
+    assert "Откликнуться" in html

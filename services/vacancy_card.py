@@ -26,6 +26,24 @@ from services.vacancy_public_text import sanitize_vacancy_public_body
 _CHANNEL_NO_CONTACT_CTA = (
     "ℹ️ <i>Контакт заказчика — в боте по кнопке «📋 Открыть в боте».</i>"
 )
+_BOT_PREVIEW_NO_CONTACT_CTA = (
+    "ℹ️ <i>Нажмите «✅ Откликнуться» — бот пришлёт черновик и ссылку на заказчика.</i>"
+)
+_CONTACT_LINE_RE = re.compile(
+    r"@|tg://|t\.me/|wa\.me|(?:\+7|8)[\s\-]?\(?\d{3}\)",
+    re.I,
+)
+
+
+def _line_looks_like_contact(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("👉"):
+        return True
+    return bool(_CONTACT_LINE_RE.search(stripped))
+
+
 _HEADLINE_RE = re.compile(
     r"(?:^|\n)\s*((?:нужн\w*|требу\w*|ищ\w*)\s+\d+\s+[^\n]{3,60})",
     re.I | re.MULTILINE,
@@ -264,6 +282,8 @@ def _extract_headline(body: str, sanitized_lines: list[str]) -> str | None:
         low = line.lower()
         if _GREETING_LINE_RE.match(line.strip()):
             continue
+        if _line_looks_like_contact(line):
+            continue
         if len(line) < 8 or len(line) > 90:
             continue
         if _RATE_LINE_RE.search(line):
@@ -288,6 +308,8 @@ def _extract_task_hint(sanitized_lines: list[str], headline: str | None) -> str 
         if low in head_key or head_key in low:
             continue
         if _RATE_LINE_RE.search(line) or _ADDRESS_LINE_RE.search(line):
+            continue
+        if _line_looks_like_contact(line):
             continue
         if any(k in low for k in ("заявк", "контакт", "пишите", "напишите", "фио", "возраст")):
             continue
@@ -336,6 +358,8 @@ def _extra_preview_body_lines(
         if _RATE_LINE_RE.search(stripped) or _ADDRESS_LINE_RE.search(stripped):
             continue
         if _JUNK_ADDRESS_RE.match(stripped):
+            continue
+        if _line_looks_like_contact(stripped):
             continue
         extras.append(stripped[:140])
         if len(extras) >= max_lines:
@@ -416,12 +440,12 @@ def build_vacancy_preview_html(
     inp: VacancyCardInput,
     *,
     show_published_at: bool = True,
-    show_employer_contact: bool = True,
+    show_employer_contact: bool = False,
+    no_contact_cta: str | None = None,
 ) -> str:
     """Компактная карточка — канал, push, лента.
 
-    Канал: без контакта заказчика (`show_employer_contact=False`).
-    Бот/push: с контактом для отклика.
+    Контакт заказчика только после отклика (`show_employer_contact=True` — редко, админ/тест).
     """
     ctx = _merge_enrichment(inp)
     lines_out: list[str] = [
@@ -457,14 +481,18 @@ def build_vacancy_preview_html(
     if show_employer_contact:
         _append_phone_apply_notice(lines_out, ctx)
     else:
-        lines_out.append(_CHANNEL_NO_CONTACT_CTA)
+        lines_out.append(no_contact_cta or _BOT_PREVIEW_NO_CONTACT_CTA)
 
     if len(lines_out) == 1:
         lines_out.append("Подробности — по кнопке «Открыть вакансию».")
     return "\n".join(lines_out)
 
 
-def build_vacancy_full_html(inp: VacancyCardInput) -> str:
+def build_vacancy_full_html(
+    inp: VacancyCardInput,
+    *,
+    show_employer_contact: bool = False,
+) -> str:
     """Полное описание — после «Открыть вакансию» или deep link из канала."""
     ctx = _merge_enrichment(inp)
     lines_out: list[str] = [
@@ -494,6 +522,9 @@ def build_vacancy_full_html(inp: VacancyCardInput) -> str:
         lines_out.append("")
         lines_out.extend(extras)
 
-    _append_phone_apply_notice(lines_out, ctx)
+    if show_employer_contact:
+        _append_phone_apply_notice(lines_out, ctx)
+    else:
+        lines_out.append(_BOT_PREVIEW_NO_CONTACT_CTA)
 
     return "\n".join(lines_out)

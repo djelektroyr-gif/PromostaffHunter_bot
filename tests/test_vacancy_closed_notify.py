@@ -113,3 +113,22 @@ def test_deliver_defers_instead_of_sending(tmp_db, monkeypatch):
 
     bot.send_message.assert_not_called()
     assert list_closed_notice_pending(uid) == ["vac_x"]
+
+
+def test_closed_notice_sent_only_once(tmp_db, monkeypatch):
+    from services import vacancy_closed_notify as vcn
+
+    uid = 9020
+    add_subscriber(uid, "u", "U", None)
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+
+    asyncio.run(
+        vcn.deliver_closed_vacancy_notices(
+            bot, [("vac_dup", [uid]), ("vac_dup", [uid])],
+        )
+    )
+    assert bot.send_message.await_count == 1
+
+    asyncio.run(vcn.deliver_closed_vacancy_notices(bot, [("vac_dup", [uid])]))
+    assert bot.send_message.await_count == 1

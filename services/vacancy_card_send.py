@@ -129,21 +129,11 @@ async def send_vacancy_card_message(
             err = str(exc).lower()
             if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
                 logger.warning(
-                    "send_vacancy_card rich: тема недоступна user=%s, fallback general",
+                    "send_vacancy_card rich: тема недоступна user=%s — не дублируем",
                     chat_id,
                 )
-                extra = {}
-                try:
-                    return await send_rich_message_html(
-                        bot,
-                        chat_id,
-                        rich_html,
-                        reply_markup=reply_markup,
-                    )
-                except TelegramBadRequest as exc2:
-                    logger.warning("sendRichMessage failed, HTML fallback: %s", exc2)
-            else:
-                logger.warning("sendRichMessage failed, HTML fallback: %s", exc)
+                raise
+            logger.warning("sendRichMessage failed, HTML fallback: %s", exc)
         except Exception as exc:
             logger.warning("sendRichMessage error, HTML fallback: %s", exc)
 
@@ -152,8 +142,11 @@ async def send_vacancy_card_message(
     except TelegramBadRequest as e:
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
-            logger.warning("send_vacancy_card: тема недоступна user=%s, fallback в общий чат", chat_id)
-            return await _send_html_vacancy_card(bot, chat_id, html_fallback, reply_markup, {})
+            logger.warning(
+                "send_vacancy_card: тема недоступна user=%s — не дублируем без thread_id",
+                chat_id,
+            )
+            raise
         raise
 
 

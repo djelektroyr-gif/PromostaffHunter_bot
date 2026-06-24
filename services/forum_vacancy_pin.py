@@ -58,6 +58,7 @@ async def _send_html_card(
     reply_markup: InlineKeyboardMarkup | None,
     *,
     topic_key: str | None,
+    disable_notification: bool = False,
 ) -> tuple[int | None, int | None]:
     """Возвращает (message_id, message_thread_id для General)."""
     extra = _delivery_kwargs(user_id, topic_key)
@@ -68,6 +69,7 @@ async def _send_html_card(
             parse_mode="HTML",
             reply_markup=reply_markup,
             disable_web_page_preview=True,
+            disable_notification=disable_notification,
             **extra,
         )
         return msg.message_id, extra.get("message_thread_id")
@@ -77,17 +79,10 @@ async def _send_html_card(
             if topic_key:
                 raise
             logger.warning(
-                "forum_vacancy_pin: General thread miss user=%s — fallback без thread_id",
+                "forum_vacancy_pin: General thread miss user=%s — не дублируем без thread_id",
                 user_id,
             )
-            msg = await bot.send_message(
-                user_id,
-                text,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
-            return msg.message_id, None
+            raise
         if "parse" in err:
             plain = re.sub(r"<[^>]*>", "", text)
             msg = await bot.send_message(
@@ -95,6 +90,7 @@ async def _send_html_card(
                 plain,
                 reply_markup=reply_markup,
                 disable_web_page_preview=True,
+                disable_notification=disable_notification,
                 **extra,
             )
             return msg.message_id, extra.get("message_thread_id")
@@ -155,7 +151,7 @@ async def _delete_general_message(
     stored_thread_id: int | None = None,
 ) -> bool:
     """Удаление push-карточки. True = можно сбросить pin (удалили или уже нет)."""
-    del stored_thread_id
+    del stored_thread_id  # API deleteMessage — только chat_id + message_id
     try:
         await bot.delete_message(chat_id=user_id, message_id=message_id)
         return True
@@ -212,7 +208,16 @@ async def clear_general_vacancy_if_pinned(
         return
     if vacancy_id and pin["vacancy_id"] != vacancy_id:
         return
-    await _clear_general_vacancy_display(bot, user_id)
+    if await _clear_general_vacancy_display(bot, user_id):
+        return
+    if await _try_edit_general_card(
+        bot,
+        user_id,
+        pin["message_id"],
+        "✅ Отклик отправлен — карточка убрана.",
+        None,
+    ):
+        clear_general_vacancy_pin(user_id)
 
 
 async def _append_vacancy_history(
@@ -239,6 +244,7 @@ async def _append_vacancy_history(
             card_text,
             reply_markup,
             topic_key=TOPIC_VACANCIES,
+            disable_notification=True,
         )
     except TelegramBadRequest as e:
         if is_forum_thread_missing_error(e):
@@ -251,6 +257,7 @@ async def _append_vacancy_history(
                         card_text,
                         reply_markup,
                         topic_key=TOPIC_VACANCIES,
+                        disable_notification=True,
                     )
                     return
                 except Exception as e2:
@@ -284,21 +291,45 @@ async def _install_general_push_card(
     text: str,
     reply_markup: InlineKeyboardMarkup | None,
 ) -> bool:
-    """Одна карточка в General + pin в БД (после удаления предыдущей, если получилось)."""
-    if not await _clear_general_vacancy_display(bot, user_id):
-        pin = get_general_vacancy_pin(user_id)
-        if pin:
-            for attempt in range(2):
-                if await _delete_general_message(
-                    bot,
+    """Одна карточка в General + pin в БД. Сначала edit — не плодим сообщения при сбое delete."""
+    pin = get_general_vacancy_pin(user_id)
+    if pin:
+        if await _try_edit_general_card(
+            bot,
+            user_id,
+            pin["message_id"],
+            text,
+            reply_markup,
+        ):
+            set_general_vacancy_pin(
+                user_id,
+                pin["message_id"],
+                vacancy_id,
+                text,
+                message_thread_id=pin.get("message_thread_id"),
+            )
+            return True
+        if not await _clear_general_vacancy_display(bot, user_id):
+            stale = get_general_vacancy_pin(user_id)
+            if stale:
+                for attempt in range(2):
+                    if await _delete_general_message(
+                        bot,
+                        user_id,
+                        stale["message_id"],
+                        stored_thread_id=stale.get("message_thread_id"),
+                    ):
+                        clear_general_vacancy_pin(user_id)
+                        break
+                    if attempt == 0:
+                        await asyncio.sleep(0.25)
+            if get_general_vacancy_pin(user_id):
+                logger.warning(
+                    "install general push: delete failed user=%s msg=%s — не шлём вторую карточку",
                     user_id,
                     pin["message_id"],
-                    stored_thread_id=pin.get("message_thread_id"),
-                ):
-                    clear_general_vacancy_pin(user_id)
-                    break
-                if attempt == 0:
-                    await asyncio.sleep(0.25)
+                )
+                return False
     msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
     if msg_id is None:
         return False
@@ -393,7 +424,13 @@ async def deliver_forum_vacancy_push(
             vacancy_id,
             exc,
         )
+    pin = get_general_vacancy_pin(user_id)
+    if pin and pin.get("vacancy_id") == vacancy_id:
+        return True
     async with _user_pin_lock(user_id):
+        pin = get_general_vacancy_pin(user_id)
+        if pin and pin.get("vacancy_id") == vacancy_id:
+            return True
         await ensure_topics(user_id)
         try:
             if not await _install_general_push_card(bot, user_id, vacancy_id, text, reply_markup):

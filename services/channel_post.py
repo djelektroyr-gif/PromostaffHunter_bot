@@ -22,7 +22,7 @@ from services.channel_images import (
 )
 from services.channel_policy import evaluate_channel_crosspost, format_skip_reason
 from services.telegram_buttons import styled_inline_button
-from services.vacancy_card import VacancyCardInput, build_vacancy_preview_html, card_input_from_push_row
+from services.vacancy_card import VacancyCardInput, _CHANNEL_NO_CONTACT_CTA, build_vacancy_preview_html, card_input_from_push_row
 from services.vacancy_public_text import sanitize_vacancy_public_body
 
 if TYPE_CHECKING:
@@ -62,7 +62,12 @@ def build_channel_preview_text(
         shift_date=shift_date,
         shift_time_start=shift_time_start,
     )
-    return build_vacancy_preview_html(inp, show_published_at=False, show_employer_contact=False)
+    return build_vacancy_preview_html(
+        inp,
+        show_published_at=False,
+        show_employer_contact=False,
+        no_contact_cta=_CHANNEL_NO_CONTACT_CTA,
+    )
 
 
 def build_channel_preview_keyboard(vacancy_id: str) -> InlineKeyboardMarkup:

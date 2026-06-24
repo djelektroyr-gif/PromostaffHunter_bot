@@ -125,8 +125,8 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
     assert general[0]["text"] == "<b>new</b>"
 
 
-def test_general_push_falls_back_without_thread(monkeypatch):
-    """General с thread_id=1 не должен ронять push — как send_vacancy_card."""
+def test_general_push_fails_without_thread_no_duplicate(monkeypatch):
+    """Без General thread_id не шлём вторую карточку в корень чата."""
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 779
     clear_general_vacancy_pin(user_id)
@@ -137,7 +137,7 @@ def test_general_push_falls_back_without_thread(monkeypatch):
 
     async def _send(chat_id, text, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1 and kwargs.get("message_thread_id") == GENERAL_TOPIC_THREAD_ID:
+        if kwargs.get("message_thread_id") == GENERAL_TOPIC_THREAD_ID:
             raise TelegramBadRequest(method="sendMessage", message="message thread not found")
         msg = MagicMock()
         msg.message_id = 200 + calls["n"]
@@ -160,9 +160,9 @@ def test_general_push_falls_back_without_thread(monkeypatch):
             ensure_topics=_ensure,
         )
     )
-    assert ok is True
-    assert calls["n"] >= 2
-    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_fb"
+    assert ok is False
+    assert calls["n"] == 1
+    assert get_general_vacancy_pin(user_id) is None
 
 
 def test_clear_general_if_pinned(monkeypatch):
@@ -181,8 +181,8 @@ def test_clear_general_if_pinned(monkeypatch):
     assert get_general_vacancy_pin(user_id) is None
 
 
-def test_push_survives_delete_typeerror(monkeypatch):
-    """Ошибка delete_message не должна ронять весь push."""
+def test_push_skips_orphan_when_delete_and_edit_fail(monkeypatch):
+    """Если старую карточку не удалить и не отредактировать — не шлём вторую в General."""
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 889
     clear_general_vacancy_pin(user_id)
@@ -218,10 +218,9 @@ def test_push_survives_delete_typeerror(monkeypatch):
             ensure_topics=_ensure,
         )
     )
-    assert ok is True
-    assert GENERAL_TOPIC_THREAD_ID in sent
-    assert 55 in sent
-    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
+    assert ok is False
+    assert GENERAL_TOPIC_THREAD_ID not in sent
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_old"
 
 
 def test_vacancies_topic_miss_does_not_fallback_to_general(monkeypatch):
@@ -320,3 +319,40 @@ def test_deliver_forum_push_fallback_sets_pin(monkeypatch):
     assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_fb"
     assert GENERAL_TOPIC_THREAD_ID in sent_threads
     assert 55 in sent_threads
+    assert len(sent_threads) == 2
+
+
+def test_deliver_skips_fallback_when_pin_already_set(monkeypatch):
+    """После успешного pinned fallback не дублирует карточку в General."""
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 893
+    clear_general_vacancy_pin(user_id)
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+    set_general_vacancy_pin(user_id, 501, "vac_done", "ok", message_thread_id=GENERAL_TOPIC_THREAD_ID)
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock()
+    bot.delete_message = AsyncMock()
+
+    async def _pinned_ok(*_a, **_k):
+        raise RuntimeError("should not be called after pin check")
+
+    monkeypatch.setattr(
+        "services.forum_vacancy_pin.send_vacancy_push_pinned_general",
+        _pinned_ok,
+    )
+
+    from services.forum_vacancy_pin import deliver_forum_vacancy_push
+
+    ok = asyncio.run(
+        deliver_forum_vacancy_push(
+            bot,
+            user_id,
+            "vac_done",
+            "<b>x</b>",
+            None,
+            ensure_topics=AsyncMock(),
+        )
+    )
+    assert ok is True
+    bot.send_message.assert_not_awaited()

@@ -14,7 +14,9 @@ from db import (
     get_subscriber_filter_prefs_effective,
     get_vacancy_push_row,
     list_closed_notice_pending,
+    release_closed_notice_reservation,
     remove_closed_notice_pending,
+    try_reserve_closed_notice,
 )
 from services.push_notify import is_push_blocked
 from services.vacancy_closed_notice import format_closed_vacancy_notice_html
@@ -66,6 +68,8 @@ def build_closed_vacancy_notice(vacancy_id: str) -> tuple[str, InlineKeyboardMar
 
 
 async def send_closed_notice(bot: Bot, user_id: int, vacancy_id: str) -> bool:
+    if not try_reserve_closed_notice(user_id, vacancy_id):
+        return False
     text, markup = build_closed_vacancy_notice(vacancy_id)
     try:
         from config import FORUM_TOPICS_ENABLED
@@ -112,6 +116,7 @@ async def send_closed_notice(bot: Bot, user_id: int, vacancy_id: str) -> bool:
                 raise
         return True
     except Exception as e:
+        release_closed_notice_reservation(user_id, vacancy_id)
         logger.error("Не удалось уведомить пользователя %s о закрытии %s: %s", user_id, vacancy_id, e)
         return False
 
@@ -126,10 +131,15 @@ def should_defer_closed_notice(user_id: int) -> bool:
 async def deliver_closed_vacancy_notices(bot: Bot, closed_data: list) -> None:
     sent = 0
     deferred = 0
+    seen: set[tuple[int, str]] = set()
     for vacancy_id, user_ids in closed_data:
         if not vacancy_id or not user_ids:
             continue
         for uid in user_ids:
+            key = (uid, vacancy_id)
+            if key in seen:
+                continue
+            seen.add(key)
             if should_defer_closed_notice(uid):
                 if add_closed_notice_pending(uid, vacancy_id):
                     deferred += 1

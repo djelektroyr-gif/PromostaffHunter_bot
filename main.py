@@ -308,6 +308,8 @@ SEND_DELAY = 0.35  # пауза между push одному пользоват�
 FEED_CARDS_PER_PAGE = 4  # меньше карточек за раз — быстрее открывается лента
 MSK_TZ = timezone(timedelta(hours=3))
 _vacancy_push_sem = asyncio.Semaphore(2)  # не более 2 параллельных push-рассылок
+_vacancy_push_inflight: set[str] = set()
+_vacancy_push_inflight_lock = asyncio.Lock()
 BROADCAST_DELAY = 0.08  # ~12 msg/s — безопаснее для Bot API при массовой рассылке
 RESPONSES_PAGE_SIZE = 5
 PREMIUM_DEFAULT_DAYS = 30
@@ -583,7 +585,7 @@ def format_vacancy_preview_html(
         shift_date=shift_date,
         shift_time_start=shift_time_start,
     )
-    return build_vacancy_preview_html(inp)
+    return build_vacancy_preview_html(inp, show_employer_contact=False)
 
 
 def format_vacancy_card_html(
@@ -673,19 +675,11 @@ async def send_vacancy_card(
     except TelegramBadRequest as e:
         err = str(e).lower()
         if extra.get("message_thread_id") and ("thread" in err or "topic" in err or "not found" in err):
-            logger.warning("send_vacancy_card: тема недоступна user=%s, fallback в общий чат", chat_id)
-            extra = {}
-            try:
-                await send_message_with_retry(
-                    chat_id,
-                    text=text,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                    disable_web_page_preview=True,
-                )
-                return
-            except TelegramBadRequest:
-                pass
+            logger.warning(
+                "send_vacancy_card: тема недоступна user=%s — не дублируем без thread_id",
+                chat_id,
+            )
+            raise
         if "parse" in err:
             plain = re.sub(r"<[^>]*>", "", text)
             await send_message_with_retry(
@@ -2718,8 +2712,22 @@ def build_user_response_card_keyboard(resp: dict, *, for_admin: bool = False) ->
 
 async def dispatch_vacancy_push(order: dict):
     """Очередь push: не блокирует Telethon-парсер на время рассылки."""
-    async with _vacancy_push_sem:
-        await send_vacancy_to_subscribers(order)
+    vacancy_id = order.get("vacancy_id") or make_vacancy_id(
+        order.get("chat_id", ""),
+        order.get("message_id", ""),
+        dedupe_key=order.get("dedupe_key"),
+    )
+    async with _vacancy_push_inflight_lock:
+        if vacancy_id in _vacancy_push_inflight:
+            logger.info("Push skip duplicate inflight %s", vacancy_id)
+            return
+        _vacancy_push_inflight.add(vacancy_id)
+    try:
+        async with _vacancy_push_sem:
+            await send_vacancy_to_subscribers(order)
+    finally:
+        async with _vacancy_push_inflight_lock:
+            _vacancy_push_inflight.discard(vacancy_id)
 
 
 def schedule_vacancy_push(order: dict):
@@ -2861,7 +2869,9 @@ async def send_vacancy_to_subscribers(order: dict):
     )
     from services.vacancy_card import build_vacancy_preview_html
 
-    push_preview_html = build_vacancy_preview_html(card_inp, show_published_at=True)
+    push_preview_html = build_vacancy_preview_html(
+        card_inp, show_published_at=True, show_employer_contact=False,
+    )
 
     from parser import find_cluster_vacancy_ids
 

@@ -273,6 +273,15 @@ def init_db():
         """)
 
         cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS closed_notice_sent (
+                user_id INTEGER NOT NULL,
+                vacancy_id TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, vacancy_id)
+            )
+        """)
+
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS closed_notice_pending (
                 user_id INTEGER NOT NULL,
                 vacancy_id TEXT NOT NULL,
@@ -1468,6 +1477,30 @@ def clear_push_digest_pending(user_id: int) -> int:
         cur = conn.cursor()
         cur.execute(q("DELETE FROM push_digest_pending WHERE user_id = ?"), (user_id,))
         return cur.rowcount
+
+
+def try_reserve_closed_notice(user_id: int, vacancy_id: str) -> bool:
+    """Один раз уведомить пользователя о закрытии вакансии."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            q(
+                """
+                INSERT INTO closed_notice_sent (user_id, vacancy_id)
+                VALUES (?, ?)
+                ON CONFLICT(user_id, vacancy_id) DO NOTHING
+                """
+            ),
+            (user_id, vacancy_id),
+        )
+        return cur.rowcount > 0
+
+
+def release_closed_notice_reservation(user_id: int, vacancy_id: str) -> None:
+    execute(
+        "DELETE FROM closed_notice_sent WHERE user_id = ? AND vacancy_id = ?",
+        (user_id, vacancy_id),
+    )
 
 
 def add_closed_notice_pending(user_id: int, vacancy_id: str) -> bool:
@@ -3160,10 +3193,15 @@ def mark_vacancy_closed(message_id: str, chat_id: str):
             return None, []
         vacancy_id = row[0]
         cur.execute(
-            q("SELECT message_text, category_code, author_contact FROM vacancies WHERE id = ?"),
+            q(
+                "SELECT message_text, category_code, author_contact, is_closed "
+                "FROM vacancies WHERE id = ?"
+            ),
             (vacancy_id,),
         )
         vac_row = cur.fetchone()
+        if vac_row and vac_row[3]:
+            return vacancy_id, []
         cluster_ids = [vacancy_id]
         if vac_row and vac_row[0]:
             try:

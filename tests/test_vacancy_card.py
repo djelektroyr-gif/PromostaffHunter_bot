@@ -36,7 +36,8 @@ def test_preview_structured_lines_no_contacts():
     assert "500" in text
     assert "на завтра" in text
     assert "10:00" in text
-    assert "boss123" in text.lower()
+    assert "boss123" not in text.lower()
+    assert "Откликнуться" in text
 
 
 def test_full_card_has_publication_and_body():
@@ -52,7 +53,8 @@ def test_full_card_has_publication_and_body():
     assert "Опубликовано" in text
     assert "09.06.2026" in text
     assert "демонтаж" in text.lower()
-    assert "boss123" in text.lower()
+    assert "boss123" not in text.lower()
+    assert "Откликнуться" in text
 
 
 def test_channel_preview_no_publication_line():
@@ -96,7 +98,8 @@ def test_preview_fallback_when_sparse_body():
     )
     text = build_vacancy_preview_html(inp)
     assert "Промоутер" in text
-    assert "spam_only" in text.lower()
+    assert "spam_only" not in text.lower()
+    assert "Откликнуться" in text
 
 
 def test_format_published_at_bad_timestamp_empty():

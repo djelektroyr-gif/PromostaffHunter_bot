@@ -35,7 +35,7 @@ def test_tg_user_markdown_has_clickable_link():
     assert "Здравствуйте" in text
 
 
-def test_vacancy_preview_tg_user_notice():
+def test_vacancy_preview_tg_user_hidden_by_default():
     inp = VacancyCardInput(
         category_code="helper",
         category_name="Хелпер",
@@ -45,5 +45,19 @@ def test_vacancy_preview_tg_user_notice():
         author_contact="tg://user?id=1057604085",
     )
     html = build_vacancy_preview_html(inp)
+    assert "tg://user?id=1057604085" not in html
+    assert "Откликнуться" in html
+
+
+def test_vacancy_preview_tg_user_notice_when_enabled():
+    inp = VacancyCardInput(
+        category_code="helper",
+        category_name="Хелпер",
+        category_emoji="👷",
+        body="👉 [Станислав](tg://user?id=1057604085)",
+        freshness="Свежая",
+        author_contact="tg://user?id=1057604085",
+    )
+    html = build_vacancy_preview_html(inp, show_employer_contact=True)
     assert "tg://user?id=1057604085" in html
     assert "Станислав" in html

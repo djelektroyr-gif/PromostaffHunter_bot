@@ -6,7 +6,7 @@ from html import escape as escape_html
 
 from services.vacancy_card import (
     VacancyCardInput,
-    _CHANNEL_NO_CONTACT_CTA,
+    _BOT_PREVIEW_NO_CONTACT_CTA,
     _append_phone_apply_notice,
     _extract_headline,
     _extract_task_hint,
@@ -45,9 +45,9 @@ def _facts_table(inp: VacancyCardInput) -> str | None:
     return "<table>" + "".join(rows) + "</table>"
 
 
-def _footer_lines(inp: VacancyCardInput, *, show_employer_contact: bool = True) -> list[str]:
+def _footer_lines(inp: VacancyCardInput, *, show_employer_contact: bool = False) -> list[str]:
     if not show_employer_contact:
-        return [_CHANNEL_NO_CONTACT_CTA]
+        return [_BOT_PREVIEW_NO_CONTACT_CTA]
     lines_out: list[str] = []
     _append_phone_apply_notice(lines_out, inp)
     return lines_out
@@ -57,7 +57,7 @@ def build_vacancy_preview_rich_html(
     inp: VacancyCardInput,
     *,
     show_published_at: bool = True,
-    show_employer_contact: bool = True,
+    show_employer_contact: bool = False,
 ) -> str:
     """Компактная rich-карточка: заголовок, таблица фактов, подсказка."""
     ctx = _merge_enrichment(inp)
@@ -104,7 +104,7 @@ def _format_public_body_rich_html(description: str) -> str:
 def build_vacancy_full_rich_html(
     inp: VacancyCardInput,
     *,
-    show_employer_contact: bool = True,
+    show_employer_contact: bool = False,
 ) -> str:
     """Полная rich-карточка: факты + видимый текст (без details — Telegram Rich их не раскрывает)."""
     ctx = _merge_enrichment(inp)
@@ -140,10 +140,10 @@ def build_vacancy_card_html_fallback(
     inp: VacancyCardInput,
     *,
     expanded: bool,
-    show_employer_contact: bool = True,
+    show_employer_contact: bool = False,
 ) -> str:
     if expanded:
-        return build_vacancy_full_html(inp)
+        return build_vacancy_full_html(inp, show_employer_contact=show_employer_contact)
     return build_vacancy_preview_html(
         inp,
         show_employer_contact=show_employer_contact,
@@ -154,7 +154,7 @@ def build_vacancy_card_rich_html(
     inp: VacancyCardInput,
     *,
     expanded: bool,
-    show_employer_contact: bool = True,
+    show_employer_contact: bool = False,
 ) -> str:
     if expanded:
         return build_vacancy_full_rich_html(inp, show_employer_contact=show_employer_contact)
