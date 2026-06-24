@@ -651,11 +651,16 @@ async def send_vacancy_card(
     if not text:
         raise ValueError("send_vacancy_card: нужен text или card_input")
     extra: dict = {}
-    if topic_key and FORUM_TOPICS_ENABLED:
-        if not get_user_topic_thread_id(chat_id, topic_key):
-            await setup_forum_topics_for_user(chat_id)
-        from services.forum_topics import topic_message_kwargs
-        extra = topic_message_kwargs(chat_id, topic_key)
+    if FORUM_TOPICS_ENABLED:
+        from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
+
+        if topic_key:
+            if not get_user_topic_thread_id(chat_id, topic_key):
+                await setup_forum_topics_for_user(chat_id)
+            from services.forum_topics import topic_message_kwargs
+            extra = topic_message_kwargs(chat_id, topic_key)
+        else:
+            extra = {"message_thread_id": GENERAL_TOPIC_THREAD_ID}
     try:
         await send_message_with_retry(
             chat_id,
@@ -2914,26 +2919,35 @@ async def send_vacancy_to_subscribers(order: dict):
                         return None
                     return build_vacancy_preview_keyboard(vid, **_map_fields_from_push_row(r))
 
-                ok = await send_vacancy_push_pinned_general(
-                    bot,
-                    uid,
-                    vacancy_id,
-                    push_preview_html,
-                    keyboard,
-                    rebuild_keyboard=_rebuild_kb,
-                    ensure_topics=setup_forum_topics_for_user,
-                )
-                if not ok:
-                    logger.warning(
-                        "pinned general push failed user=%s vac=%s — fallback send_vacancy_card",
+                try:
+                    ok = await send_vacancy_push_pinned_general(
+                        bot,
                         uid,
                         vacancy_id,
+                        push_preview_html,
+                        keyboard,
+                        rebuild_keyboard=_rebuild_kb,
+                        ensure_topics=setup_forum_topics_for_user,
+                    )
+                    if not ok:
+                        raise RuntimeError("pinned general push returned false")
+                except Exception as pin_exc:
+                    logger.warning(
+                        "pinned general push failed user=%s vac=%s: %s — fallback General",
+                        uid,
+                        vacancy_id,
+                        pin_exc,
                     )
                     await send_vacancy_card(
                         uid,
                         text=push_preview_html,
                         reply_markup=keyboard,
                         topic_key=None,
+                    )
+                    from services.forum_vacancy_pin import append_vacancy_history_message
+
+                    await append_vacancy_history_message(
+                        bot, uid, vacancy_id, push_preview_html, keyboard,
                     )
             else:
                 await send_vacancy_card(

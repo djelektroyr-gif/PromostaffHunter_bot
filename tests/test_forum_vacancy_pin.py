@@ -177,3 +177,46 @@ def test_clear_general_if_pinned(monkeypatch):
     asyncio.run(clear_general_vacancy_if_pinned(bot, user_id, "vac_x"))
     bot.delete_message.assert_awaited()
     assert get_general_vacancy_pin(user_id) is None
+
+
+def test_push_survives_delete_typeerror(monkeypatch):
+    """Ошибка delete_message не должна ронять весь push."""
+    monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
+    user_id = 889
+    clear_general_vacancy_pin(user_id)
+    save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
+    set_general_vacancy_pin(user_id, 10, "vac_old", "old", message_thread_id=GENERAL_TOPIC_THREAD_ID)
+
+    bot = AsyncMock()
+    sent = []
+
+    async def _send(chat_id, text, **kwargs):
+        msg = MagicMock()
+        msg.message_id = 300 + len(sent)
+        sent.append(kwargs.get("message_thread_id"))
+        return msg
+
+    bot.send_message = _send
+    bot.delete_message = AsyncMock(side_effect=TypeError("unexpected keyword argument"))
+    bot.edit_message_text = AsyncMock(
+        side_effect=TelegramBadRequest(method="editMessageText", message="message to edit not found"),
+    )
+
+    async def _ensure(_uid):
+        return None
+
+    ok = asyncio.run(
+        send_vacancy_push_pinned_general(
+            bot,
+            user_id,
+            "vac_new",
+            "<b>new</b>",
+            None,
+            rebuild_keyboard=lambda _vid: None,
+            ensure_topics=_ensure,
+        )
+    )
+    assert ok is True
+    assert GENERAL_TOPIC_THREAD_ID in sent
+    assert 55 in sent
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"

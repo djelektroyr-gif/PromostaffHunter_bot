@@ -16,7 +16,12 @@ from db import (
     get_user_topic_thread_id,
     set_general_vacancy_pin,
 )
-from services.forum_topics import TOPIC_VACANCIES, topic_message_kwargs
+from services.forum_topics import (
+    TOPIC_VACANCIES,
+    is_forum_thread_missing_error,
+    recreate_user_topic,
+    topic_message_kwargs,
+)
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -207,7 +212,15 @@ async def _append_vacancy_history(
     reply_markup: InlineKeyboardMarkup | None,
 ) -> None:
     if not get_user_topic_thread_id(user_id, TOPIC_VACANCIES):
-        return
+        try:
+            from services.forum_topics import ensure_user_forum_topics
+
+            await ensure_user_forum_topics(bot, user_id)
+        except Exception as e:
+            logger.warning("vacancy history ensure topics user=%s: %s", user_id, e)
+            return
+        if not get_user_topic_thread_id(user_id, TOPIC_VACANCIES):
+            return
     try:
         await _send_html_card(
             bot,
@@ -216,8 +229,41 @@ async def _append_vacancy_history(
             reply_markup,
             topic_key=TOPIC_VACANCIES,
         )
+    except TelegramBadRequest as e:
+        if is_forum_thread_missing_error(e):
+            new_thread = await recreate_user_topic(bot, user_id, TOPIC_VACANCIES)
+            if new_thread:
+                try:
+                    await _send_html_card(
+                        bot,
+                        user_id,
+                        card_text,
+                        reply_markup,
+                        topic_key=TOPIC_VACANCIES,
+                    )
+                    return
+                except Exception as e2:
+                    logger.warning(
+                        "vacancy history topic retry user=%s vac=%s: %s",
+                        user_id,
+                        vacancy_id,
+                        e2,
+                    )
+                    return
+        logger.warning("vacancy history topic user=%s vac=%s: %s", user_id, vacancy_id, e)
     except Exception as e:
         logger.warning("vacancy history topic user=%s vac=%s: %s", user_id, vacancy_id, e)
+
+
+async def append_vacancy_history_message(
+    bot: Bot,
+    user_id: int,
+    vacancy_id: str,
+    card_text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+) -> None:
+    """Копия push-карточки в топик «Вакансии» (история)."""
+    await _append_vacancy_history(bot, user_id, vacancy_id, card_text, reply_markup)
 
 
 async def archive_general_vacancy_to_topic(
@@ -257,7 +303,15 @@ async def send_vacancy_push_pinned_general(
                     message_thread_id=pin.get("message_thread_id"),
                 )
                 return True
-        await _clear_general_vacancy_display(bot, user_id)
+        try:
+            await _clear_general_vacancy_display(bot, user_id)
+        except Exception as e:
+            logger.warning(
+                "clear general pin before push user=%s vac=%s: %s",
+                user_id,
+                vacancy_id,
+                e,
+            )
         msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
         if msg_id is None:
             return False
