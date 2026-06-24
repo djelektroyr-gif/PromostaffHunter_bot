@@ -148,34 +148,27 @@ async def _delete_general_message(
     *,
     stored_thread_id: int | None = None,
 ) -> None:
-    """Удаление с перебором thread_id — legacy push без thread_id не оставляет мусор."""
-    from config import FORUM_TOPICS_ENABLED
-    from services.chat_feedback import GENERAL_TOPIC_THREAD_ID
-
-    attempts: list[dict] = []
-    if stored_thread_id is not None:
-        attempts.append({"message_thread_id": stored_thread_id})
-    if FORUM_TOPICS_ENABLED:
-        if GENERAL_TOPIC_THREAD_ID not in {stored_thread_id}:
-            attempts.append({"message_thread_id": GENERAL_TOPIC_THREAD_ID})
-    attempts.append({})
-
-    for extra in attempts:
-        try:
-            await bot.delete_message(chat_id=user_id, message_id=message_id, **extra)
+    """Удаление push-карточки в General (deleteMessage — только chat_id + message_id)."""
+    del stored_thread_id  # thread_id не передаётся в deleteMessage (aiogram / Bot API)
+    try:
+        await bot.delete_message(chat_id=user_id, message_id=message_id)
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        if "message to delete not found" in err:
             return
-        except TelegramBadRequest as e:
-            err = str(e).lower()
-            if "message to delete not found" in err:
-                return
-            if extra:
-                continue
-            logger.warning(
-                "delete general vacancy pin user=%s msg=%s: %s",
-                user_id,
-                message_id,
-                e,
-            )
+        logger.warning(
+            "delete general vacancy pin user=%s msg=%s: %s",
+            user_id,
+            message_id,
+            e,
+        )
+    except TypeError as e:
+        logger.warning(
+            "delete general vacancy pin user=%s msg=%s: %s",
+            user_id,
+            message_id,
+            e,
+        )
 
 
 async def _clear_general_vacancy_display(bot: Bot, user_id: int) -> None:

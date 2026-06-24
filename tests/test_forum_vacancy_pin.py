@@ -127,6 +127,7 @@ def test_general_push_falls_back_without_thread(monkeypatch):
     """General с thread_id=1 не должен ронять push — как send_vacancy_card."""
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 779
+    clear_general_vacancy_pin(user_id)
     save_user_topic_thread(user_id, TOPIC_VACANCIES, 55)
 
     bot = AsyncMock()
