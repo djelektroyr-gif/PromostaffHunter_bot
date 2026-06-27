@@ -8,7 +8,7 @@ from html import escape as escape_html
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import YOUR_USER_ID
-from db import get_unanswered_support_requests
+from db import get_unanswered_support_requests, get_vacancy_push_row
 
 logger = logging.getLogger(__name__)
 
@@ -270,17 +270,11 @@ async def notify_admin_notfit_feedback(
 ) -> None:
     if not YOUR_USER_ID:
         return
-    row = fetchone(
-        """
-        SELECT message_text, source_chat_title, message_link, category_code
-        FROM vacancies WHERE id = ?
-        """,
-        (vacancy_id,),
-    )
+    row = get_vacancy_push_row(vacancy_id)
     message_text = row[0] if row else None
-    source_chat = row[1] if row else None
-    message_link = row[2] if row else None
-    vac_cat = row[3] if row else None
+    message_link = row[1] if row else None
+    source_chat = row[2] if row else None
+    vac_cat = row[5] if row else None
     if username is None:
         from db import get_subscriber_profile
         profile = get_subscriber_profile(user_id) or {}

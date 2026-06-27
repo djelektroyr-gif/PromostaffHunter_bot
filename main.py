@@ -5440,16 +5440,19 @@ async def _finalize_notfit_feedback(
     elif message and message.from_user:
         username = message.from_user.username
     from services.admin_inbox_alerts import notify_admin_notfit_feedback
-    await notify_admin_notfit_feedback(
-        bot,
-        feedback_id=feedback_id,
-        user_id=user_id,
-        vacancy_id=vacancy_id,
-        reason_code=reason_code,
-        reason_label=NOTFIT_REASONS.get(reason_code, reason_code),
-        reason_text=reason_text,
-        username=username,
-    )
+    try:
+        await notify_admin_notfit_feedback(
+            bot,
+            feedback_id=feedback_id,
+            user_id=user_id,
+            vacancy_id=vacancy_id,
+            reason_code=reason_code,
+            reason_label=NOTFIT_REASONS.get(reason_code, reason_code),
+            reason_text=reason_text,
+            username=username,
+        )
+    except Exception as e:
+        logger.warning("notify_admin_notfit_feedback vac=%s: %s", vacancy_id, e)
 
 
 async def _edit_vacancy_card_message(

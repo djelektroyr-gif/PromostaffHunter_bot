@@ -14,11 +14,23 @@ from services.admin_ops_alerts import notify_admin_handler_error
 logger = logging.getLogger(__name__)
 
 
+def _inner_event(event: TelegramObject) -> TelegramObject:
+    if isinstance(event, Update):
+        return (
+            event.callback_query
+            or event.message
+            or event.edited_message
+            or event
+        )
+    return event
+
+
 def _extract_user_id(event: TelegramObject) -> int | None:
-    if isinstance(event, CallbackQuery) and event.from_user:
-        return event.from_user.id
-    if isinstance(event, Message) and event.from_user:
-        return event.from_user.id
+    inner = _inner_event(event)
+    if isinstance(inner, CallbackQuery) and inner.from_user:
+        return inner.from_user.id
+    if isinstance(inner, Message) and inner.from_user:
+        return inner.from_user.id
     return None
 
 

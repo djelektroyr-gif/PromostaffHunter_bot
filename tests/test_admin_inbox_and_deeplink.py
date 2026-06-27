@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
+from unittest.mock import AsyncMock
 
 import pytest
 
-from db import add_subscriber, add_support_request, get_user_categories, init_db, set_user_plan
+from db import add_subscriber, add_support_request, get_user_categories, init_db, save_vacancy, set_user_plan
 from db_backend import IS_POSTGRES
 from services.admin_inbox_alerts import (
     complaint_action_keyboard,
     format_complaint_admin_html,
     format_support_admin_html,
+    notify_admin_notfit_feedback,
 )
 from services.inbox_ack_messages import (
     INBOX_SLA_HOURS,
@@ -118,3 +121,39 @@ def test_unknown_category_no_preselect(tmp_db):
     uid = 102
     add_subscriber(uid, "u", "U", None)
     assert apply_vacancy_deeplink_category_preselect(uid, "unknown_role", free_limit=1) == ""
+
+
+def test_notify_admin_notfit_feedback_loads_vacancy(tmp_db, monkeypatch):
+    monkeypatch.setattr("services.admin_inbox_alerts.YOUR_USER_ID", 777)
+    add_subscriber(55, "tester", "Tester", None)
+    save_vacancy(
+        "nf_v1",
+        "c1",
+        "Test Chat",
+        "helper",
+        "Нужен хелпер на завтра",
+        "https://t.me/x/1",
+        "@boss",
+        None,
+        False,
+        "dk_nf",
+        "2026-06-26 12:00:00",
+    )
+    bot = AsyncMock()
+    asyncio.run(
+        notify_admin_notfit_feedback(
+            bot,
+            feedback_id=3,
+            user_id=55,
+            vacancy_id="nf_v1",
+            reason_code="pay",
+            reason_label="Оплата",
+            reason_text="мало",
+            username="tester",
+        )
+    )
+    bot.send_message.assert_awaited_once()
+    text = bot.send_message.call_args.args[1]
+    assert "nf_v1" in text
+    assert "helper" in text
+    assert "Нужен хелпер" in text
