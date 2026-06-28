@@ -125,8 +125,8 @@ def test_push_replaces_general_and_appends_history(monkeypatch):
     assert general[0]["text"] == "<b>new</b>"
 
 
-def test_general_push_fails_without_thread_no_duplicate(monkeypatch):
-    """Без General thread_id не шлём вторую карточку в корень чата."""
+def test_general_push_retries_without_thread(monkeypatch):
+    """General thread miss — повтор без thread_id, push не теряется."""
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 779
     clear_general_vacancy_pin(user_id)
@@ -160,9 +160,9 @@ def test_general_push_fails_without_thread_no_duplicate(monkeypatch):
             ensure_topics=_ensure,
         )
     )
-    assert ok is False
-    assert calls["n"] == 1
-    assert get_general_vacancy_pin(user_id) is None
+    assert ok is True
+    assert calls["n"] >= 2
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_fb"
 
 
 def test_clear_general_if_pinned(monkeypatch):
@@ -181,8 +181,8 @@ def test_clear_general_if_pinned(monkeypatch):
     assert get_general_vacancy_pin(user_id) is None
 
 
-def test_push_skips_orphan_when_delete_and_edit_fail(monkeypatch):
-    """Если старую карточку не удалить и не отредактировать — не шлём вторую в General."""
+def test_push_plain_fallback_when_delete_and_edit_fail(monkeypatch):
+    """Если старую карточку не удалить — всё равно шлём push (plain fallback)."""
     monkeypatch.setattr("config.FORUM_TOPICS_ENABLED", True)
     user_id = 889
     clear_general_vacancy_pin(user_id)
@@ -218,9 +218,8 @@ def test_push_skips_orphan_when_delete_and_edit_fail(monkeypatch):
             ensure_topics=_ensure,
         )
     )
-    assert ok is False
-    assert GENERAL_TOPIC_THREAD_ID not in sent
-    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_old"
+    assert ok is True
+    assert get_general_vacancy_pin(user_id)["vacancy_id"] == "vac_new"
 
 
 def test_vacancies_topic_miss_does_not_fallback_to_general(monkeypatch):

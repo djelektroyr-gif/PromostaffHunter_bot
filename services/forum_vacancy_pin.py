@@ -79,10 +79,34 @@ async def _send_html_card(
             if topic_key:
                 raise
             logger.warning(
-                "forum_vacancy_pin: General thread miss user=%s — не дублируем без thread_id",
+                "forum_vacancy_pin: General thread miss user=%s — retry без thread_id",
                 user_id,
             )
-            raise
+            plain_extra = {}
+            try:
+                msg = await bot.send_message(
+                    user_id,
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                    disable_notification=disable_notification,
+                    **plain_extra,
+                )
+                return msg.message_id, None
+            except TelegramBadRequest as e2:
+                if "parse" not in str(e2).lower():
+                    raise
+                plain = re.sub(r"<[^>]*>", "", text)
+                msg = await bot.send_message(
+                    user_id,
+                    plain,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                    disable_notification=disable_notification,
+                    **plain_extra,
+                )
+                return msg.message_id, None
         if "parse" in err:
             plain = re.sub(r"<[^>]*>", "", text)
             msg = await bot.send_message(
@@ -325,11 +349,23 @@ async def _install_general_push_card(
                         await asyncio.sleep(0.25)
             if get_general_vacancy_pin(user_id):
                 logger.warning(
-                    "install general push: delete failed user=%s msg=%s — не шлём вторую карточку",
+                    "install general push: delete failed user=%s msg=%s — plain send fallback",
                     user_id,
                     pin["message_id"],
                 )
-                return False
+                msg_id, thread_id = await _send_html_card(
+                    bot, user_id, text, reply_markup, topic_key=None,
+                )
+                if msg_id is None:
+                    return False
+                set_general_vacancy_pin(
+                    user_id,
+                    msg_id,
+                    vacancy_id,
+                    text,
+                    message_thread_id=thread_id,
+                )
+                return True
     msg_id, thread_id = await _send_html_card(bot, user_id, text, reply_markup, topic_key=None)
     if msg_id is None:
         return False

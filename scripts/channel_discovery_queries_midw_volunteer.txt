@@ -1,0 +1,31 @@
+# Разовый прогон: Московская неделя интерьера и дизайна + волонтёры
+# Запуск:
+#   $env:DISCOVERY_QUERIES_FILE = "scripts/channel_discovery_queries_midw_volunteer.txt"
+#   $env:DISCOVERY_MIN_MEMBERS = "0"
+#   python scripts/run_channel_discovery.py
+
+# --- Московская неделя интерьера и дизайна ---
+Московская неделя интерьера и дизайна
+неделя интерьера дизайна москва
+неделя интерьера москва
+moscow interior week
+interior design week moscow
+выставка интерьер дизайн москва
+design week moscow
+midw москва
+москва неделя дизайна
+интерьер выставка персонал
+design expo moscow
+
+# --- Волонтёры / набор ---
+волонтер москва мероприятие
+волонтёры москва мероприятие
+набор волонтеров москва
+набор волонтёров
+ищем волонтеров
+требуются волонтеры
+volunteer moscow event
+volunteers moscow
+volunteer expo moscow
+волонтер выставка москва
+волонтер ивент москва

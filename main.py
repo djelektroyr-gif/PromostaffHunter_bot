@@ -2832,6 +2832,8 @@ async def send_vacancy_to_subscribers(order: dict):
     skipped_quiet = 0
     skipped_busy = 0
     skipped_feed_only = 0
+    skipped_already = 0
+    skipped_delivery = 0
     from services.subscriber_match import build_vacancy_match_dict, vacancy_matches_subscriber
     from services.push_notify import evaluate_push_delivery
     from services.vacancy_category_match import vacancy_matching_user_categories
@@ -2888,10 +2890,12 @@ async def send_vacancy_to_subscribers(order: dict):
             skipped_free += 1
             continue
         if has_user_received_vacancy(subscriber['user_id'], vacancy_id):
+            skipped_already += 1
             continue
         if cluster_ids and any(
             has_user_received_vacancy(subscriber['user_id'], cid) for cid in cluster_ids
         ):
+            skipped_already += 1
             continue
         prefs = get_subscriber_filter_prefs_effective(subscriber['user_id'])
         ok, filter_reason = vacancy_matches_subscriber(
@@ -2922,41 +2926,73 @@ async def send_vacancy_to_subscribers(order: dict):
             continue
         try:
             uid = subscriber['user_id']
+            delivered = False
             if FORUM_TOPICS_ENABLED:
                 from services.forum_vacancy_pin import deliver_forum_vacancy_push
 
-                if not await deliver_forum_vacancy_push(
+                delivered = await deliver_forum_vacancy_push(
                     bot,
                     uid,
                     vacancy_id,
                     push_preview_html,
                     keyboard,
                     ensure_topics=setup_forum_topics_for_user,
-                ):
-                    raise RuntimeError("forum vacancy push delivery failed")
-            else:
-                await send_vacancy_card(
-                    uid,
-                    reply_markup=keyboard,
-                    topic_key=None,
-                    card_input=card_inp,
                 )
+            if not delivered:
+                if FORUM_TOPICS_ENABLED:
+                    logger.warning(
+                        "forum push fallback user=%s vac=%s — plain message",
+                        uid,
+                        vacancy_id,
+                    )
+                try:
+                    await send_message_with_retry(
+                        uid,
+                        text=push_preview_html,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                        disable_web_page_preview=True,
+                    )
+                except TelegramBadRequest as e:
+                    if "parse" in str(e).lower():
+                        plain = re.sub(r"<[^>]*>", "", push_preview_html)
+                        await send_message_with_retry(
+                            uid,
+                            text=plain,
+                            reply_markup=keyboard,
+                            disable_web_page_preview=True,
+                        )
+                    else:
+                        raise
             sent_count += 1
             from services.feed_loader import invalidate_feed_cache
             invalidate_feed_cache(uid)
             await asyncio.sleep(SEND_DELAY)  # небольшая пауза, чтобы не флудить
         except Exception as e:
             unreserve_vacancy_sent_to_user(vacancy_id, subscriber['user_id'])
+            skipped_delivery += 1
             if "bot was blocked by the user" in str(e):
                 logger.info(f"Пользователь {subscriber['user_id']} заблокировал бота")
                 _mark_subscriber_blocked_if_needed(subscriber['user_id'])
             else:
                 logger.error(f"Ошибка отправки {subscriber['user_id']}: {e}")
 
-    logger.info(
-        f"Вакансия {vacancy_id} (категория {category_code}): push {sent_count}, "
-        f"free skip {skipped_free}, filter skip {skipped_filter}, "
-        f"quiet {skipped_quiet}, busy {skipped_busy}, feed_only {skipped_feed_only}"
+    log_fn = logger.warning if sent_count == 0 and subscribers else logger.info
+    log_fn(
+        "Вакансия %s (категория %s): кандидатов %s, push %s, "
+        "free skip %s, filter skip %s, already %s, delivery fail %s, "
+        "quiet %s, busy %s, feed_only %s",
+        vacancy_id,
+        category_code,
+        len(subscribers),
+        sent_count,
+        skipped_free,
+        skipped_filter,
+        skipped_already,
+        skipped_delivery,
+        skipped_quiet,
+        skipped_busy,
+        skipped_feed_only,
     )
     if sent_count > 0:
         mark_vacancy_sent(vacancy_id)

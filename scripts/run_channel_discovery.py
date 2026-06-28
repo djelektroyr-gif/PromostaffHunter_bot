@@ -58,10 +58,21 @@ def _load_queries(path: Path) -> list[str]:
     return queries
 
 
+def _queries_source() -> Path:
+    raw = os.environ.get("DISCOVERY_QUERIES_FILE", "").strip()
+    if raw:
+        path = Path(raw)
+        if not path.is_absolute():
+            path = HUNTER_ROOT / path
+        return path
+    return QUERIES_SRC
+
+
 def _write_queries_for_parser(queries_dst: Path) -> int:
-    queries = _load_queries(QUERIES_SRC)
+    src = _queries_source()
+    queries = _load_queries(src)
     if not queries:
-        raise FileNotFoundError(f"Нет запросов в {QUERIES_SRC}")
+        raise FileNotFoundError(f"Нет запросов в {src}")
     queries_dst.write_text("\n".join(queries) + "\n", encoding="utf-8")
     return len(queries)
 
