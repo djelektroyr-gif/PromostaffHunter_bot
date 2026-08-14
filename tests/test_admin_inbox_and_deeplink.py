@@ -14,6 +14,8 @@ from db_backend import IS_POSTGRES
 from services.admin_inbox_alerts import (
     complaint_action_keyboard,
     format_complaint_admin_html,
+    format_moderation_notify_html,
+    format_moderation_queue_item_html,
     format_support_admin_html,
     notify_admin_notfit_feedback,
 )
@@ -81,6 +83,33 @@ def test_format_complaint_admin_html():
     )
     assert "#9" in text
     assert "vac_x" in text
+
+
+def test_format_moderation_notify_html_escapes_user_text():
+    preview = "м. Тверская, 5000 руб. @boss_name, ставка 450 ₽/ч"
+    text = format_moderation_notify_html(
+        vacancy_id="vac_123",
+        category_name="Промоутер",
+        preview=preview,
+        employer_user_id=999,
+    )
+    assert "<b>Модерация вакансии заказчика</b>" in text
+    assert "vac_123" in text
+    assert preview in text
+    assert "\\." not in text
+    assert "\\_" not in text
+
+
+def test_format_moderation_queue_item_html_escapes_contact():
+    text = format_moderation_queue_item_html(
+        category_name="Хелпер",
+        vacancy_id="vac_abc",
+        author_contact="@some_user",
+        preview="Адрес: ул. Ленина, д. 5",
+    )
+    assert "@some_user" in text
+    assert "vac_abc" in text
+    assert "Ленина" in text
 
 
 def test_support_request_ack_text_includes_id_and_sla():

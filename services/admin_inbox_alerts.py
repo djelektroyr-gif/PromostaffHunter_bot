@@ -302,3 +302,41 @@ async def notify_admin_notfit_feedback(
         )
     except Exception as e:
         logger.warning("notify_admin_notfit_feedback #%s: %s", feedback_id, e)
+
+
+def format_moderation_notify_html(
+    *,
+    vacancy_id: str,
+    category_name: str,
+    preview: str,
+    employer_user_id: int,
+    preview_limit: int = 400,
+) -> str:
+    body = escape_html((preview or "")[:preview_limit])
+    if len(preview or "") > preview_limit:
+        body += "…"
+    return (
+        f"📝 <b>Модерация вакансии заказчика</b>\n\n"
+        f"ID: <code>{escape_html(vacancy_id)}</code>\n"
+        f"Категория: {escape_html(category_name)}\n"
+        f"Заказчик user_id: <code>{employer_user_id}</code>\n\n"
+        f"{body}"
+    )
+
+
+def format_moderation_queue_item_html(
+    *,
+    category_name: str,
+    vacancy_id: str,
+    author_contact: str | None,
+    preview: str,
+    preview_limit: int = 350,
+) -> str:
+    body = escape_html((preview or "")[:preview_limit])
+    if len(preview or "") > preview_limit:
+        body += "…"
+    return (
+        f"<b>{escape_html(category_name)}</b> · <code>{escape_html(vacancy_id)}</code>\n"
+        f"Контакт: {escape_html(author_contact or '—')}\n\n"
+        f"{body}"
+    )

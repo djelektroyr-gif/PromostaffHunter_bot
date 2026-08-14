@@ -197,13 +197,14 @@ async def publish_employer_vacancy(user: types.User, category_code: str, vacancy
 async def notify_admin_moderation(vacancy_id: str, category_code: str, preview: str, employer_user_id: int):
     if not YOUR_USER_ID:
         return
+    from services.admin_inbox_alerts import format_moderation_notify_html
+
     cat_name = get_category_name(category_code)
-    text = (
-        f"📝 *Модерация вакансии заказчика*\n\n"
-        f"ID: `{vacancy_id}`\n"
-        f"Категория: {cat_name}\n"
-        f"Заказчик user_id: `{employer_user_id}`\n\n"
-        f"{escape_markdown(preview[:400])}"
+    text = format_moderation_notify_html(
+        vacancy_id=vacancy_id,
+        category_name=cat_name,
+        preview=preview,
+        employer_user_id=employer_user_id,
     )
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -215,7 +216,13 @@ async def notify_admin_moderation(vacancy_id: str, category_code: str, preview: 
         ],
     ])
     try:
-        await bot.send_message(YOUR_USER_ID, text, parse_mode="Markdown", reply_markup=markup)
+        await bot.send_message(
+            YOUR_USER_ID,
+            text,
+            parse_mode="HTML",
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
     except Exception as e:
         logger.warning("notify_admin_moderation: %s", e)
 
@@ -3661,10 +3668,10 @@ async def employer_post_text(message: types.Message, state: FSMContext):
     cat_name = data.get("category_name") or get_category_name(category_code)
     await notify_admin_moderation(info, category_code, message.text, message.from_user.id)
     await message.answer(
-        f"✅ Вакансия «{cat_name}» отправлена на модерацию.\n"
-        f"ID: `{info}`\n\n"
+        f"✅ Вакансия «{escape_html(cat_name)}» отправлена на модерацию.\n"
+        f"ID: <code>{escape_html(info)}</code>\n\n"
         "После проверки администратором её увидят Premium-подписчики.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=get_employer_keyboard(),
     )
 
@@ -7399,15 +7406,24 @@ async def post_vacancy_photo(message: types.Message, state: FSMContext):
         )
         await state.clear()
         return
-    text = f"{get_category_emoji(category_code)} *Вакансия от администратора:*\n\n{escape_markdown(vacancy_text[:500])}"
+    text = (
+        f"{get_category_emoji(category_code)} <b>Вакансия от администратора:</b>\n\n"
+        f"{escape_html(vacancy_text[:500])}"
+    )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✋ Откликнуться", callback_data="admin_vacancy")]])
     sent = 0
     for sub in subscribers:
         try:
             if photo_file_id:
-                await bot.send_photo(sub['user_id'], photo_file_id, caption=text, parse_mode="MarkdownV2", reply_markup=keyboard)
+                await bot.send_photo(
+                    sub['user_id'],
+                    photo_file_id,
+                    caption=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
+                )
             else:
-                await bot.send_message(sub['user_id'], text, parse_mode="MarkdownV2", reply_markup=keyboard)
+                await bot.send_message(sub['user_id'], text, parse_mode="HTML", reply_markup=keyboard)
             sent += 1
             await asyncio.sleep(0.2)
         except Exception as e:
@@ -8658,8 +8674,10 @@ async def admin_moderation_button(message: types.Message):
         await message.answer("✅ Очередь модерации пуста.", reply_markup=get_admin_keyboard())
         return
     await message.answer(f"📝 *На модерации:* {len(pending)}", parse_mode="Markdown")
+    from services.admin_inbox_alerts import format_moderation_queue_item_html
+
     for v in pending:
-        preview = (v.get("message_text") or "")[:350]
+        preview = v.get("message_text") or ""
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [
                 _inline_btn("Опубликовать", callback_data=f"mod_ok_{v['id']}", style="success"),
@@ -8671,11 +8689,15 @@ async def admin_moderation_button(message: types.Message):
             ],
         ])
         await message.answer(
-            f"*{get_category_name(v['category_code'])}* · `{v['id']}`\n"
-            f"Контакт: {v.get('author_contact') or '—'}\n\n"
-            f"{escape_markdown(preview)}",
-            parse_mode="Markdown",
+            format_moderation_queue_item_html(
+                category_name=get_category_name(v["category_code"]),
+                vacancy_id=v["id"],
+                author_contact=v.get("author_contact"),
+                preview=preview,
+            ),
+            parse_mode="HTML",
             reply_markup=markup,
+            disable_web_page_preview=True,
         )
 
 
